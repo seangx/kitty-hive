@@ -1,0 +1,25 @@
+{
+  "name": "kitty-hive",
+  "version": "0.1.0",
+  "description": "Room-first MCP server for multi-agent collaboration",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "kitty-hive": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js serve",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "better-sqlite3": "^11.8.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
