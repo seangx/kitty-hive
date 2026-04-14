@@ -213,11 +213,13 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'hive-team-join',
-      description: 'Join an existing team room',
+      description: 'Join an existing team room by name or ID',
       inputSchema: {
         type: 'object',
-        properties: { room_id: { type: 'string', description: 'Team room ID' } },
-        required: ['room_id'],
+        properties: {
+          room_id: { type: 'string', description: 'Team room ID' },
+          name: { type: 'string', description: 'Team name' },
+        },
       },
     },
     {
@@ -360,7 +362,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 
   if (name === 'hive-team-join') {
-    const result = await hiveCallTool('hive.team.join', { as: agentName, room_id: args.room_id })
+    const result = await hiveCallTool('hive.team.join', { as: agentName, room_id: args.room_id, name: args.name })
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }
 

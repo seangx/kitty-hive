@@ -8,6 +8,10 @@ interface CreateInput {
 }
 
 export function handleTeamCreate(actorId: string, input: CreateInput): { room_id: string; name: string } {
+  // Check uniqueness
+  const existing = listTeams().find(t => t.name === input.name);
+  if (existing) throw new Error(`Team "${input.name}" already exists (room_id: ${existing.id})`);
+
   const room = createRoom('team', actorId, input.name);
   appendRoomEvent(room.id, 'join', actorId);
   return { room_id: room.id, name: input.name };
@@ -16,17 +20,24 @@ export function handleTeamCreate(actorId: string, input: CreateInput): { room_id
 // --- hive.team.join ---
 
 interface JoinInput {
-  room_id: string;
+  room_id?: string;
+  name?: string;
 }
 
 export function handleTeamJoin(actorId: string, input: JoinInput): { room_id: string; name: string | null } {
-  const room = getRoomById(input.room_id);
-  if (!room) throw new Error(`Room not found: ${input.room_id}`);
+  let room;
+  if (input.room_id) {
+    room = getRoomById(input.room_id);
+  } else if (input.name) {
+    const teams = listTeams();
+    room = teams.find(t => t.name === input.name);
+  }
+  if (!room) throw new Error(`Team not found: ${input.room_id || input.name}`);
   if (room.kind !== 'team') throw new Error('Not a team room');
   if (room.closed_at) throw new Error('Team is closed');
-  if (isMember(input.room_id, actorId)) throw new Error('Already a member');
+  if (isMember(room.id, actorId)) throw new Error('Already a member');
 
-  appendRoomEvent(input.room_id, 'join', actorId);
+  appendRoomEvent(room.id, 'join', actorId);
   return { room_id: room.id, name: room.name };
 }
 

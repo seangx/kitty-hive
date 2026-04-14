@@ -486,17 +486,18 @@ function createMcpServer(): McpServer {
 
   mcp.tool(
     'hive.team.join',
-    'Join an existing team room.',
+    'Join an existing team room by name or ID.',
     {
       as: asParam,
-      room_id: z.string().describe('Team room ID'),
+      room_id: z.string().optional().describe('Team room ID'),
+      name: z.string().optional().describe('Team name'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = handleTeamJoin(agent.id, { room_id: params.room_id });
-      notifyRoomMembers(params.room_id, agent.id, JSON.stringify({
-        type: 'join', from: agent.display_name, room_id: params.room_id,
+      const result = handleTeamJoin(agent.id, { room_id: params.room_id, name: params.name });
+      notifyRoomMembers(result.room_id, agent.id, JSON.stringify({
+        type: 'join', from: agent.display_name, room_id: result.room_id,
         preview: `${agent.display_name} joined the team`,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
