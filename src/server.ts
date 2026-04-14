@@ -240,7 +240,7 @@ function createMcpServer(): McpServer {
       const result = handleDM(agent.id, params);
       notifyRoomMembers(result.room_id, agent.id, JSON.stringify({
         type: 'dm', from: agent.display_name, room_id: result.room_id,
-        preview: params.content,
+        preview: params.content && params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -339,7 +339,7 @@ function createMcpServer(): McpServer {
       });
       notifyRoomMembers(params.room_id, agent.id, JSON.stringify({
         type: 'message', from: agent.display_name, room_id: params.room_id,
-        preview: params.content,
+        preview: params.content && params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -485,7 +485,7 @@ function createMcpServer(): McpServer {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = handleStepComplete(params.task_id, agent.id, params.step, params.result);
-      const resultPreview = params.result;
+      const resultPreview = params.result && params.result.length > 200 ? params.result.slice(0, 200) + ' [summary]' : params.result;
       const msg = action?.type === 'task-complete' ? 'Task completed!'
         : action?.type === 'step-start' ? `Step ${action.step} started. Previous step result: ${resultPreview || 'none'}`
         : `Step ${params.step} progress recorded, waiting for others`;

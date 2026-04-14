@@ -344,7 +344,7 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
       try { const p = JSON.parse(e.payload_json); preview = p.content || ''; } catch {}
       return {
         from: actor?.display_name ?? 'unknown', type: e.type,
-        preview,
+        preview: preview.length > 200 ? preview.slice(0, 200) + ' [summary — this is a preview, not a broken message]' : preview,
         ts: e.ts,
       };
     });
