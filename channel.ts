@@ -102,7 +102,7 @@ const mcp = new Server(
       'You are connected to kitty-hive, a multi-agent collaboration server.',
       'Messages arrive as <channel source="hive-channel" from="..." room_id="..." type="...">.',
       '',
-      'Communication: hive-dm (send DM), hive-reply (reply in room), hive-inbox (check unread).',
+      'Communication: hive-dm (send DM), hive-inbox (check unread).',
       'Teams: hive-team-create, hive-team-join (by name), hive-team-list.',
       'Tasks: hive-task (create), hive-claim (claim unassigned), hive-tasks (list/board), hive-check (status).',
       'Workflow: hive-propose (propose steps), hive-approve, hive-step-complete, hive-reject.',
@@ -129,18 +129,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           content: { type: 'string', description: 'Message content' },
         },
         required: ['to', 'content'],
-      },
-    },
-    {
-      name: 'hive-reply',
-      description: 'Reply in a room you are already a member of. ONLY use the room_id from a <channel> message YOU received. To message someone new, use hive-dm instead.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          room_id: { type: 'string', description: 'The room ID from a <channel> tag you received — do NOT use room IDs from other agents' },
-          content: { type: 'string', description: 'Your reply message' },
-        },
-        required: ['room_id', 'content'],
       },
     },
     {
@@ -316,16 +304,6 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name } = req.params
   const args = req.params.arguments as Record<string, string>
-
-  if (name === 'hive-reply') {
-    await hiveCallTool('hive.room.post', {
-      as: agentName,
-      room_id: args.room_id,
-      type: 'message',
-      content: args.content,
-    })
-    return { content: [{ type: 'text', text: 'sent' }] }
-  }
 
   if (name === 'hive-dm') {
     const result = await hiveCallTool('hive.dm', {

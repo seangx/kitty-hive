@@ -76,12 +76,12 @@ async function run() {
   console.log('\n=== 4. Create task ===');
   const task = await alice.callTool('hive.task', { to: 'role:backend', title: 'Fix auth bug' });
   assert(task.task_id, 'task created');
-  assert(task.status === 'in_progress', `task status = ${task.status}`);
+  assert(task.status === 'proposing', `task status = ${task.status}`);
   assert(task.assignee?.display_name === 'Bob', `assignee = ${task.assignee?.display_name}`);
 
   console.log('\n=== 5. Check task ===');
   const check = await alice.callTool('hive.check', { task_id: task.task_id });
-  assert(check.status === 'in_progress', `check status = ${check.status}`);
+  assert(check.status === 'proposing', `check status = ${check.status}`);
 
   console.log('\n=== 6. Team ===');
   const team = await alice.callTool('hive.team.create', { name: 'Frontend Team' });
@@ -99,10 +99,6 @@ async function run() {
   const inbox = await bob.callTool('hive.inbox', {});
   // May or may not have unread depending on timing
   assert(Array.isArray(inbox), 'inbox returned array');
-
-  console.log('\n=== 9. Room post (message) ===');
-  const post = await alice.callTool('hive.room.post', { room_id: team.room_id, content: 'Team standup!' });
-  assert(post.event_id, 'message posted');
 
   console.log('\n==============================');
   console.log('ALL TESTS PASSED');

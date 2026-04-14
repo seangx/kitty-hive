@@ -8,7 +8,7 @@ import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, se
 import { handleStart } from './tools/start.js';
 import { handleDM } from './tools/dm.js';
 import { handleTaskCreate, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
-import { handlePost, handleEvents, handleList, handleInfo } from './tools/room.js';
+import { handleEvents, handleList, handleInfo } from './tools/room.js';
 import { handleTeamCreate, handleTeamJoin, handleTeamList } from './tools/team.js';
 import { ROOM_EVENT_TYPES } from './models.js';
 import type { Agent } from './models.js';
@@ -323,27 +323,6 @@ function createMcpServer(): McpServer {
     },
   );
 
-  mcp.tool(
-    'hive.room.post',
-    'Post a message to a room.',
-    {
-      as: asParam,
-      room_id: z.string().describe('Room ID'),
-      content: z.string().describe('Message content'),
-    },
-    async (params, extra) => {
-      const agent = resolveAgent(extra, params.as);
-      if (!agent) return authError();
-      const result = handlePost(agent.id, {
-        room_id: params.room_id, type: 'message', content: params.content,
-      });
-      notifyRoomMembers(params.room_id, agent.id, JSON.stringify({
-        type: 'message', from: agent.display_name, room_id: params.room_id,
-        preview: params.content && params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content,
-      }));
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
-    },
-  );
 
   mcp.tool(
     'hive.room.events',

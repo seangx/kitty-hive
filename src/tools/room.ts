@@ -1,34 +1,8 @@
 import {
-  getRoomById, getRoomEvents, getLastRoomEventTs, getLatestRoomEvents, appendRoomEvent, isMember,
+  getRoomById, getRoomEvents, getLastRoomEventTs, getLatestRoomEvents, isMember,
   getAgentRooms, getRoomMembers, getAgentById,
 } from '../db.js';
-import type { Room, RoomEvent, RoomEventType } from '../models.js';
-
-// --- hive.room.post ---
-
-interface PostInput {
-  room_id: string;
-  type: RoomEventType;
-  content?: string;
-}
-
-interface PostOutput {
-  event_id: number;
-  seq: number;
-}
-
-export function handlePost(actorId: string, input: PostInput): PostOutput {
-  const room = getRoomById(input.room_id);
-  if (!room) throw new Error(`Room not found: ${input.room_id}`);
-  if (!isMember(input.room_id, actorId)) throw new Error('Not a member of this room. Use hive.dm to message someone directly.');
-  if (room.closed_at) throw new Error('Room is closed');
-
-  const payload: Record<string, unknown> = {};
-  if (input.content) payload.content = input.content;
-
-  const event = appendRoomEvent(input.room_id, input.type, actorId, payload);
-  return { event_id: event.id, seq: event.seq };
-}
+import type { Room, RoomEvent } from '../models.js';
 
 // --- hive.room.events ---
 
