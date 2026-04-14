@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { startServer } from './server.js';
+import { startServer, setLogLevel } from './server.js';
 import { initDB } from './db.js';
 import { writeFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
 import { join, dirname } from 'node:path';
@@ -44,17 +44,31 @@ async function ask(question: string, defaultValue?: string): Promise<string> {
 
 async function cmdServe() {
   const { port, dbPath } = parseFlags(1);
+  if (args.includes('--verbose') || args.includes('-v')) setLogLevel('debug');
+  if (args.includes('--quiet') || args.includes('-q')) setLogLevel('warn');
   await startServer(port, dbPath);
 }
 
 async function cmdInit() {
-  console.log('🐝 kitty-hive init\n');
+  // Support: kitty-hive init [agent-name] [--port N] [--http]
+  let agentName = '';
+  let useChannel = true;
+  const { port } = parseFlags(1);
 
-  const agentName = await ask('Agent name for this project', getDefaultAgentName());
-  const port = await ask('Hive server port', '4123');
+  // Parse init-specific args
+  for (let i = 1; i < args.length; i++) {
+    if (args[i] === '--http') { useChannel = false; }
+    else if (args[i] === '--port' || args[i] === '-p') { i++; } // skip, already parsed
+    else if (args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-')) { agentName = args[i]; }
+  }
+
+  // Interactive fallback only if no agent name provided
+  if (!agentName) {
+    agentName = await ask('Agent name', getDefaultAgentName());
+  }
+
   const channelPath = join(__dirname, '..', 'channel.ts');
-  const useChannel = await ask('Use channel plugin for push notifications? (y/n)', 'y');
-
   const mcpJsonPath = join(process.cwd(), '.mcp.json');
   let existing: any = {};
   if (existsSync(mcpJsonPath)) {
@@ -62,7 +76,7 @@ async function cmdInit() {
   }
   if (!existing.mcpServers) existing.mcpServers = {};
 
-  if (useChannel.toLowerCase() === 'y') {
+  if (useChannel) {
     existing.mcpServers['hive-channel'] = {
       command: 'npx',
       args: ['tsx', channelPath],
@@ -71,29 +85,23 @@ async function cmdInit() {
         HIVE_AGENT_NAME: agentName,
       },
     };
-    // Remove direct hive if exists
     delete existing.mcpServers['hive'];
   } else {
     existing.mcpServers['hive'] = {
       url: `http://localhost:${port}/mcp`,
     };
-    // Remove channel if exists
     delete existing.mcpServers['hive-channel'];
   }
 
   writeFileSync(mcpJsonPath, JSON.stringify(existing, null, 2) + '\n');
-  console.log(`\n✅ Written to ${mcpJsonPath}`);
-  console.log(`   Agent name: ${agentName}`);
+  console.log(`🐝 kitty-hive configured`);
+  console.log(`   Agent: ${agentName}`);
   console.log(`   Server: http://localhost:${port}/mcp`);
-  console.log(`   Mode: ${useChannel.toLowerCase() === 'y' ? 'channel plugin (push)' : 'HTTP MCP (pull)'}`);
+  console.log(`   Mode: ${useChannel ? 'channel (push)' : 'HTTP (pull)'}`);
 
-  if (useChannel.toLowerCase() === 'y') {
-    console.log(`\n💡 Start Claude Code with:`);
-    console.log(`   claude --dangerously-load-development-channels server:hive-channel`);
+  if (useChannel) {
+    console.log(`\n   Run: claude --dangerously-load-development-channels server:hive-channel`);
   }
-
-  console.log(`\n💡 Make sure hive server is running:`);
-  console.log(`   kitty-hive serve --port ${port}`);
 }
 
 async function cmdStatus() {
@@ -166,14 +174,22 @@ function showHelp() {
   console.log(`🐝 kitty-hive — multi-agent collaboration server
 
 Usage:
-  kitty-hive serve [--port 4100] [--db path]   Start the server
-  kitty-hive init                               Configure hive for this project
-  kitty-hive status [--port 4100]               Check server & agent status
-  kitty-hive db clear [--db path]               Clear the database
+  kitty-hive serve [--port 4100] [--db path]    Start the server
+  kitty-hive init <name> [--port 4123] [--http]  Configure hive for this project
+  kitty-hive status [--port 4100]                Check server & agent status
+  kitty-hive db clear [--db path]                Clear the database
+
+Examples:
+  kitty-hive init myagent                  Channel mode (push notifications)
+  kitty-hive init myagent --http           HTTP mode (for Antigravity/Cursor)
+  kitty-hive init myagent --port 4200      Custom server port
 
 Options:
-  --port, -p  Port (default: 4100)
-  --db        Database path (default: ~/.kitty-hive/hive.db)`);
+  --port, -p   Port (default: 4100 for serve, 4123 for init)
+  --db         Database path (default: ~/.kitty-hive/hive.db)
+  --http       Use HTTP MCP instead of channel plugin
+  --verbose/-v Show debug logs (serve)
+  --quiet/-q   Only show warnings and errors (serve)`);
 }
 
 // --- Main ---

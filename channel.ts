@@ -412,9 +412,5 @@ async function connectToHive() {
 
 await connectToHive()
 
-// Drain any missed messages first
-await drainInbox()
-
-// Try SSE for real-time, with polling fallback
+// SSE only, no polling
 listenSSE()
-setInterval(drainInbox, 5000)

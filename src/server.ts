@@ -13,6 +13,21 @@ import { EVENT_TYPES } from './models.js';
 import type { Agent } from './models.js';
 import * as db from './db.js';
 
+// --- Logging ---
+
+type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+const LOG_PRIORITY: Record<LogLevel, number> = { error: 0, warn: 1, info: 2, debug: 3 };
+let logLevel: LogLevel = 'info';
+
+export function setLogLevel(level: LogLevel) { logLevel = level; }
+
+function log(level: LogLevel, msg: string) {
+  if (LOG_PRIORITY[level] <= LOG_PRIORITY[logLevel]) {
+    const prefix = level === 'info' ? '' : `[${level}] `;
+    console.log(`${prefix}${msg}`);
+  }
+}
+
 // --- Session tracking ---
 
 interface Session {
@@ -39,7 +54,7 @@ function bindSession(sessionId: string, agentId: string) {
   let set = agentSessions.get(agentId);
   if (!set) { set = new Set(); agentSessions.set(agentId, set); }
   set.add(sessionId);
-  console.log(`[bind] session=${sessionId} → agent=${agentId} (total sessions for agent: ${set.size})`);
+  log("debug", `[bind] session=${sessionId} → agent=${agentId} (total sessions for agent: ${set.size})`);
 }
 
 function unbindSession(sessionId: string) {
@@ -55,15 +70,15 @@ function unbindSession(sessionId: string) {
 
 function notifyRoomMembers(roomId: string, excludeAgentId?: string, message?: string) {
   const members = db.getRoomMembers(roomId);
-  console.log(`[notify] room=${roomId} members=${members.join(',')} exclude=${excludeAgentId}`);
+  log("debug", `[notify] room=${roomId} members=${members.join(',')} exclude=${excludeAgentId}`);
   for (const memberId of members) {
     if (memberId === excludeAgentId) continue;
     const sids = agentSessions.get(memberId);
-    console.log(`[notify] agent=${memberId} sessions=${sids ? [...sids].join(',') : 'NONE'}`);
+    log("debug", `[notify] agent=${memberId} sessions=${sids ? [...sids].join(',') : 'NONE'}`);
     if (!sids) continue;
     for (const sid of sids) {
       const session = sessions[sid];
-      if (!session) { console.log(`[notify] session ${sid} NOT FOUND in sessions map`); continue; }
+      if (!session) { log("warn", `[notify] session ${sid} NOT FOUND in sessions map`); continue; }
       try {
         // Logging notification (generic)
         session.server.sendLoggingMessage({
@@ -72,9 +87,9 @@ function notifyRoomMembers(roomId: string, excludeAgentId?: string, message?: st
         }, sid);
         // Resource updated notification (inbox changed)
         session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
-        console.log(`[notify] sent to session ${sid} OK (logging + resource updated)`);
+        log("debug", `[notify] sent to session ${sid} OK (logging + resource updated)`);
       } catch (err) {
-        console.log(`[notify] failed to send to session ${sid}: ${err}`);
+        log("warn", `[notify] failed to send to session ${sid}: ${err}`);
       }
     }
   }
@@ -86,21 +101,21 @@ const asParam = z.string().optional().describe('Your agent name or ID (from hive
 
 function resolveAgent(extra: any, asValue?: string): Agent | null {
   const sessionId = extra?.sessionId;
-  console.log(`[auth] resolveAgent sessionId=${sessionId} as=${asValue} sessionAgent=${sessionId ? sessionAgents.get(sessionId) : 'n/a'}`);
+  // Logged by caller, not here (too noisy from polling)
   // 1) Session binding
   if (sessionId) {
     const agentId = sessionAgents.get(sessionId);
     if (agentId) {
       const agent = getAgentById(agentId);
-      if (agent) { touchAgent(agent.id); console.log(`[auth] resolved via session: ${agent.display_name}`); return agent; }
+      if (agent) { touchAgent(agent.id); return agent; }
     }
   }
   // 2) `as` param fallback
   if (asValue) {
     const agent = getAgentById(asValue) || getAgentByName(asValue);
-    if (agent) { touchAgent(agent.id); console.log(`[auth] resolved via as: ${agent.display_name}`); return agent; }
+    if (agent) { touchAgent(agent.id); return agent; }
   }
-  console.log(`[auth] FAILED to resolve agent`);
+  // silent — too noisy from polling/stateless requests
   return null;
 }
 
@@ -369,18 +384,19 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
       return;
     }
 
-    console.log(`[http] ${req.method} ${req.url} session=${req.headers['mcp-session-id'] || 'none'}`);
+    // Don't log heartbeat/polling requests
+    const isQuiet = req.method === 'GET'; // SSE keepalive
 
     // --- GET: SSE stream ---
     if (req.method === 'GET') {
       const sid = req.headers['mcp-session-id'] as string | undefined;
       if (!sid || !sessions[sid]) {
-        console.log(`[http] GET rejected: sid=${sid} exists=${!!sessions[sid!]} active_sessions=${Object.keys(sessions).join(',')}`);
+
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
         return;
       }
-      console.log(`[sse] opening SSE stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
+      log("debug", `[sse] opening SSE stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
       await sessions[sid].transport.handleRequest(req, res);
       return;
     }
@@ -393,7 +409,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
         return;
       }
-      console.log(`[session] DELETE session=${sid}`);
+      log("info", `[session] DELETE session=${sid}`);
       unbindSession(sid);
       await sessions[sid].transport.handleRequest(req, res);
       return;
@@ -407,7 +423,11 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
 
       const sid = req.headers['mcp-session-id'] as string | undefined;
       const method = body?.method || (Array.isArray(body) ? `batch[${body.length}]` : 'unknown');
-      console.log(`[rpc] method=${method} sid=${sid || 'none'} tool=${body?.params?.name || '-'}`);
+      const tool = body?.params?.name || '';
+      const isHeartbeat = tool === 'hive.inbox' || method === 'notifications/initialized';
+      if (!isHeartbeat) {
+        log("info", `[rpc] method=${method} sid=${sid || 'none'} tool=${tool || '-'}`);
+      }
 
       if (sid && sessions[sid]) {
         // Existing session
@@ -418,7 +438,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSid: string) => {
-            console.log(`[session] new session created: ${newSid}`);
+            log("info", `[session] new session created: ${newSid}`);
             sessions[newSid] = { transport, server };
           },
         });
@@ -426,7 +446,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         transport.onclose = () => {
           const tSid = transport.sessionId;
           if (tSid) {
-            console.log(`[session] transport closed: ${tSid}`);
+            log("debug", `[session] transport closed: ${tSid}`);
             unbindSession(tSid);
             delete sessions[tSid];
           }
@@ -435,13 +455,14 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         await server.connect(transport);
         await transport.handleRequest(req, res, body);
       } else {
-        console.log(`[rpc] rejected: no session and not initialize. sid=${sid} isInit=${isInitializeRequest(body)}`);
-        res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({
-          jsonrpc: '2.0',
-          error: { code: -32000, message: 'Bad Request: No valid session ID provided' },
-          id: null,
-        }));
+        // Stateless fallback: create temporary server + transport per request
+        // This supports clients that don't maintain sessions (e.g. HTTP adapters)
+        if (!isHeartbeat) log("debug", `[rpc] stateless request: method=${method} tool=${tool || '-'}`);
+        const server = createMcpServer();
+        const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+        await server.connect(transport);
+        await transport.handleRequest(req, res, body);
+        res.on('close', () => { transport.close(); server.close(); });
       }
     } catch (error) {
       console.error('[rpc] Error handling MCP request:', error);
@@ -465,7 +486,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
   // Cleanup stale task rooms every hour
   setInterval(() => {
     const count = cleanupStaleRooms(7);
-    if (count > 0) console.log(`[cleanup] removed ${count} stale task rooms`);
+    if (count > 0) log("info", `[cleanup] removed ${count} stale task rooms`);
   }, 60 * 60 * 1000);
 
   process.on('SIGINT', async () => {

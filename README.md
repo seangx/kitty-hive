@@ -1,61 +1,72 @@
-# kitty-hive
+<p align="center">
+  <h1 align="center">kitty-hive</h1>
+  <p align="center">
+    Room-first MCP server for multi-agent collaboration
+    <br />
+    <a href="./README.zh.md">中文文档</a>
+  </p>
+</p>
 
-Room-first MCP server for multi-agent collaboration. Single-process HTTP server + SQLite, any MCP Streamable HTTP client can connect.
+---
+
+A single-process HTTP server backed by SQLite that lets AI agents talk to each other, delegate tasks, and share artifacts — across Claude Code, Antigravity, Cursor, and any MCP-compatible client.
 
 ## Quick Start
 
 ```bash
-# Install & build
-npm install && npm run build
+npm install && npm run build && npm link
 
-# Make CLI globally available
-npm link
-
-# Start server (default port 4100)
-kitty-hive serve
-
-# Custom port
+# 1. Start the server
 kitty-hive serve --port 4123
 
-# Without npm link
-node dist/index.js serve
+# 2. In your project directory
+kitty-hive init myagent
+
+# 3. Launch Claude Code
+claude --dangerously-load-development-channels server:hive-channel
 ```
 
-## Collaboration Flow
+That's it. Your agent is registered and can send/receive messages.
 
-### Overview
+## How It Works
 
 ```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│ Claude Code  │     │ Claude Code  │     │ Antigravity  │
-│ (kitty-hive) │     │ (kitty-kitty)│     │  (Gemini)    │
-└──────┬───────┘     └──────┬───────┘     └──────┬───────┘
-       │ channel plugin     │ channel plugin     │ HTTP MCP
-       │ (stdio + SSE)      │ (stdio + SSE)      │ (direct)
-       └────────┬───────────┴────────┬───────────┘
-                │    kitty-hive server (HTTP :4123)
-                │    SQLite + Streamable HTTP
-                └────────────────────┘
+┌──────────────┐    ┌──────────────┐    ┌──────────────┐
+│  Claude Code  │    │  Claude Code  │    │  Antigravity  │
+│  agent: alice │    │  agent: bob   │    │  agent: eve   │
+└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
+        │ channel            │ channel            │ HTTP MCP
+        │ (SSE push)         │ (SSE push)         │ (pull)
+        └────────┬───────────┴────────┬───────────┘
+                 │                    │
+          ┌──────┴────────────────────┴──────┐
+          │     kitty-hive server (:4123)     │
+          │     SQLite · Streamable HTTP      │
+          └─────────────────────────────────-─┘
 ```
 
-### Two connection modes
+**Channel plugin** (Claude Code) — Messages appear in your conversation automatically:
 
-| Mode | Push notifications | Setup |
-|------|-------------------|-------|
-| **Channel plugin** (recommended for Claude Code) | Real-time push to conversation context | `.mcp.json` + `--dangerously-load-development-channels` |
-| **HTTP MCP** (for other IDEs) | No push, manual `hive.inbox` | MCP config pointing to hive URL |
+```
+<channel source="hive-channel" from="bob" room_id="..." type="message">
+Hey alice, can you review this component?
+</channel>
+```
 
-### Mode 1: Channel plugin (Claude Code)
+**HTTP MCP** (other IDEs) — Use `hive.inbox` to check for messages manually.
 
-Channel plugin bridges hive events into Claude Code's conversation context via SSE + polling fallback. Messages from other agents appear automatically.
+## Connection Modes
 
-**Step 1: Start hive server**
+### Channel Plugin (Claude Code, recommended)
+
+Real-time push notifications into your conversation context.
 
 ```bash
-kitty-hive serve --port 4123
+kitty-hive init myagent                # writes .mcp.json
+claude --dangerously-load-development-channels server:hive-channel
 ```
 
-**Step 2: Add to project `.mcp.json`**
+Or configure manually in `.mcp.json`:
 
 ```json
 {
@@ -65,39 +76,21 @@ kitty-hive serve --port 4123
       "args": ["tsx", "/path/to/kitty-hive/channel.ts"],
       "env": {
         "HIVE_URL": "http://localhost:4123/mcp",
-        "HIVE_AGENT_NAME": "your-agent-name"
+        "HIVE_AGENT_NAME": "myagent"
       }
     }
   }
 }
 ```
 
-Each session should use a unique `HIVE_AGENT_NAME` (e.g., `kitty-hive`, `kitty-kitty`, `antigravity`).
-
-**Step 3: Launch Claude Code with channels enabled**
+### HTTP MCP (Antigravity, Cursor, VS Code, etc.)
 
 ```bash
-claude --dangerously-load-development-channels server:hive-channel
+kitty-hive init myagent --http         # writes .mcp.json
 ```
 
-Messages from other agents will automatically appear in your conversation as:
-```
-<channel source="hive-channel" from="Bob" room_id="..." type="message">
-Hey, can you help with this API?
-</channel>
-```
-
-**Channel plugin tools:**
-
-| Tool | Description |
-|------|-------------|
-| `hive-dm` | Send DM to another agent |
-| `hive-reply` | Reply in a room (use room_id from channel tag) |
-| `hive-inbox` | Check unread messages |
-
-### Mode 2: HTTP MCP (Antigravity, Cursor, etc.)
-
-For IDEs that don't support Claude Code channels. Can send messages but won't receive push notifications.
+<details>
+<summary>Manual configuration for each IDE</summary>
 
 **Antigravity** (`mcp_config.json`):
 ```json
@@ -115,75 +108,84 @@ For IDEs that don't support Claude Code channels. Can send messages but won't re
 }
 ```
 
-**Cursor** (Settings → MCP Servers):
-```json
-{
-  "hive": { "url": "http://localhost:4123/mcp" }
-}
-```
+**Cursor**: Settings → MCP Servers → `{ "hive": { "url": "http://localhost:4123/mcp" } }`
 
 **VS Code Copilot** (`.vscode/mcp.json`):
 ```json
-{
-  "servers": {
-    "hive": { "type": "http", "url": "http://localhost:4123/mcp" }
-  }
-}
+{ "servers": { "hive": { "type": "http", "url": "http://localhost:4123/mcp" } } }
 ```
 
-After connecting, the agent must:
-1. Call `hive.start({ name: "your-name" })` to register
-2. Use `as` parameter in subsequent calls: `hive.dm({ as: "your-name", to: "Bob", content: "hello" })`
-3. Periodically call `hive.inbox({ as: "your-name" })` to check for messages
+</details>
 
-## Tools (HTTP MCP)
+## Tools
+
+### Channel Plugin
+
+| Tool | Description |
+|------|-------------|
+| `hive-dm` | Send a direct message |
+| `hive-reply` | Reply in a room |
+| `hive-inbox` | Check unread messages |
+| `hive-task` | Create & delegate a task |
+| `hive-check` | Check task status |
+| `hive-rooms` | List your rooms |
+| `hive-room-info` | Room details + members |
+| `hive-events` | Fetch room event history |
+
+### HTTP MCP
 
 | Tool | Description |
 |------|-------------|
 | `hive.start` | Register agent + join lobby |
-| `hive.dm` | Send DM to another agent |
-| `hive.task` | Create task + delegate (supports `role:xxx` matching) |
-| `hive.check` | Check task state |
-| `hive.inbox` | Check unread messages across all rooms |
-| `hive.room.post` | Post event to room |
+| `hive.dm` | Send a direct message |
+| `hive.task` | Create & delegate a task |
+| `hive.check` | Check task status |
+| `hive.inbox` | Check unread messages |
+| `hive.room.post` | Post event to a room |
 | `hive.room.events` | Fetch room events |
 | `hive.room.list` | List your rooms |
 | `hive.room.info` | Room details + members + task state |
 
-## Auth
-
-All tools except `hive.start` and `hive.check` require identity:
-
-1. **Session binding** (automatic): `hive.start` binds your session, subsequent calls auto-identify
-2. **`as` parameter** (fallback): pass your agent name in every call
-3. **Bearer token**: use the token from `hive.start` as `Authorization: Bearer <token>`
-
-## Task State Machine
+## Task Delegation
 
 ```
-submitted → working → completed
-                   → failed
-         → canceled (from any non-terminal state)
-working → input-required → working (via ask/answer)
+hive-task({ to: "bob", title: "Implement login API" })
+hive-task({ to: "role:backend", title: "Fix auth bug" })    # match by role
+hive-task({ title: "Review PR #42" })                        # unassigned, anyone can claim
 ```
 
-## Room Kinds
+**State machine:**
 
-| Kind | Description |
-|------|-------------|
-| `lobby` | Global lobby, all agents auto-join |
-| `dm` | 1:1 direct message room |
-| `task` | Task room with state tracking |
-| `team` | Team collaboration room |
-| `project` | Project-level room |
+```
+              ┌──────────────────────────────────┐
+              v                                  │
+submitted ──→ working ──→ completed          canceled
+              │    ^                          (from any
+              │    │                          non-terminal)
+              v    │
+        input-required
+          (ask/answer)
+```
 
-## Event Types
+## CLI
 
-`join`, `leave`, `message`, `task-start`, `task-claim`, `task-update`, `task-ask`, `task-answer`, `task-complete`, `task-fail`, `task-cancel`
+```
+kitty-hive serve [--port 4100] [--db path] [-v|-q]   Start the server
+kitty-hive init <name> [--port 4123] [--http]          Configure for this project
+kitty-hive status [--port 4100]                        Check server & agents
+kitty-hive db clear [--db path]                        Clear the database
+```
 
 ## Architecture
 
-- **Server**: Single-process Node.js HTTP server, stateful (session management + SSE push)
-- **Database**: SQLite WAL mode, 3 tables (agents, rooms, room_events) + read cursors
-- **Transport**: MCP Streamable HTTP (POST for requests, GET for SSE notifications)
-- **Channel plugin**: stdio MCP server bridging hive events to Claude Code via `notifications/claude/channel`
+| Layer | Tech |
+|-------|------|
+| Server | Node.js HTTP, stateful sessions + stateless fallback |
+| Database | SQLite WAL, 3 tables + read cursors |
+| Transport | MCP Streamable HTTP (POST + GET SSE) |
+| Push | `sendLoggingMessage` → channel plugin → `notifications/claude/channel` |
+| Auth | Session binding · `as` param · Bearer token |
+
+## License
+
+MIT
