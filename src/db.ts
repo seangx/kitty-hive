@@ -177,16 +177,29 @@ export function listTeams(): Room[] {
 
 export function appendRoomEvent(roomId: string, type: RoomEventType, actorAgentId: string | null, payload: object = {}): RoomEvent {
   const d = getDB();
-  const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM room_events WHERE room_id = ?').get(roomId) as { max_seq: number };
-  const seq = maxSeq.max_seq + 1;
   const ts = nowISO();
   const payloadJson = JSON.stringify(payload);
-  const result = d.prepare('INSERT INTO room_events (room_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(roomId, seq, type, actorAgentId, payloadJson, ts);
-  return { id: result.lastInsertRowid as number, room_id: roomId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
+  const insert = d.transaction(() => {
+    const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM room_events WHERE room_id = ?').get(roomId) as { max_seq: number };
+    const seq = maxSeq.max_seq + 1;
+    const result = d.prepare('INSERT INTO room_events (room_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(roomId, seq, type, actorAgentId, payloadJson, ts);
+    return { id: result.lastInsertRowid as number, seq };
+  });
+  const { id, seq } = insert();
+  return { id, room_id: roomId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
 }
 
 export function getRoomEvents(roomId: string, since: number = 0, limit: number = 50): RoomEvent[] {
   return getDB().prepare('SELECT * FROM room_events WHERE room_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?').all(roomId, since, limit) as RoomEvent[];
+}
+
+export function getLastRoomEventTs(roomId: string): string | null {
+  const row = getDB().prepare('SELECT ts FROM room_events WHERE room_id = ? ORDER BY seq DESC LIMIT 1').get(roomId) as { ts: string } | undefined;
+  return row?.ts ?? null;
+}
+
+export function getLatestRoomEvents(roomId: string, limit: number = 10): RoomEvent[] {
+  return getDB().prepare('SELECT * FROM (SELECT * FROM room_events WHERE room_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC').all(roomId, limit) as RoomEvent[];
 }
 
 export function getRoomMembers(roomId: string): string[] {
@@ -268,12 +281,16 @@ export function getAgentTasks(agentId: string, status?: string): Task[] {
 
 export function appendTaskEvent(taskId: string, type: TaskEventType, actorAgentId: string | null, payload: object = {}): TaskEvent {
   const d = getDB();
-  const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM task_events WHERE task_id = ?').get(taskId) as { max_seq: number };
-  const seq = maxSeq.max_seq + 1;
   const ts = nowISO();
   const payloadJson = JSON.stringify(payload);
-  const result = d.prepare('INSERT INTO task_events (task_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(taskId, seq, type, actorAgentId, payloadJson, ts);
-  return { id: result.lastInsertRowid as number, task_id: taskId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
+  const insert = d.transaction(() => {
+    const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM task_events WHERE task_id = ?').get(taskId) as { max_seq: number };
+    const seq = maxSeq.max_seq + 1;
+    const result = d.prepare('INSERT INTO task_events (task_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(taskId, seq, type, actorAgentId, payloadJson, ts);
+    return { id: result.lastInsertRowid as number, seq };
+  });
+  const { id, seq } = insert();
+  return { id, task_id: taskId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
 }
 
 export function getTaskEvents(taskId: string, since: number = 0, limit: number = 100): TaskEvent[] {

@@ -1,5 +1,5 @@
 import {
-  getRoomById, getRoomEvents, appendRoomEvent, isMember,
+  getRoomById, getRoomEvents, getLastRoomEventTs, getLatestRoomEvents, appendRoomEvent, isMember,
   getAgentRooms, getRoomMembers, getAgentById,
 } from '../db.js';
 import type { Room, RoomEvent, RoomEventType } from '../models.js';
@@ -71,8 +71,7 @@ export function handleList(actorId: string, input: ListInput): { rooms: RoomSumm
   const rooms = getAgentRooms(actorId, input.kind, input.active_only ?? true);
   const summaries: RoomSummary[] = rooms.map(r => {
     const members = getRoomMembers(r.id);
-    const allEvents = getRoomEvents(r.id, 0, 10000);
-    const lastTs = allEvents.length > 0 ? allEvents[allEvents.length - 1].ts : null;
+    const lastTs = getLastRoomEventTs(r.id);
     return { id: r.id, name: r.name, kind: r.kind, member_count: members.length, last_event_ts: lastTs };
   });
   return { rooms: summaries };
@@ -101,8 +100,7 @@ export function handleInfo(actorId: string, input: InfoInput): InfoOutput {
     return { id, display_name: agent?.display_name ?? 'Unknown', status: agent?.status ?? 'offline' };
   });
 
-  const allEvents = getRoomEvents(input.room_id, 0, 10000);
-  const latestEvents = allEvents.slice(-10);
+  const latestEvents = getLatestRoomEvents(input.room_id, 10);
 
   return { room, members, latest_events: latestEvents };
 }

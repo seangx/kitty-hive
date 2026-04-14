@@ -3,7 +3,7 @@ import {
   createTask, getTaskById, updateTaskStatus,
   appendTaskEvent, getTaskEvents,
 } from '../db.js';
-import { shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
+import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
 import type { TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
 
 // --- hive.task ---
@@ -36,18 +36,18 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
   }
 
   const task = createTask(input.title, actorId, assignee?.id, input.source_room_id, input.input);
-
-  appendTaskEvent(task.id, 'task-start', actorId, {
-    title: input.title,
-    input: input.input,
-    assignee_agent_id: assignee?.id ?? null,
-  });
-
   let status: TaskStatus = 'created';
 
+  // task-start
+  validateTransition(status, 'task-start');
+  appendTaskEvent(task.id, 'task-start', actorId, {
+    title: input.title, input: input.input, assignee_agent_id: assignee?.id ?? null,
+  });
+
+  // Auto-claim if assignee
   if (assignee) {
+    status = validateTransition(status, 'task-claim');
     appendTaskEvent(task.id, 'task-claim', assignee.id, {});
-    status = 'in_progress';
     updateTaskStatus(task.id, status, { assignee_agent_id: assignee.id });
   }
 
@@ -93,6 +93,7 @@ export function handleWorkflowPropose(taskId: string, agentId: string, workflow:
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
 
+  validateWorkflowTransition(task.status as TaskStatus, 'task-propose');
   const steps = workflow.map(s => ({ ...s, completed_by: [] }));
   updateTaskStatus(taskId, 'proposing', { workflow_json: JSON.stringify(steps) });
   appendTaskEvent(taskId, 'task-propose', agentId, { workflow: steps });
@@ -114,8 +115,14 @@ export function handleWorkflowApprove(taskId: string, agentId: string): Workflow
   const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
   if (steps.length === 0) throw new Error('Workflow has no steps');
 
-  updateTaskStatus(taskId, 'in_progress', { current_step: 1 });
+  // proposing → approved
+  validateWorkflowTransition(task.status as TaskStatus, 'task-approve');
+  updateTaskStatus(taskId, 'approved');
   appendTaskEvent(taskId, 'task-approve', agentId, {});
+
+  // approved → in_progress (step-start)
+  validateWorkflowTransition('approved', 'step-start');
+  updateTaskStatus(taskId, 'in_progress', { current_step: 1 });
   appendTaskEvent(taskId, 'step-start', null, { step: 1, assignees: steps[0].assignees });
 
   return { type: 'step-start', step: 1, assignees: steps[0].assignees };
@@ -127,28 +134,25 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
-  if (task.current_step !== stepNum) throw new Error(`Step ${stepNum} is not the current step (current: ${task.current_step})`);
+  if (task.current_step !== stepNum) throw new Error(`Step ${stepNum} is not current (current: ${task.current_step})`);
+
+  validateWorkflowTransition(task.status as TaskStatus, 'step-complete');
 
   const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
   const step = steps.find(s => s.step === stepNum);
   if (!step) throw new Error(`Step ${stepNum} not found`);
 
-  // Record completion
   if (!step.completed_by.includes(agentId)) {
     step.completed_by.push(agentId);
   }
 
   appendTaskEvent(taskId, 'step-complete', agentId, { step: stepNum });
-
-  // Check advance
-  const advance = step.completion === 'any' || step.completed_by.length >= step.assignees.length;
-
-  // Save updated workflow
   updateTaskStatus(taskId, task.status, { workflow_json: JSON.stringify(steps) });
 
-  if (advance) {
+  if (shouldAdvanceStep(step)) {
     const nextStepNum = stepNum + 1;
     if (nextStepNum > steps.length) {
+      validateWorkflowTransition(task.status as TaskStatus, 'task-complete');
       updateTaskStatus(taskId, 'completed', { completed_at: new Date().toISOString() });
       appendTaskEvent(taskId, 'task-complete', null, {});
       return { type: 'task-complete' };
@@ -160,7 +164,7 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
     }
   }
 
-  return null; // Waiting for more completions
+  return null;
 }
 
 // --- Workflow: reject ---
@@ -170,13 +174,14 @@ export function handleWorkflowReject(taskId: string, agentId: string, stepNum: n
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
 
+  validateWorkflowTransition(task.status as TaskStatus, 'task-reject');
+
   const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
   const step = steps.find(s => s.step === stepNum);
   if (!step) throw new Error(`Step ${stepNum} not found`);
 
   const targetStep = getRejectTarget(step);
 
-  // Clear completed_by from target onwards
   for (const s of steps) {
     if (s.step >= targetStep) s.completed_by = [];
   }

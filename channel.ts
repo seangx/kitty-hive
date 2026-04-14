@@ -146,7 +146,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: 'hive-task',
-      description: 'Create a task and delegate to an agent or role. Creates a task room with state tracking.',
+      description: 'Create a task and delegate to an agent or role.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -174,7 +174,7 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       inputSchema: {
         type: 'object',
         properties: {
-          kind: { type: 'string', description: 'Filter by room kind: dm, team, task, project, lobby' },
+          kind: { type: 'string', description: 'Filter by room kind: dm, team, lobby' },
         },
       },
     },
@@ -509,16 +509,16 @@ async function drainInbox() {
       for (const msg of room.latest) {
         if (msg.type === 'join' || msg.type === 'leave') continue
         const content = msg.preview || `[${msg.type} event]`;
-        if (!dedup(msg.from, room.room_id, content)) continue;
+        if (!dedup(msg.from, room.id, content)) continue;
         await mcp.notification({
           method: 'notifications/claude/channel',
           params: {
             content,
             meta: {
               from: msg.from,
-              room_id: room.room_id,
-              room_name: room.room_name || '',
-              room_kind: room.room_kind,
+              room_id: room.id,
+              room_name: room.name || '',
+              room_kind: room.kind,
               type: msg.type,
             },
           },

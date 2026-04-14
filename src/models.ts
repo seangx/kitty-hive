@@ -89,6 +89,3 @@ export interface WorkflowStep {
   completed_by: string[];
 }
 
-// Legacy compat
-export const EVENT_TYPES = [...ROOM_EVENT_TYPES, ...TASK_EVENT_TYPES] as const;
-export type EventType = RoomEventType | TaskEventType;

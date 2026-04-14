@@ -1,4 +1,4 @@
-import { createAgent, getAgentByName, getLobby, createRoom, appendRoomEvent, getRoomEvents, isMember, touchAgent } from '../db.js';
+import { createAgent, getAgentByName, getLobby, createRoom, appendRoomEvent, getRoomEvents, isMember, touchAgent, getDB } from '../db.js';
 import type { RoomEvent } from '../models.js';
 
 interface StartInput {
@@ -32,6 +32,16 @@ export function handleStart(input: StartInput): StartOutput {
   let agent = input.name ? getAgentByName(input.name) : undefined;
   if (agent) {
     touchAgent(agent.id);
+    // Update roles/tool/expertise if provided
+    const updates: string[] = [];
+    const params: any[] = [];
+    if (input.tool) { updates.push('tool = ?'); params.push(input.tool); }
+    if (input.roles) { updates.push('roles = ?'); params.push(input.roles); }
+    if (input.expertise) { updates.push('expertise = ?'); params.push(input.expertise); }
+    if (updates.length > 0) {
+      params.push(agent.id);
+      getDB().prepare(`UPDATE agents SET ${updates.join(', ')} WHERE id = ?`).run(...params);
+    }
   } else {
     agent = createAgent(displayName, input.tool ?? '', input.roles ?? '', input.expertise ?? '');
   }

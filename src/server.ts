@@ -242,7 +242,7 @@ function createMcpServer(): McpServer {
 
   mcp.tool(
     'hive.task',
-    'Create a task and delegate to an agent or role. Creates a task room with state tracking.',
+    'Create a task and delegate to an agent or role.',
     {
       as: asParam,
       to: z.string().optional().describe('Target: agent ID, display name, or "role:ux"'),
@@ -654,7 +654,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
   // Cleanup stale task rooms every hour
   setInterval(() => {
     const count = cleanupStaleTasks(7);
-    if (count > 0) log("info", `[cleanup] removed ${count} stale task rooms`);
+    if (count > 0) log("info", `[cleanup] removed ${count} stale tasks`);
   }, 60 * 60 * 1000);
 
   process.on('SIGINT', async () => {

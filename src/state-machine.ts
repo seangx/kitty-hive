@@ -3,6 +3,7 @@ import type { TaskStatus, TaskEventType, WorkflowStep } from './models.js';
 // --- Simple task FSM ---
 
 const TRANSITIONS: Record<string, TaskStatus> = {
+  'created:task-start': 'created',
   'created:task-claim': 'in_progress',
   'in_progress:task-update': 'in_progress',
   'in_progress:task-complete': 'completed',
@@ -13,8 +14,10 @@ const TRANSITIONS: Record<string, TaskStatus> = {
 
 const TERMINAL: Set<TaskStatus> = new Set(['completed', 'failed', 'canceled']);
 
-export function nextStatus(current: TaskStatus, event: TaskEventType): TaskStatus | null {
-  return TRANSITIONS[`${current}:${event}`] ?? null;
+export function validateTransition(current: TaskStatus, event: TaskEventType): TaskStatus {
+  const next = TRANSITIONS[`${current}:${event}`];
+  if (!next) throw new Error(`Invalid task transition: ${current} + ${event}`);
+  return next;
 }
 
 export function isTerminal(status: TaskStatus): boolean {
@@ -39,17 +42,17 @@ const WORKFLOW_TRANSITIONS: Record<string, TaskStatus> = {
   'in_progress:task-cancel': 'canceled',
 };
 
-export function nextWorkflowStatus(current: TaskStatus, event: TaskEventType): TaskStatus | null {
-  return WORKFLOW_TRANSITIONS[`${current}:${event}`] ?? null;
+export function validateWorkflowTransition(current: TaskStatus, event: TaskEventType): TaskStatus {
+  const next = WORKFLOW_TRANSITIONS[`${current}:${event}`];
+  if (!next) throw new Error(`Invalid workflow transition: ${current} + ${event}`);
+  return next;
 }
 
 // --- Workflow step logic ---
 
-export function shouldAdvanceStep(step: WorkflowStep, completedAgentId: string): boolean {
-  if (step.completed_by.includes(completedAgentId)) return false;
-  const newCompleted = [...step.completed_by, completedAgentId];
-  if (step.completion === 'any') return true;
-  return newCompleted.length >= step.assignees.length;
+export function shouldAdvanceStep(step: WorkflowStep): boolean {
+  if (step.completion === 'any') return step.completed_by.length > 0;
+  return step.completed_by.length >= step.assignees.length;
 }
 
 export function getRejectTarget(step: WorkflowStep): number {

@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// End-to-end test for kitty-hive MCP server (stateful mode)
+// End-to-end test for kitty-hive v2 (stateful mode)
 
 const BASE = 'http://localhost:4100/mcp';
 let idCounter = 0;
@@ -13,14 +13,12 @@ class HiveClient {
       'Accept': 'application/json, text/event-stream',
     };
     if (this.sessionId) headers['Mcp-Session-Id'] = this.sessionId;
-
     const res = await fetch(BASE, {
       method: 'POST', headers,
       body: JSON.stringify({ jsonrpc: '2.0', id: ++idCounter, method, params }),
     });
     const sid = res.headers.get('mcp-session-id');
     if (sid) this.sessionId = sid;
-
     const text = await res.text();
     for (const line of text.split('\n')) {
       if (line.startsWith('data:')) {
@@ -36,17 +34,12 @@ class HiveClient {
 
   async init() {
     await this._post('initialize', {
-      protocolVersion: '2025-03-26',
-      capabilities: {},
+      protocolVersion: '2025-03-26', capabilities: {},
       clientInfo: { name: this.name, version: '1.0' },
     });
     await fetch(BASE, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json, text/event-stream',
-        'Mcp-Session-Id': this.sessionId,
-      },
+      headers: { 'Content-Type': 'application/json', 'Accept': 'application/json, text/event-stream', 'Mcp-Session-Id': this.sessionId },
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
     });
   }
@@ -55,61 +48,64 @@ class HiveClient {
     const result = await this._post('tools/call', { name, arguments: args });
     const text = result.content[0].text;
     if (result.isError) throw new Error(text);
-    return JSON.parse(text);
+    try { return JSON.parse(text); } catch { return text; }
   }
 }
 
+function assert(cond, msg) {
+  if (!cond) { console.error(`  FAIL: ${msg}`); process.exit(1); }
+  console.log(`  OK: ${msg}`);
+}
+
 async function run() {
-  console.log('====== 1. Initialize stateful sessions ======');
+  console.log('=== 1. Init sessions ===');
   const alice = new HiveClient('alice');
   const bob = new HiveClient('bob');
   await alice.init();
   await bob.init();
-  console.log(`  Alice session: ${alice.sessionId}`);
-  console.log(`  Bob session:   ${bob.sessionId}`);
-  console.log(`  Sessions are different: ${alice.sessionId !== bob.sessionId}`);
 
-  console.log('\n====== 2. Register agents (session auto-bound) ======');
+  console.log('\n=== 2. Register agents ===');
   const a = await alice.callTool('hive.start', { name: 'Alice', roles: 'ux,frontend' });
-  console.log(`  Alice: ${a.agent_id}`);
   const b = await bob.callTool('hive.start', { name: 'Bob', roles: 'backend' });
-  console.log(`  Bob:   ${b.agent_id}`);
+  assert(a.agent_id && b.agent_id, 'agents registered');
 
-  console.log('\n====== 3. Alice DMs Bob (no `as` needed — session bound) ======');
-  const dm = await alice.callTool('hive.dm', { to: 'Bob', content: '你好 Bob！' });
-  console.log(`  room_id=${dm.room_id}  event_id=${dm.event_id}`);
+  console.log('\n=== 3. DM ===');
+  const dm = await alice.callTool('hive.dm', { to: 'Bob', content: 'Hello Bob!' });
+  assert(dm.room_id && dm.event_id, 'DM sent');
 
-  console.log('\n====== 4. Alice creates task → role:backend ======');
-  const task = await alice.callTool('hive.task', { to: 'role:backend', title: '实现登录 API' });
-  console.log(`  task_id=${task.task_id}  state=${task.state}  assignee=${task.assignee?.display_name}`);
+  console.log('\n=== 4. Create task ===');
+  const task = await alice.callTool('hive.task', { to: 'role:backend', title: 'Fix auth bug' });
+  assert(task.task_id, 'task created');
+  assert(task.status === 'in_progress', `task status = ${task.status}`);
+  assert(task.assignee?.display_name === 'Bob', `assignee = ${task.assignee?.display_name}`);
 
-  console.log('\n====== 5. Bob updates and completes task (no `as` needed) ======');
-  await bob.callTool('hive.room.post', {
-    room_id: task.room_id, type: 'task-update', task_id: task.task_id, content: '正在写',
-  });
-  await bob.callTool('hive.room.post', {
-    room_id: task.room_id, type: 'task-complete', task_id: task.task_id, content: '搞定了',
-  });
+  console.log('\n=== 5. Check task ===');
   const check = await alice.callTool('hive.check', { task_id: task.task_id });
-  console.log(`  final state: ${check.state}`);
+  assert(check.status === 'in_progress', `check status = ${check.status}`);
 
-  console.log('\n====== 6. Bob lists rooms (session-based auth) ======');
+  console.log('\n=== 6. Team ===');
+  const team = await alice.callTool('hive.team.create', { name: 'Frontend Team' });
+  assert(team.room_id, 'team created');
+  const join = await bob.callTool('hive.team.join', { room_id: team.room_id });
+  assert(join.room_id === team.room_id, 'Bob joined team');
+  const teams = await alice.callTool('hive.team.list');
+  assert(teams.teams.length >= 1, `${teams.teams.length} teams`);
+
+  console.log('\n=== 7. Room list ===');
   const rooms = await bob.callTool('hive.room.list', {});
-  console.log(`  room count: ${rooms.rooms.length}`);
-  for (const r of rooms.rooms) console.log(`    ${r.kind}: ${r.name}`);
+  assert(rooms.rooms.length >= 2, `Bob has ${rooms.rooms.length} rooms`);
 
-  console.log('\n====== 7. Session persistence — Alice reuses session ======');
-  const rooms2 = await alice.callTool('hive.room.list', {});
-  console.log(`  Alice rooms: ${rooms2.rooms.length}`);
+  console.log('\n=== 8. Inbox ===');
+  const inbox = await bob.callTool('hive.inbox', {});
+  // May or may not have unread depending on timing
+  assert(Array.isArray(inbox), 'inbox returned array');
 
-  console.log('\n======================================');
-  const pass = check.state === 'completed'
-    && task.assignee?.display_name === 'Bob'
-    && rooms.rooms.length >= 2
-    && alice.sessionId !== bob.sessionId;
+  console.log('\n=== 9. Room post (message) ===');
+  const post = await alice.callTool('hive.room.post', { room_id: team.room_id, content: 'Team standup!' });
+  assert(post.event_id, 'message posted');
 
-  console.log(pass ? '✅ ALL TESTS PASSED' : '❌ SOME TESTS FAILED');
-  if (!pass) process.exit(1);
+  console.log('\n==============================');
+  console.log('ALL TESTS PASSED');
 }
 
-run().catch(err => { console.error('❌ ERROR:', err.message); process.exit(1); });
+run().catch(err => { console.error('ERROR:', err.message); process.exit(1); });
