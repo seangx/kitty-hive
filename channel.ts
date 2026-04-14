@@ -202,6 +202,68 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['room_id'],
       },
     },
+    {
+      name: 'hive-propose',
+      description: 'Propose a workflow for a task. Define steps with assignees, actions, and completion criteria.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Task ID' },
+          workflow: {
+            type: 'array',
+            description: 'Workflow steps',
+            items: {
+              type: 'object',
+              properties: {
+                step: { type: 'number' },
+                title: { type: 'string' },
+                assignees: { type: 'array', items: { type: 'string' }, description: 'Agent names or "role:xxx"' },
+                action: { type: 'string' },
+                completion: { type: 'string', description: '"all" or "any"' },
+                on_reject: { type: 'string', description: '"revise" or "back:N"' },
+              },
+              required: ['step', 'title', 'assignees', 'action'],
+            },
+          },
+        },
+        required: ['task_id', 'workflow'],
+      },
+    },
+    {
+      name: 'hive-approve',
+      description: 'Approve a proposed workflow. Automatically starts step 1.',
+      inputSchema: {
+        type: 'object',
+        properties: { task_id: { type: 'string', description: 'Task ID' } },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'hive-step-complete',
+      description: 'Mark your part of the current step as complete.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Task ID' },
+          step: { type: 'number', description: 'Step number' },
+          result: { type: 'string', description: 'Result description' },
+        },
+        required: ['task_id', 'step'],
+      },
+    },
+    {
+      name: 'hive-reject',
+      description: 'Reject the current step. Sends the task back to a previous step.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          task_id: { type: 'string', description: 'Task ID' },
+          step: { type: 'number', description: 'Step being rejected' },
+          reason: { type: 'string', description: 'Rejection reason' },
+        },
+        required: ['task_id', 'step'],
+      },
+    },
   ],
 }))
 
@@ -265,6 +327,44 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       room_id: args.room_id,
       since: args.since ? Number(args.since) : undefined,
       limit: args.limit ? Number(args.limit) : undefined,
+    })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-propose') {
+    const workflow = typeof args.workflow === 'string' ? JSON.parse(args.workflow) : args.workflow
+    const result = await hiveCallTool('hive.workflow.propose', {
+      as: agentName,
+      task_id: args.task_id,
+      workflow,
+    })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-approve') {
+    const result = await hiveCallTool('hive.workflow.approve', {
+      as: agentName,
+      task_id: args.task_id,
+    })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-step-complete') {
+    const result = await hiveCallTool('hive.workflow.step.complete', {
+      as: agentName,
+      task_id: args.task_id,
+      step: Number(args.step),
+      result: args.result,
+    })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-reject') {
+    const result = await hiveCallTool('hive.workflow.reject', {
+      as: agentName,
+      task_id: args.task_id,
+      step: Number(args.step),
+      reason: args.reason,
     })
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }

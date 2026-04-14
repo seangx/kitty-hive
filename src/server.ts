@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleRooms } from './db.js';
 import { handleStart } from './tools/start.js';
 import { handleDM } from './tools/dm.js';
-import { handleTask, handleCheck } from './tools/task.js';
+import { handleTask, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
 import { handlePost, handleEvents, handleList, handleInfo } from './tools/room.js';
 import { EVENT_TYPES } from './models.js';
 import type { Agent } from './models.js';
@@ -342,6 +342,113 @@ function createMcpServer(): McpServer {
         return { content: [{ type: 'text', text: '[]' }] };
       }
       return { content: [{ type: 'text', text: JSON.stringify(unread) }] };
+    },
+  );
+
+  // --- Workflow tools ---
+
+  mcp.tool(
+    'hive.workflow.propose',
+    'Propose a workflow for a task. The task creator must approve before it starts.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task ID'),
+      workflow: z.array(z.object({
+        step: z.number(),
+        title: z.string(),
+        assignees: z.array(z.string()).describe('Agent names or "role:xxx"'),
+        action: z.string(),
+        completion: z.enum(['all', 'any']).default('all'),
+        on_reject: z.string().optional().describe('"revise" or "back:N"'),
+      })).describe('Workflow steps'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const taskEvents = db.getTaskEvents(params.task_id);
+      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
+      const roomId = taskEvents[0].room_id;
+      handleWorkflowPropose(params.task_id, roomId, agent.id, params.workflow as any);
+      notifyRoomMembers(roomId, agent.id, JSON.stringify({
+        type: 'task-propose', from: agent.display_name, room_id: roomId,
+        task_id: params.task_id, preview: `Workflow proposed: ${params.workflow.length} steps`,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'proposing', steps: params.workflow.length }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.workflow.approve',
+    'Approve a proposed workflow. Automatically starts step 1.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task ID'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const taskEvents = db.getTaskEvents(params.task_id);
+      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
+      const roomId = taskEvents[0].room_id;
+      const action = handleWorkflowApprove(params.task_id, roomId, agent.id);
+      if (action.assignees) {
+        notifyRoomMembers(roomId, agent.id, JSON.stringify({
+          type: 'step-start', from: agent.display_name, room_id: roomId,
+          task_id: params.task_id, preview: `Step 1 started, assignees: ${action.assignees.join(', ')}`,
+        }));
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'approved', action }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.workflow.step.complete',
+    'Mark your part of the current step as complete.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task ID'),
+      step: z.number().describe('Step number'),
+      result: z.string().optional().describe('Result description'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const taskEvents = db.getTaskEvents(params.task_id);
+      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
+      const roomId = taskEvents[0].room_id;
+      const action = handleStepComplete(params.task_id, roomId, agent.id, params.step);
+      const msg = action?.type === 'task-complete' ? 'Task completed!'
+        : action?.type === 'step-start' ? `Step ${action.step} started`
+        : `Step ${params.step} progress recorded, waiting for others`;
+      notifyRoomMembers(roomId, agent.id, JSON.stringify({
+        type: action?.type || 'step-complete', from: agent.display_name, room_id: roomId,
+        task_id: params.task_id, preview: msg,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action: action || 'waiting' }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.workflow.reject',
+    'Reject the current step output. Sends the task back to a previous step.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task ID'),
+      step: z.number().describe('Step number being rejected'),
+      reason: z.string().optional().describe('Rejection reason'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const taskEvents = db.getTaskEvents(params.task_id);
+      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
+      const roomId = taskEvents[0].room_id;
+      const action = handleWorkflowReject(params.task_id, roomId, agent.id, params.step, params.reason);
+      notifyRoomMembers(roomId, agent.id, JSON.stringify({
+        type: 'task-reject', from: agent.display_name, room_id: roomId,
+        task_id: params.task_id, preview: `Step ${params.step} rejected → back to step ${action.step}`,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
     },
   );
 
