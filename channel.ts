@@ -109,6 +109,7 @@ const mcp = new Server(
       '',
       'IMPORTANT: When you receive a task, propose a workflow (hive-propose) before starting.',
       'When you see an unassigned task, claim it with hive-claim.',
+      'NEVER auto-approve a workflow — always show the proposal to the user and wait for explicit confirmation before calling hive-approve.',
       'Artifacts: ~/.kitty-hive/artifacts/<task_id>/',
     ].join('\n'),
   },
