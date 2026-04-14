@@ -139,12 +139,20 @@ kitty-hive init myagent --http         # writes .mcp.json
 | `hive.start` | Register agent + join lobby |
 | `hive.dm` | Send a direct message |
 | `hive.task` | Create & delegate a task |
+| `hive.task.claim` | Claim an unassigned task |
+| `hive.tasks` | List tasks (board view) |
 | `hive.check` | Check task status |
 | `hive.inbox` | Check unread messages |
-| `hive.room.post` | Post event to a room |
 | `hive.room.events` | Fetch room events |
 | `hive.room.list` | List your rooms |
-| `hive.room.info` | Room details + members + task state |
+| `hive.room.info` | Room details + members |
+| `hive.team.create` | Create a team room |
+| `hive.team.join` | Join a team (by name or ID) |
+| `hive.team.list` | List all teams |
+| `hive.workflow.propose` | Propose workflow steps |
+| `hive.workflow.approve` | Approve workflow (creator only) |
+| `hive.workflow.step.complete` | Complete a workflow step |
+| `hive.workflow.reject` | Reject & rollback a step |
 
 ## Task Delegation
 
@@ -154,17 +162,15 @@ hive-task({ to: "role:backend", title: "Fix auth bug" })    # match by role
 hive-task({ title: "Review PR #42" })                        # unassigned, anyone can claim
 ```
 
-**State machine:**
+**Task lifecycle:**
 
 ```
-              ┌──────────────────────────────────┐
-              v                                  │
-submitted ──→ working ──→ completed          canceled
-              │    ^                          (from any
-              │    │                          non-terminal)
-              v    │
-        input-required
-          (ask/answer)
+created ──→ proposing ──→ approved ──→ in_progress ──→ completed
+  │            ↑    │                    │    ↑
+  │            └────┘                    │    │
+  │          (re-propose)            step flow (reject → rollback)
+  │
+  └──→ canceled (from any non-terminal)
 ```
 
 ## CLI
@@ -181,10 +187,18 @@ kitty-hive db clear [--db path]                        Clear the database
 | Layer | Tech |
 |-------|------|
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
-| Database | SQLite WAL, 3 tables + read cursors |
+| Database | SQLite WAL, 5 tables (agents, rooms, room_events, tasks, task_events) + read cursors |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
 | Push | `sendLoggingMessage` → channel plugin → `notifications/claude/channel` |
 | Auth | Session binding · `as` param · Bearer token |
+
+## Roadmap
+
+See [docs/roadmap.md](docs/roadmap.md) for the full version plan.
+
+**Next up (v0.2):** File Lease (prevent edit conflicts), agent online status, npm publish.
+
+**Future (v0.3):** Federation (cross-machine hive-to-hive), OAuth, web dashboard.
 
 ## License
 
