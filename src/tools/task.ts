@@ -109,6 +109,7 @@ export function handleCheck(input: { task_id: string }): CheckOutput {
 export function handleWorkflowPropose(taskId: string, agentId: string, workflow: WorkflowStep[]): void {
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.assignee_agent_id !== agentId) throw new Error('Only the task assignee can propose a workflow');
 
   validateWorkflowTransition(task.status as TaskStatus, 'task-propose');
   const steps = workflow.map(s => ({ ...s, completed_by: [] }));
@@ -127,6 +128,7 @@ export interface WorkflowAction {
 export function handleWorkflowApprove(taskId: string, agentId: string): WorkflowAction {
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.creator_agent_id !== agentId) throw new Error('Only the task creator can approve the workflow');
   if (!task.workflow_json) throw new Error('No workflow defined');
 
   const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
