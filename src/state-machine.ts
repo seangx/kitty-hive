@@ -1,56 +1,37 @@
-import type { TaskState, EventType, WorkflowTaskStatus, WorkflowStep, TaskWorkflow } from './models.js';
+import type { TaskStatus, TaskEventType, WorkflowStep } from './models.js';
 
-// --- Simple task FSM (backward compat) ---
+// --- Simple task FSM ---
 
-const TRANSITIONS: Record<string, TaskState> = {
-  ':task-start': 'submitted',
-  'submitted:task-claim': 'working',
-  'working:task-update': 'working',
-  'working:task-ask': 'input-required',
-  'input-required:task-answer': 'working',
-  'working:task-complete': 'completed',
-  'working:task-fail': 'failed',
-  'submitted:task-cancel': 'canceled',
-  'working:task-cancel': 'canceled',
-  'input-required:task-cancel': 'canceled',
+const TRANSITIONS: Record<string, TaskStatus> = {
+  'created:task-claim': 'in_progress',
+  'in_progress:task-update': 'in_progress',
+  'in_progress:task-complete': 'completed',
+  'in_progress:task-fail': 'failed',
+  'created:task-cancel': 'canceled',
+  'in_progress:task-cancel': 'canceled',
 };
 
-const TERMINAL: Set<TaskState> = new Set(['completed', 'failed', 'canceled']);
+const TERMINAL: Set<TaskStatus> = new Set(['completed', 'failed', 'canceled']);
 
-export function nextState(current: TaskState | null, event: EventType): TaskState | null {
-  const key = `${current ?? ''}:${event}`;
-  return TRANSITIONS[key] ?? null;
+export function nextStatus(current: TaskStatus, event: TaskEventType): TaskStatus | null {
+  return TRANSITIONS[`${current}:${event}`] ?? null;
 }
 
-export function isTerminal(state: TaskState): boolean {
-  return TERMINAL.has(state);
-}
-
-export function isTaskEvent(type: EventType): boolean {
-  return type.startsWith('task-') || type.startsWith('step-');
-}
-
-export function deriveTaskState(events: Array<{ type: EventType }>): TaskState {
-  let state: TaskState = 'submitted';
-  for (const e of events) {
-    if (!isTaskEvent(e.type)) continue;
-    const next = nextState(state, e.type);
-    if (next) state = next;
-  }
-  return state;
+export function isTerminal(status: TaskStatus): boolean {
+  return TERMINAL.has(status);
 }
 
 // --- Workflow FSM ---
 
-const WORKFLOW_TRANSITIONS: Record<string, WorkflowTaskStatus> = {
-  ':task-start': 'proposing',
-  'proposing:task-propose': 'proposing',    // can re-propose
+const WORKFLOW_TRANSITIONS: Record<string, TaskStatus> = {
+  'created:task-start': 'proposing',
+  'proposing:task-propose': 'proposing',
   'proposing:task-approve': 'approved',
-  'proposing:task-reject': 'proposing',     // reject proposal → re-propose
+  'proposing:task-reject': 'proposing',
   'approved:step-start': 'in_progress',
   'in_progress:step-complete': 'in_progress',
-  'in_progress:step-start': 'in_progress',  // next step
-  'in_progress:task-reject': 'in_progress', // reject step → back
+  'in_progress:step-start': 'in_progress',
+  'in_progress:task-reject': 'in_progress',
   'in_progress:task-complete': 'completed',
   'in_progress:task-fail': 'failed',
   'proposing:task-cancel': 'canceled',
@@ -58,36 +39,16 @@ const WORKFLOW_TRANSITIONS: Record<string, WorkflowTaskStatus> = {
   'in_progress:task-cancel': 'canceled',
 };
 
-const WORKFLOW_TERMINAL: Set<WorkflowTaskStatus> = new Set(['completed', 'failed', 'canceled']);
-
-export function nextWorkflowStatus(current: WorkflowTaskStatus | null, event: EventType): WorkflowTaskStatus | null {
-  const key = `${current ?? ''}:${event}`;
-  return WORKFLOW_TRANSITIONS[key] ?? null;
-}
-
-export function isWorkflowTerminal(status: WorkflowTaskStatus): boolean {
-  return WORKFLOW_TERMINAL.has(status);
-}
-
-export function deriveWorkflowStatus(events: Array<{ type: EventType }>): WorkflowTaskStatus {
-  let status: WorkflowTaskStatus = 'proposing';
-  for (const e of events) {
-    if (!isTaskEvent(e.type)) continue;
-    const next = nextWorkflowStatus(status, e.type);
-    if (next) status = next;
-  }
-  return status;
+export function nextWorkflowStatus(current: TaskStatus, event: TaskEventType): TaskStatus | null {
+  return WORKFLOW_TRANSITIONS[`${current}:${event}`] ?? null;
 }
 
 // --- Workflow step logic ---
 
 export function shouldAdvanceStep(step: WorkflowStep, completedAgentId: string): boolean {
-  if (step.completed_by.includes(completedAgentId)) return false; // already completed
+  if (step.completed_by.includes(completedAgentId)) return false;
   const newCompleted = [...step.completed_by, completedAgentId];
   if (step.completion === 'any') return true;
-  // "all": check if all resolved assignees have completed
-  // Note: assignees might be "role:xxx" which resolve to multiple agents at runtime
-  // The caller should pass resolved assignee IDs
   return newCompleted.length >= step.assignees.length;
 }
 

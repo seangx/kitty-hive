@@ -1,5 +1,4 @@
-import { getAgentById, getAgentByName, findDMRoom, createRoom, appendEvent } from '../db.js';
-import type { Agent } from '../models.js';
+import { getAgentById, getAgentByName, findDMRoom, createRoom, appendRoomEvent } from '../db.js';
 
 interface DMInput {
   to: string;
@@ -14,24 +13,17 @@ interface DMOutput {
 export function handleDM(actorId: string, input: DMInput): DMOutput {
   const actor = getAgentById(actorId);
   const target = getAgentById(input.to) || getAgentByName(input.to);
-  if (!target) {
-    throw new Error(`Agent not found: ${input.to}`);
-  }
-  if (target.id === actorId) {
-    throw new Error('Cannot DM yourself');
-  }
+  if (!target) throw new Error(`Agent not found: ${input.to}`);
+  if (target.id === actorId) throw new Error('Cannot DM yourself');
 
-  // Find or create DM room
   let room = findDMRoom(actorId, target.id);
   if (!room) {
     const actorName = actor?.display_name ?? actorId;
     room = createRoom('dm', actorId, `DM: ${actorName} ↔ ${target.display_name}`);
-    appendEvent(room.id, 'join', actorId);
-    appendEvent(room.id, 'join', target.id);
+    appendRoomEvent(room.id, 'join', actorId);
+    appendRoomEvent(room.id, 'join', target.id);
   }
 
-  // Post message
-  const event = appendEvent(room.id, 'message', actorId, { content: input.content });
-
+  const event = appendRoomEvent(room.id, 'message', actorId, { content: input.content });
   return { room_id: room.id, event_id: event.id };
 }

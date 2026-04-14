@@ -203,6 +203,29 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'hive-team-create',
+      description: 'Create a team room for group collaboration',
+      inputSchema: {
+        type: 'object',
+        properties: { name: { type: 'string', description: 'Team name' } },
+        required: ['name'],
+      },
+    },
+    {
+      name: 'hive-team-join',
+      description: 'Join an existing team room',
+      inputSchema: {
+        type: 'object',
+        properties: { room_id: { type: 'string', description: 'Team room ID' } },
+        required: ['room_id'],
+      },
+    },
+    {
+      name: 'hive-team-list',
+      description: 'List all available teams',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
       name: 'hive-propose',
       description: 'Propose a workflow for a task. Define steps with assignees, actions, and completion criteria.',
       inputSchema: {
@@ -328,6 +351,21 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       since: args.since ? Number(args.since) : undefined,
       limit: args.limit ? Number(args.limit) : undefined,
     })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-team-create') {
+    const result = await hiveCallTool('hive.team.create', { as: agentName, name: args.name })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-team-join') {
+    const result = await hiveCallTool('hive.team.join', { as: agentName, room_id: args.room_id })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-team-list') {
+    const result = await hiveCallTool('hive.team.list', {})
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }
 

@@ -10,55 +10,34 @@ export interface Agent {
   last_seen: string;
 }
 
-export type RoomKind = 'dm' | 'team' | 'task' | 'project' | 'lobby';
+export type RoomKind = 'lobby' | 'dm' | 'team';
 
 export interface Room {
   id: string;
   name: string | null;
   kind: RoomKind;
   host_agent_id: string | null;
-  parent_room_id: string | null;
-  metadata_json: string;
   created_at: string;
   closed_at: string | null;
 }
 
-export const EVENT_TYPES = [
-  'join', 'leave', 'message',
-  // Simple task events (backward compat)
-  'task-start', 'task-claim', 'task-update',
-  'task-ask', 'task-answer',
-  'task-complete', 'task-fail', 'task-cancel',
-  // Workflow events
-  'task-propose', 'task-approve', 'task-reject',
-  'step-start', 'step-complete',
-] as const;
-
-export type EventType = typeof EVENT_TYPES[number];
+// Room events: only communication
+export const ROOM_EVENT_TYPES = ['join', 'leave', 'message'] as const;
+export type RoomEventType = typeof ROOM_EVENT_TYPES[number];
 
 export interface RoomEvent {
   id: number;
   room_id: string;
   seq: number;
-  type: EventType;
+  type: RoomEventType;
   actor_agent_id: string | null;
   payload_json: string;
   ts: string;
 }
 
-// --- Simple task states (backward compat) ---
-
-export type TaskState =
-  | 'submitted'
-  | 'working'
-  | 'input-required'
-  | 'completed'
-  | 'failed'
-  | 'canceled';
-
-// --- Workflow task states ---
-
-export type WorkflowTaskStatus =
+// Task status
+export type TaskStatus =
+  | 'created'
   | 'proposing'
   | 'approved'
   | 'in_progress'
@@ -66,21 +45,50 @@ export type WorkflowTaskStatus =
   | 'failed'
   | 'canceled';
 
+export interface Task {
+  id: string;
+  title: string;
+  creator_agent_id: string;
+  assignee_agent_id: string | null;
+  status: TaskStatus;
+  workflow_json: string | null;
+  current_step: number;
+  source_room_id: string | null;
+  input_json: string;
+  created_at: string;
+  completed_at: string | null;
+}
+
+// Task events
+export const TASK_EVENT_TYPES = [
+  'task-start', 'task-claim', 'task-update',
+  'task-propose', 'task-approve', 'task-reject',
+  'step-start', 'step-complete',
+  'task-complete', 'task-fail', 'task-cancel',
+] as const;
+export type TaskEventType = typeof TASK_EVENT_TYPES[number];
+
+export interface TaskEvent {
+  id: number;
+  task_id: string;
+  seq: number;
+  type: TaskEventType;
+  actor_agent_id: string | null;
+  payload_json: string;
+  ts: string;
+}
+
+// Workflow
 export interface WorkflowStep {
   step: number;
   title: string;
-  assignees: string[];        // agent name or "role:xxx"
+  assignees: string[];
   action: string;
   completion: 'all' | 'any';
   on_reject?: 'revise' | `back:${number}`;
-  completed_by: string[];     // agent IDs that have completed this step
+  completed_by: string[];
 }
 
-export interface TaskWorkflow {
-  task_id: string;
-  title: string;
-  status: WorkflowTaskStatus;
-  current_step: number;
-  creator_agent_id: string;
-  workflow: WorkflowStep[];
-}
+// Legacy compat
+export const EVENT_TYPES = [...ROOM_EVENT_TYPES, ...TASK_EVENT_TYPES] as const;
+export type EventType = RoomEventType | TaskEventType;

@@ -4,12 +4,13 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
-import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleRooms } from './db.js';
+import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks } from './db.js';
 import { handleStart } from './tools/start.js';
 import { handleDM } from './tools/dm.js';
-import { handleTask, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
+import { handleTaskCreate, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
 import { handlePost, handleEvents, handleList, handleInfo } from './tools/room.js';
-import { EVENT_TYPES } from './models.js';
+import { handleTeamCreate, handleTeamJoin, handleTeamList } from './tools/team.js';
+import { ROOM_EVENT_TYPES } from './models.js';
 import type { Agent } from './models.js';
 import * as db from './db.js';
 
@@ -93,6 +94,48 @@ function notifyRoomMembers(roomId: string, excludeAgentId?: string, message?: st
       }
     }
   }
+}
+
+function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string) {
+  for (const agentId of agentIds) {
+    if (agentId === excludeAgentId) continue;
+    const sids = agentSessions.get(agentId);
+    if (!sids) continue;
+    for (const sid of sids) {
+      const session = sessions[sid];
+      if (!session) continue;
+      try {
+        session.server.sendLoggingMessage({ level: 'info', data: message ?? 'New task event' }, sid);
+        session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+function notifyTaskParticipants(taskId: string, excludeAgentId?: string, message?: string) {
+  const task = db.getTaskById(taskId);
+  if (!task) return;
+  const participants = new Set<string>();
+  participants.add(task.creator_agent_id);
+  if (task.assignee_agent_id) participants.add(task.assignee_agent_id);
+  // Also notify workflow step assignees
+  if (task.workflow_json) {
+    try {
+      const steps = JSON.parse(task.workflow_json);
+      for (const step of steps) {
+        for (const a of step.assignees || []) {
+          if (a.startsWith('role:')) {
+            const agent = db.findAgentByRole(a.slice(5));
+            if (agent) participants.add(agent.id);
+          } else {
+            const agent = db.getAgentById(a) || db.getAgentByName(a);
+            if (agent) participants.add(agent.id);
+          }
+        }
+      }
+    } catch { /* ignore */ }
+  }
+  notifyAgents([...participants], excludeAgentId, message);
 }
 
 // --- Agent resolution ---
@@ -209,24 +252,12 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = handleTask(agent.id, { to: params.to, title: params.title, input: params.input as object });
+      const result = handleTaskCreate(agent.id, { to: params.to, title: params.title, input: params.input as object });
       if (result.assignee) {
-        const sids = agentSessions.get(result.assignee.id);
-        if (sids) {
-          for (const sid of sids) {
-            const session = sessions[sid];
-            if (!session) continue;
-            try {
-              session.server.sendLoggingMessage({
-                level: 'info',
-                data: JSON.stringify({
-                  type: 'task-assigned', from: agent.display_name,
-                  task_id: result.task_id, room_id: result.room_id, title: params.title,
-                }),
-              }, sid);
-            } catch { /* ignore */ }
-          }
-        }
+        notifyAgents([result.assignee.id], agent.id, JSON.stringify({
+          type: 'task-assigned', from: agent.display_name,
+          task_id: result.task_id, title: params.title,
+        }));
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -244,24 +275,21 @@ function createMcpServer(): McpServer {
 
   mcp.tool(
     'hive.room.post',
-    'Post an event to a room (message, task update, etc.).',
+    'Post a message to a room.',
     {
       as: asParam,
       room_id: z.string().describe('Room ID'),
-      type: z.string().describe(`Event type: ${EVENT_TYPES.join(', ')}`),
-      content: z.string().optional().describe('Message content (for type=message)'),
-      task_id: z.string().optional().describe('Task ID (for task-* event types)'),
+      content: z.string().describe('Message content'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = handlePost(agent.id, {
-        room_id: params.room_id, type: params.type as any,
-        content: params.content, task_id: params.task_id,
+        room_id: params.room_id, type: 'message', content: params.content,
       });
       notifyRoomMembers(params.room_id, agent.id, JSON.stringify({
-        type: params.type, from: agent.display_name, room_id: params.room_id,
-        task_id: params.task_id, preview: params.content,
+        type: 'message', from: agent.display_name, room_id: params.room_id,
+        preview: params.content && params.content.length > 100 ? params.content.slice(0, 100) + '...' : params.content,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -291,7 +319,7 @@ function createMcpServer(): McpServer {
     'List rooms you are a member of.',
     {
       as: asParam,
-      kind: z.string().optional().describe('Filter by room kind: dm, team, task, project, lobby'),
+      kind: z.string().optional().describe('Filter by room kind: dm, team, lobby'),
       active_only: z.boolean().optional().describe('Only show active (non-closed) rooms (default true)'),
     },
     async (params, extra) => {
@@ -329,12 +357,13 @@ function createMcpServer(): McpServer {
       const unread = getUnreadForAgent(agent.id);
       // Mark as read
       for (const u of unread) {
-        const maxSeq = u.latest[u.latest.length - 1];
-        if (maxSeq) {
-          // Get actual max seq from db
-          const events = db.getEvents(u.room_id, 0, 10000);
-          if (events.length > 0) {
-            setReadCursor(agent.id, u.room_id, events[events.length - 1].seq);
+        if (u.latest.length > 0) {
+          if (u.type === 'room') {
+            const events = db.getRoomEvents(u.id, 0, 10000);
+            if (events.length > 0) setReadCursor(agent.id, 'room', u.id, events[events.length - 1].seq);
+          } else {
+            const events = db.getTaskEvents(u.id, 0, 100);
+            if (events.length > 0) setReadCursor(agent.id, 'task', u.id, events[events.length - 1].seq);
           }
         }
       }
@@ -365,12 +394,9 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const taskEvents = db.getTaskEvents(params.task_id);
-      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
-      const roomId = taskEvents[0].room_id;
-      handleWorkflowPropose(params.task_id, roomId, agent.id, params.workflow as any);
-      notifyRoomMembers(roomId, agent.id, JSON.stringify({
-        type: 'task-propose', from: agent.display_name, room_id: roomId,
+      handleWorkflowPropose(params.task_id, agent.id, params.workflow as any);
+      notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: 'task-propose', from: agent.display_name,
         task_id: params.task_id, preview: `Workflow proposed: ${params.workflow.length} steps`,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'proposing', steps: params.workflow.length }) }] };
@@ -387,16 +413,11 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const taskEvents = db.getTaskEvents(params.task_id);
-      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
-      const roomId = taskEvents[0].room_id;
-      const action = handleWorkflowApprove(params.task_id, roomId, agent.id);
-      if (action.assignees) {
-        notifyRoomMembers(roomId, agent.id, JSON.stringify({
-          type: 'step-start', from: agent.display_name, room_id: roomId,
-          task_id: params.task_id, preview: `Step 1 started, assignees: ${action.assignees.join(', ')}`,
-        }));
-      }
+      const action = handleWorkflowApprove(params.task_id, agent.id);
+      notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: 'step-start', from: agent.display_name,
+        task_id: params.task_id, preview: `Step 1 started, assignees: ${action.assignees?.join(', ')}`,
+      }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'approved', action }) }] };
     },
   );
@@ -413,15 +434,12 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const taskEvents = db.getTaskEvents(params.task_id);
-      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
-      const roomId = taskEvents[0].room_id;
-      const action = handleStepComplete(params.task_id, roomId, agent.id, params.step);
+      const action = handleStepComplete(params.task_id, agent.id, params.step);
       const msg = action?.type === 'task-complete' ? 'Task completed!'
         : action?.type === 'step-start' ? `Step ${action.step} started`
         : `Step ${params.step} progress recorded, waiting for others`;
-      notifyRoomMembers(roomId, agent.id, JSON.stringify({
-        type: action?.type || 'step-complete', from: agent.display_name, room_id: roomId,
+      notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: action?.type || 'step-complete', from: agent.display_name,
         task_id: params.task_id, preview: msg,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action: action || 'waiting' }) }] };
@@ -440,15 +458,58 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const taskEvents = db.getTaskEvents(params.task_id);
-      if (taskEvents.length === 0) throw new Error(`Task not found: ${params.task_id}`);
-      const roomId = taskEvents[0].room_id;
-      const action = handleWorkflowReject(params.task_id, roomId, agent.id, params.step, params.reason);
-      notifyRoomMembers(roomId, agent.id, JSON.stringify({
-        type: 'task-reject', from: agent.display_name, room_id: roomId,
+      const action = handleWorkflowReject(params.task_id, agent.id, params.step, params.reason);
+      notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: 'task-reject', from: agent.display_name,
         task_id: params.task_id, preview: `Step ${params.step} rejected → back to step ${action.step}`,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
+    },
+  );
+
+  // --- Team tools ---
+
+  mcp.tool(
+    'hive.team.create',
+    'Create a team room for group collaboration.',
+    {
+      as: asParam,
+      name: z.string().describe('Team name'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTeamCreate(agent.id, { name: params.name });
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.team.join',
+    'Join an existing team room.',
+    {
+      as: asParam,
+      room_id: z.string().describe('Team room ID'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTeamJoin(agent.id, { room_id: params.room_id });
+      notifyRoomMembers(params.room_id, agent.id, JSON.stringify({
+        type: 'join', from: agent.display_name, room_id: params.room_id,
+        preview: `${agent.display_name} joined the team`,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.team.list',
+    'List all available teams.',
+    {},
+    async () => {
+      const result = handleTeamList();
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
 
@@ -592,7 +653,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
 
   // Cleanup stale task rooms every hour
   setInterval(() => {
-    const count = cleanupStaleRooms(7);
+    const count = cleanupStaleTasks(7);
     if (count > 0) log("info", `[cleanup] removed ${count} stale task rooms`);
   }, 60 * 60 * 1000);
 
