@@ -484,9 +484,10 @@ function createMcpServer(): McpServer {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const action = handleStepComplete(params.task_id, agent.id, params.step);
+      const action = handleStepComplete(params.task_id, agent.id, params.step, params.result);
+      const resultPreview = params.result && params.result.length > 100 ? params.result.slice(0, 100) + '...' : params.result;
       const msg = action?.type === 'task-complete' ? 'Task completed!'
-        : action?.type === 'step-start' ? `Step ${action.step} started`
+        : action?.type === 'step-start' ? `Step ${action.step} started. Previous step result: ${resultPreview || 'none'}`
         : `Step ${params.step} progress recorded, waiting for others`;
       notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: action?.type || 'step-complete', from: agent.display_name,

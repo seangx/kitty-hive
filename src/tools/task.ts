@@ -149,7 +149,7 @@ export function handleWorkflowApprove(taskId: string, agentId: string): Workflow
 
 // --- Workflow: step complete ---
 
-export function handleStepComplete(taskId: string, agentId: string, stepNum: number): WorkflowAction | null {
+export function handleStepComplete(taskId: string, agentId: string, stepNum: number, result?: string): WorkflowAction | null {
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
@@ -165,7 +165,7 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
     step.completed_by.push(agentId);
   }
 
-  appendTaskEvent(taskId, 'step-complete', agentId, { step: stepNum });
+  appendTaskEvent(taskId, 'step-complete', agentId, { step: stepNum, result });
   updateTaskStatus(taskId, task.status, { workflow_json: JSON.stringify(steps) });
 
   if (shouldAdvanceStep(step)) {
@@ -178,7 +178,10 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
     } else {
       const nextStep = steps[nextStepNum - 1];
       updateTaskStatus(taskId, 'in_progress', { current_step: nextStepNum });
-      appendTaskEvent(taskId, 'step-start', null, { step: nextStepNum, assignees: nextStep.assignees });
+      appendTaskEvent(taskId, 'step-start', null, {
+        step: nextStepNum, assignees: nextStep.assignees,
+        previous_step_result: result,
+      });
       return { type: 'step-start', step: nextStepNum, assignees: nextStep.assignees };
     }
   }
