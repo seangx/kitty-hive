@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks } from './db.js';
 import { handleStart } from './tools/start.js';
 import { handleDM } from './tools/dm.js';
-import { handleTaskCreate, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
+import { handleTaskCreate, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
 import { handlePost, handleEvents, handleList, handleInfo } from './tools/room.js';
 import { handleTeamCreate, handleTeamJoin, handleTeamList } from './tools/team.js';
 import { ROOM_EVENT_TYPES } from './models.js';
@@ -184,23 +184,28 @@ function createMcpServer(): McpServer {
       'kitty-hive is a multi-agent collaboration server.',
       '',
       '## Getting Started',
-      'FIRST: Call hive.start with your name to register. This returns your agent_id.',
-      'THEN: Use hive.dm to send direct messages, hive.task to delegate tasks, hive.inbox to check unread messages.',
-      'All tools except hive.start and hive.check require the `as` parameter with your agent name.',
+      'Call hive.start with your name to register. All tools except hive.start and hive.check require `as` param.',
       '',
-      '## Task Workflow',
-      'When creating a task with hive.task, use the `input` field to define requirements:',
-      '- `input.description`: what to do',
-      '- `input.output_path`: where to save the result file (use ~/.kitty-hive/artifacts/<task_id>/)',
-      '- `input.output_format`: expected format (png, json, md, etc.)',
+      '## Task Rules (IMPORTANT)',
+      'When you receive a task (via hive.task or task-assigned notification):',
+      '1. Analyze the task and propose a workflow using hive.workflow.propose',
+      '2. The workflow should have clear steps with assignees from your team',
+      '3. Wait for the creator to approve (hive.workflow.approve) before starting',
+      '4. Execute each step, call hive.workflow.step.complete when done',
+      '5. If you see an unassigned task, claim it with hive.task.claim',
       '',
-      'When completing a task, include the result in the task-complete payload:',
-      '- Post hive.room.post with type "task-complete" and content describing the result and file path.',
+      'When you CREATE a task:',
+      '- Always specify `to` (agent name or "role:xxx") to assign it',
+      '- Use `input.description` to describe what needs to be done',
+      '- The assignee will propose a workflow for your approval',
+      '',
+      '## Rooms',
+      '- lobby: global, everyone auto-joins',
+      '- dm: private 1:1 messaging (auto-created by hive.dm)',
+      '- team: group collaboration (hive.team.create/join/list)',
       '',
       '## Shared Artifacts',
-      'Use ~/.kitty-hive/artifacts/ as the shared directory for cross-agent file exchange.',
-      'Convention: ~/.kitty-hive/artifacts/<task_id>/<filename>',
-      'The task creator reads the output_path from the task-complete event.',
+      'Use ~/.kitty-hive/artifacts/<task_id>/ for cross-agent file exchange.',
     ].join('\n'),
   });
 
@@ -260,6 +265,50 @@ function createMcpServer(): McpServer {
         }));
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.task.claim',
+    'Claim an unassigned task. Only works on tasks with status "created" and no assignee.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task ID to claim'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTaskClaim(params.task_id, agent.id);
+      notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: 'task-claimed', from: agent.display_name,
+        task_id: params.task_id, preview: `${agent.display_name} claimed: ${result.title}`,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.tasks',
+    'List tasks. Shows all tasks you created or are assigned to, grouped by status.',
+    {
+      as: asParam,
+      status: z.string().optional().describe('Filter by status: created, proposing, approved, in_progress, completed, failed, canceled'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const tasks = db.getAgentTasks(agent.id, params.status);
+      const board = tasks.map(t => ({
+        task_id: t.id,
+        title: t.title,
+        status: t.status,
+        creator: db.getAgentById(t.creator_agent_id)?.display_name ?? 'unknown',
+        assignee: t.assignee_agent_id ? (db.getAgentById(t.assignee_agent_id)?.display_name ?? 'unknown') : 'unassigned',
+        current_step: t.current_step,
+        has_workflow: !!t.workflow_json,
+        created_at: t.created_at,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(board, null, 2) }] };
     },
   );
 

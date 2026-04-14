@@ -54,6 +54,27 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
   return { task_id: task.id, title: task.title, status, assignee };
 }
 
+// --- hive.task.claim ---
+
+export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.status !== 'created') throw new Error(`Task cannot be claimed (status: ${task.status})`);
+  if (task.assignee_agent_id) throw new Error('Task already has an assignee');
+
+  const agent = getAgentById(agentId);
+  if (!agent) throw new Error('Agent not found');
+
+  const status = validateTransition(task.status as TaskStatus, 'task-claim');
+  appendTaskEvent(taskId, 'task-claim', agentId, {});
+  updateTaskStatus(taskId, status, { assignee_agent_id: agentId });
+
+  return {
+    task_id: taskId, title: task.title, status,
+    assignee: { id: agent.id, display_name: agent.display_name },
+  };
+}
+
 // --- hive.check ---
 
 interface CheckOutput {

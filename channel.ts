@@ -100,13 +100,16 @@ const mcp = new Server(
     },
     instructions: [
       'You are connected to kitty-hive, a multi-agent collaboration server.',
-      'Messages from other agents arrive as <channel source="hive-channel" from="..." room_id="..." type="...">.',
-      'To reply, use the hive-reply tool with the room_id from the message tag.',
-      'To send a DM to another agent, use the hive-dm tool.',
-      'To check all unread messages, use the hive-inbox tool.',
+      'Messages arrive as <channel source="hive-channel" from="..." room_id="..." type="...">.',
       '',
-      'Task artifacts: use ~/.kitty-hive/artifacts/<task_id>/ for cross-agent file exchange.',
-      'When a task-complete message includes an output_path, read the file from that path.',
+      'Communication: hive-dm (send DM), hive-reply (reply in room), hive-inbox (check unread).',
+      'Teams: hive-team-create, hive-team-join (by name), hive-team-list.',
+      'Tasks: hive-task (create), hive-claim (claim unassigned), hive-tasks (list/board), hive-check (status).',
+      'Workflow: hive-propose (propose steps), hive-approve, hive-step-complete, hive-reject.',
+      '',
+      'IMPORTANT: When you receive a task, propose a workflow (hive-propose) before starting.',
+      'When you see an unassigned task, claim it with hive-claim.',
+      'Artifacts: ~/.kitty-hive/artifacts/<task_id>/',
     ].join('\n'),
   },
 )
@@ -155,6 +158,23 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           input: { type: 'object', description: 'Structured task input (description, output_path, output_format)' },
         },
         required: ['title'],
+      },
+    },
+    {
+      name: 'hive-claim',
+      description: 'Claim an unassigned task',
+      inputSchema: {
+        type: 'object',
+        properties: { task_id: { type: 'string', description: 'Task ID' } },
+        required: ['task_id'],
+      },
+    },
+    {
+      name: 'hive-tasks',
+      description: 'List your tasks (created or assigned), grouped by status',
+      inputSchema: {
+        type: 'object',
+        properties: { status: { type: 'string', description: 'Filter: created, in_progress, completed, etc.' } },
       },
     },
     {
@@ -328,6 +348,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       title: args.title,
       input,
     })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-claim') {
+    const result = await hiveCallTool('hive.task.claim', { as: agentName, task_id: args.task_id })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-tasks') {
+    const result = await hiveCallTool('hive.tasks', { as: agentName, status: args.status })
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }
 
