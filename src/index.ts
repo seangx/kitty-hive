@@ -50,22 +50,35 @@ async function cmdServe() {
 }
 
 async function cmdInit() {
-  // Support: kitty-hive init [agent-name] [--port N] [--http]
-  let agentName = '';
-  let useChannel = true;
-  const { port } = parseFlags(1);
+  console.log('🐝 kitty-hive init\n');
 
-  // Parse init-specific args
+  // Parse flags first
+  let explicitPort = false;
+  let explicitHttp = false;
+  let agentName = '';
+  let port = 4123;
+
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--http') { useChannel = false; }
-    else if (args[i] === '--port' || args[i] === '-p') { i++; } // skip, already parsed
+    if (args[i] === '--http') { explicitHttp = true; }
+    else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
+      port = parseInt(args[i + 1], 10); explicitPort = true; i++;
+    }
     else if (args[i] === '--db') { i++; }
     else if (!args[i].startsWith('-')) { agentName = args[i]; }
   }
 
-  // Interactive fallback only if no agent name provided
+  // Interactive: ask what wasn't provided
   if (!agentName) {
     agentName = await ask('Agent name', getDefaultAgentName());
+  }
+  if (!explicitPort) {
+    const p = await ask('Hive server port', '4123');
+    port = parseInt(p, 10) || 4123;
+  }
+  let useChannel = !explicitHttp;
+  if (!explicitHttp) {
+    const mode = await ask('Mode: (c)hannel push or (h)ttp pull?', 'c');
+    useChannel = mode.toLowerCase() !== 'h';
   }
 
   const channelPath = join(__dirname, '..', 'channel.ts');
@@ -94,7 +107,7 @@ async function cmdInit() {
   }
 
   writeFileSync(mcpJsonPath, JSON.stringify(existing, null, 2) + '\n');
-  console.log(`🐝 kitty-hive configured`);
+  console.log(`\n🐝 kitty-hive configured`);
   console.log(`   Agent: ${agentName}`);
   console.log(`   Server: http://localhost:${port}/mcp`);
   console.log(`   Mode: ${useChannel ? 'channel (push)' : 'HTTP (pull)'}`);

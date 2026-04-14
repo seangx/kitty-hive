@@ -36,20 +36,15 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
   }
 
   const task = createTask(input.title, actorId, assignee?.id, input.source_room_id, input.input);
-  let status: TaskStatus = 'created';
 
-  // task-start
-  validateTransition(status, 'task-start');
+  // task-start → proposing (assignee should propose workflow)
+  validateWorkflowTransition('created' as TaskStatus, 'task-start');
   appendTaskEvent(task.id, 'task-start', actorId, {
     title: input.title, input: input.input, assignee_agent_id: assignee?.id ?? null,
   });
 
-  // Auto-claim if assignee
-  if (assignee) {
-    status = validateTransition(status, 'task-claim');
-    appendTaskEvent(task.id, 'task-claim', assignee.id, {});
-    updateTaskStatus(task.id, status, { assignee_agent_id: assignee.id });
-  }
+  let status: TaskStatus = assignee ? 'proposing' : 'created';
+  updateTaskStatus(task.id, status, assignee ? { assignee_agent_id: assignee.id } : {});
 
   return { task_id: task.id, title: task.title, status, assignee };
 }
@@ -65,7 +60,8 @@ export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
   const agent = getAgentById(agentId);
   if (!agent) throw new Error('Agent not found');
 
-  const status = validateTransition(task.status as TaskStatus, 'task-claim');
+  // Claim → proposing (agent should propose workflow next)
+  const status: TaskStatus = 'proposing';
   appendTaskEvent(taskId, 'task-claim', agentId, {});
   updateTaskStatus(taskId, status, { assignee_agent_id: agentId });
 
