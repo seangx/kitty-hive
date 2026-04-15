@@ -1,7 +1,7 @@
 {
   "name": "kitty-hive",
   "version": "0.1.1",
-  "description": "Room-first MCP server for multi-agent collaboration",
+  "description": "MCP server for multi-agent collaboration — DM, tasks, workflow, federation",
   "type": "module",
   "main": "dist/index.js",
   "bin": {

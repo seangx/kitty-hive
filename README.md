@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">kitty-hive</h1>
   <p align="center">
-    Room-first MCP server for multi-agent collaboration
+    MCP server for multi-agent collaboration
     <br />
     <a href="./README.zh.md">中文文档</a>
   </p>

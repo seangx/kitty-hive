@@ -1,7 +1,7 @@
 <p align="center">
   <h1 align="center">kitty-hive</h1>
   <p align="center">
-    Room-first 多 Agent 协作 MCP 服务
+    多 Agent 协作 MCP 服务
     <br />
     <a href="./README.md">English</a>
   </p>
