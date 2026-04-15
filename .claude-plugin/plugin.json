@@ -1,0 +1,12 @@
+{
+  "name": "kitty-hive",
+  "description": "Multi-agent collaboration — DM, tasks, workflow, federation. Real-time push via channels.",
+  "version": "0.1.1",
+  "author": {
+    "name": "seangx",
+    "url": "https://github.com/seangx"
+  },
+  "homepage": "https://github.com/seangx/kitty-hive",
+  "repository": "https://github.com/seangx/kitty-hive",
+  "license": "MIT"
+}
