@@ -90,6 +90,17 @@ export function initDB(dbPath?: string): Database.Database {
       last_seq    INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (agent_id, target_type, target_id)
     );
+
+    CREATE TABLE IF NOT EXISTS peers (
+      id          TEXT PRIMARY KEY,
+      name        TEXT UNIQUE NOT NULL,
+      url         TEXT NOT NULL,
+      secret      TEXT NOT NULL,
+      exposed     TEXT DEFAULT '',
+      status      TEXT DEFAULT 'active' CHECK(status IN ('active','inactive')),
+      created_at  TEXT NOT NULL,
+      last_seen   TEXT
+    );
   `);
 
   return db;
@@ -377,6 +388,63 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
   }
 
   return result;
+}
+
+// --- Peers ---
+
+export interface Peer {
+  id: string;
+  name: string;
+  url: string;
+  secret: string;
+  exposed: string;
+  status: string;
+  created_at: string;
+  last_seen: string | null;
+}
+
+export function addPeer(name: string, url: string, secret: string, exposed: string = ''): Peer {
+  const peer: Peer = {
+    id: ulid(), name, url, secret, exposed, status: 'active',
+    created_at: nowISO(), last_seen: null,
+  };
+  getDB().prepare(`
+    INSERT INTO peers (id, name, url, secret, exposed, status, created_at, last_seen)
+    VALUES (@id, @name, @url, @secret, @exposed, @status, @created_at, @last_seen)
+  `).run(peer);
+  return peer;
+}
+
+export function getPeerByName(name: string): Peer | undefined {
+  return getDB().prepare('SELECT * FROM peers WHERE name = ?').get(name) as Peer | undefined;
+}
+
+export function getPeerBySecret(secret: string): Peer | undefined {
+  return getDB().prepare('SELECT * FROM peers WHERE secret = ? AND status = ?').get(secret, 'active') as Peer | undefined;
+}
+
+export function listPeers(): Peer[] {
+  return getDB().prepare('SELECT * FROM peers ORDER BY created_at DESC').all() as Peer[];
+}
+
+export function removePeer(name: string): boolean {
+  const result = getDB().prepare('DELETE FROM peers WHERE name = ?').run(name);
+  return result.changes > 0;
+}
+
+export function updatePeerExposed(name: string, exposed: string): void {
+  getDB().prepare('UPDATE peers SET exposed = ? WHERE name = ?').run(exposed, name);
+}
+
+export function touchPeer(name: string): void {
+  getDB().prepare('UPDATE peers SET last_seen = ? WHERE name = ?').run(nowISO(), name);
+}
+
+export function isPeerExposed(peerName: string, agentName: string): boolean {
+  const peer = getPeerByName(peerName);
+  if (!peer || !peer.exposed) return false;
+  const exposed = peer.exposed.split(',').map(s => s.trim());
+  return exposed.includes(agentName);
 }
 
 // --- Cleanup ---

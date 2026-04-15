@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB } from './db.js';
-import { writeFileSync, existsSync, readFileSync, unlinkSync } from 'node:fs';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName } from './db.js';
+import { generateToken } from './utils.js';
+import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir } from 'node:os';
@@ -234,6 +235,153 @@ async function cmdAgentList() {
   }
 }
 
+// --- Node config ---
+
+function getConfigPath(): string {
+  return join(homedir(), '.kitty-hive', 'config.json');
+}
+
+function getNodeConfig(): { name?: string } {
+  const p = getConfigPath();
+  if (!existsSync(p)) return {};
+  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; }
+}
+
+function setNodeConfig(config: Record<string, any>): void {
+  const p = getConfigPath();
+  mkdirSync(join(p, '..'), { recursive: true });
+  const existing = getNodeConfig();
+  writeFileSync(p, JSON.stringify({ ...existing, ...config }, null, 2) + '\n');
+}
+
+function getNodeName(): string {
+  return getNodeConfig().name || require('os').hostname().split('.')[0];
+}
+
+// --- Peer commands ---
+
+async function cmdPeerAdd() {
+  const { dbPath } = parseFlags(1);
+  // kitty-hive peer add <name> <url> [--expose a,b] [--secret s]
+  let peerName = '';
+  let peerUrl = '';
+  let exposed = '';
+  let secret = '';
+
+  let positional = 0;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--expose' && args[i + 1]) { exposed = args[i + 1]; i++; }
+    else if (args[i] === '--secret' && args[i + 1]) { secret = args[i + 1]; i++; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-')) {
+      if (positional === 0) peerName = args[i];
+      else if (positional === 1) peerUrl = args[i];
+      positional++;
+    }
+  }
+
+  if (!peerName || !peerUrl) {
+    console.log('Usage: kitty-hive peer add <name> <url> [--expose agent1,agent2] [--secret s]');
+    process.exit(1);
+  }
+
+  initDB(dbPath);
+
+  if (getPeerByName(peerName)) {
+    console.log(`Peer "${peerName}" already exists. Remove it first.`);
+    process.exit(1);
+  }
+
+  if (!secret) {
+    secret = 'sk_' + generateToken().slice(0, 32);
+  }
+
+  const peer = addPeer(peerName, peerUrl, secret, exposed);
+  console.log(`🤝 Peer added: ${peerName}`);
+  console.log(`   URL: ${peerUrl}`);
+  console.log(`   Secret: ${secret}`);
+  console.log(`   Exposed agents: ${exposed || 'none (use --expose to add)'}`);
+  console.log(`\n   Give this secret to the peer so they can connect back.`);
+}
+
+async function cmdPeerList() {
+  const { dbPath } = parseFlags(1);
+  initDB(dbPath);
+  const peers = listPeers();
+  if (peers.length === 0) {
+    console.log('No peers configured.');
+    return;
+  }
+  for (const p of peers) {
+    console.log(`  ${p.name} (${p.status}) — ${p.url}`);
+    console.log(`    exposed: ${p.exposed || 'none'}`);
+    console.log(`    last seen: ${p.last_seen || 'never'}`);
+  }
+}
+
+async function cmdPeerRemove() {
+  const { dbPath } = parseFlags(1);
+  const name = args[2];
+  if (!name) {
+    console.log('Usage: kitty-hive peer remove <name>');
+    process.exit(1);
+  }
+  initDB(dbPath);
+  if (removePeer(name)) {
+    console.log(`✅ Peer "${name}" removed.`);
+  } else {
+    console.log(`Peer "${name}" not found.`);
+  }
+}
+
+async function cmdPeerExpose() {
+  const { dbPath } = parseFlags(1);
+  const peerName = args[2];
+  if (!peerName) {
+    console.log('Usage: kitty-hive peer expose <peer> --add/--remove <agent>');
+    process.exit(1);
+  }
+  initDB(dbPath);
+  const peer = getPeerByName(peerName);
+  if (!peer) {
+    console.log(`Peer "${peerName}" not found.`);
+    process.exit(1);
+  }
+
+  const current = peer.exposed ? peer.exposed.split(',').map(s => s.trim()).filter(Boolean) : [];
+
+  for (let i = 3; i < args.length; i++) {
+    if (args[i] === '--add' && args[i + 1]) {
+      const agents = args[i + 1].split(',').map(s => s.trim());
+      for (const a of agents) if (!current.includes(a)) current.push(a);
+      i++;
+    } else if (args[i] === '--remove' && args[i + 1]) {
+      const agents = args[i + 1].split(',').map(s => s.trim());
+      for (const a of agents) {
+        const idx = current.indexOf(a);
+        if (idx >= 0) current.splice(idx, 1);
+      }
+      i++;
+    }
+  }
+
+  updatePeerExposed(peerName, current.join(','));
+  console.log(`✅ Peer "${peerName}" exposed agents: ${current.join(', ') || 'none'}`);
+}
+
+async function cmdConfigSet() {
+  // kitty-hive config set name marvin
+  const key = args[2];
+  const value = args[3];
+  if (!key || !value) {
+    console.log('Usage: kitty-hive config set <key> <value>');
+    console.log('  e.g. kitty-hive config set name marvin');
+    process.exit(1);
+  }
+  setNodeConfig({ [key]: value });
+  console.log(`✅ ${key} = ${value}`);
+}
+
 function getDefaultAgentName(): string {
   // Try package.json name
   const pkgPath = join(process.cwd(), 'package.json');
@@ -251,19 +399,17 @@ function showHelp() {
   console.log(`🐝 kitty-hive — multi-agent collaboration server
 
 Usage:
-  kitty-hive serve [--port 4100] [--db path] [-v|-q]  Start the server
-  kitty-hive init [name] [--port 4123] [--http]        Configure hive for this project
-  kitty-hive status [--port 4100]                      Server & agent status
-  kitty-hive agent list                                List all agents
-  kitty-hive agent remove <name>                       Remove an agent
-  kitty-hive db clear [--db path]                      Clear the database
-
-Options:
-  --port, -p   Port (default: 4100 for serve, 4123 for init)
-  --db         Database path (default: ~/.kitty-hive/hive.db)
-  --http       Use HTTP MCP instead of channel plugin
-  -v/--verbose Show debug logs (serve)
-  -q/--quiet   Only show warnings and errors (serve)`);
+  kitty-hive serve [--port 4100] [--db path] [-v|-q]     Start the server
+  kitty-hive init [name] [--port 4123] [--http]           Configure for this project
+  kitty-hive status [--port 4100]                         Server & agent status
+  kitty-hive agent list                                   List agents
+  kitty-hive agent remove <name>                          Remove an agent
+  kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer
+  kitty-hive peer list                                    List peers
+  kitty-hive peer remove <name>                           Remove a peer
+  kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
+  kitty-hive config set <key> <value>                     Set config (e.g. name)
+  kitty-hive db clear [--db path]                         Clear the database`);
 }
 
 // --- Main ---
@@ -283,6 +429,26 @@ switch (command) {
       cmdAgentRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'list') {
       cmdAgentList().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else {
+      showHelp();
+    }
+    break;
+  case 'peer':
+    if (args[1] === 'add') {
+      cmdPeerAdd().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'list') {
+      cmdPeerList().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'remove') {
+      cmdPeerRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'expose') {
+      cmdPeerExpose().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else {
+      showHelp();
+    }
+    break;
+  case 'config':
+    if (args[1] === 'set') {
+      cmdConfigSet().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else {
       showHelp();
     }

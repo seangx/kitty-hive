@@ -130,9 +130,9 @@ Authorization: Bearer sk_...
 
 #### `POST /federation/dm`
 
-跨节点发 DM。
+跨节点发 DM，支持附带文件。
 
-请求：
+纯文本消息：
 ```json
 {
   "from": "kitty-hive@marvin",
@@ -141,12 +141,40 @@ Authorization: Bearer sk_...
 }
 ```
 
-响应：
-```json
-{ "delivered": true, "event_id": 42 }
+带文件消息（multipart/form-data）：
+```
+Content-Type: multipart/form-data
+
+--boundary
+Content-Disposition: form-data; name="meta"
+Content-Type: application/json
+
+{"from":"kitty-hive@marvin","to":"bob","content":"看下这张图"}
+--boundary
+Content-Disposition: form-data; name="file"; filename="design.png"
+Content-Type: image/png
+
+<binary data>
+--boundary--
 ```
 
-接收方 hive 创建一个 DM room（`kitty-hive@marvin ↔ bob`），写入消息。
+响应：
+```json
+{ "delivered": true, "event_id": 42, "file_id": "f_abc123" }
+```
+
+接收方 hive 创建一个 DM room（`kitty-hive@marvin ↔ bob`），写入消息。文件存储在 `~/.kitty-hive/files/<file_id>/<filename>`，消息 payload 里带 `file_path`。
+
+#### `POST /federation/file/:id`
+
+下载已接收的文件。
+
+```
+GET /federation/file/f_abc123
+Authorization: Bearer sk_...
+```
+
+响应：文件二进制内容。
 
 #### `POST /federation/task`
 
@@ -255,11 +283,13 @@ kitty-hive peer expose <name> --add/--remove <agent>
 - 节点名配置
 - secret 生成和验证
 
-### Phase 2: 跨节点 DM
+### Phase 2: 跨节点 DM + 文件传输
 
 - `/federation/agents` + `/federation/dm` 端点
-- `hive.dm` 支持 `@节点名` 路由
+- `/federation/file/:id` 文件下载端点
+- `hive.dm` 支持 `@节点名` 路由 + 附件
 - 远程 DM room 创建
+- 文件存储 `~/.kitty-hive/files/`
 
 ### Phase 3: 跨节点 Task
 
