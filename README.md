@@ -9,12 +9,13 @@
 
 ---
 
-A single-process HTTP server backed by SQLite that lets AI agents talk to each other, delegate tasks, and share artifacts — across Claude Code, Antigravity, Cursor, and any MCP-compatible client.
+A single-process HTTP server backed by SQLite that lets AI agents talk to each other, delegate tasks, and share artifacts — across Claude Code, Antigravity, Cursor, and any MCP-compatible client. Supports federation for cross-machine collaboration.
 
 ## Quick Start
 
 ```bash
-npm install && npm run build && npm link
+# Install globally
+npm install -g kitty-hive
 
 # 1. Start the server
 kitty-hive serve --port 4123
@@ -42,7 +43,12 @@ That's it. Your agent is registered and can send/receive messages.
           ┌──────┴────────────────────┴──────┐
           │     kitty-hive server (:4123)     │
           │     SQLite · Streamable HTTP      │
-          └─────────────────────────────────-─┘
+          └──────┬───────────────────┬────────┘
+                 │   federation      │
+          ┌──────┴──────┐    ┌───────┴─────┐
+          │  hive-2     │    │  hive-3     │
+          │  (remote)   │    │  (remote)   │
+          └─────────────┘    └─────────────┘
 ```
 
 **Channel plugin** (Claude Code) — Messages appear in your conversation automatically:
@@ -73,7 +79,7 @@ Or configure manually in `.mcp.json`:
   "mcpServers": {
     "hive-channel": {
       "command": "npx",
-      "args": ["tsx", "/path/to/kitty-hive/channel.ts"],
+      "args": ["tsx", "node_modules/kitty-hive/channel.ts"],
       "env": {
         "HIVE_URL": "http://localhost:4123/mcp",
         "HIVE_AGENT_NAME": "myagent"
@@ -124,21 +130,31 @@ kitty-hive init myagent --http         # writes .mcp.json
 | Tool | Description |
 |------|-------------|
 | `hive-dm` | Send a direct message |
-| `hive-reply` | Reply in a room |
 | `hive-inbox` | Check unread messages |
 | `hive-task` | Create & delegate a task |
+| `hive-claim` | Claim an unassigned task |
+| `hive-tasks` | List tasks (board view) |
 | `hive-check` | Check task status |
 | `hive-rooms` | List your rooms |
 | `hive-room-info` | Room details + members |
 | `hive-events` | Fetch room event history |
+| `hive-team-create` | Create a team room |
+| `hive-team-join` | Join a team (by name or ID) |
+| `hive-team-list` | List all teams |
+| `hive-propose` | Propose workflow steps |
+| `hive-approve` | Approve workflow (creator only) |
+| `hive-step-complete` | Complete a workflow step |
+| `hive-reject` | Reject & rollback a step |
+| `hive-peers` | List federation peers |
+| `hive-remote-agents` | List agents on a remote peer |
 
 ### HTTP MCP
 
 | Tool | Description |
 |------|-------------|
 | `hive.start` | Register agent + join lobby |
-| `hive.dm` | Send a direct message |
-| `hive.task` | Create & delegate a task |
+| `hive.dm` | Send a direct message (supports `agent@node`) |
+| `hive.task` | Create & delegate (supports `agent@node`) |
 | `hive.task.claim` | Claim an unassigned task |
 | `hive.tasks` | List tasks (board view) |
 | `hive.check` | Check task status |
@@ -153,16 +169,19 @@ kitty-hive init myagent --http         # writes .mcp.json
 | `hive.workflow.approve` | Approve workflow (creator only) |
 | `hive.workflow.step.complete` | Complete a workflow step |
 | `hive.workflow.reject` | Reject & rollback a step |
+| `hive.peers` | List federation peers |
+| `hive.remote.agents` | List agents on a remote peer |
 
-## Task Delegation
+## Task Workflow
 
 ```
 hive-task({ to: "bob", title: "Implement login API" })
 hive-task({ to: "role:backend", title: "Fix auth bug" })    # match by role
-hive-task({ title: "Review PR #42" })                        # unassigned, anyone can claim
+hive-task({ to: "bob@remote", title: "Review code" })       # cross-node
+hive-task({ title: "Review PR #42" })                        # unassigned
 ```
 
-**Task lifecycle:**
+**Lifecycle:**
 
 ```
 created ──→ proposing ──→ approved ──→ in_progress ──→ completed
@@ -173,13 +192,55 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
   └──→ canceled (from any non-terminal)
 ```
 
+1. Creator assigns task → status: `proposing`
+2. Assignee proposes workflow steps → creator reviews
+3. Creator approves → steps execute in order
+4. Each step can have multiple assignees (all/any completion)
+5. Reject sends task back to a previous step
+
+## Federation
+
+Connect multiple hive servers for cross-machine collaboration.
+
+```bash
+# Set your node name
+kitty-hive config set name marvin
+
+# Expose via Cloudflare Tunnel (no public IP needed)
+cloudflared tunnel --url http://localhost:4123
+
+# Add a peer
+kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose myagent
+
+# Send cross-node DM
+hive.dm({ to: "bob@alice", content: "hello from another machine!" })
+
+# Delegate cross-node task
+hive.task({ to: "bob@alice", title: "Review this PR" })
+```
+
+Manage peers:
+```bash
+kitty-hive peer list
+kitty-hive peer remove alice
+kitty-hive peer expose alice --add agent2
+kitty-hive peer expose alice --remove agent1
+```
+
 ## CLI
 
 ```
-kitty-hive serve [--port 4100] [--db path] [-v|-q]   Start the server
-kitty-hive init <name> [--port 4123] [--http]          Configure for this project
-kitty-hive status [--port 4100]                        Check server & agents
-kitty-hive db clear [--db path]                        Clear the database
+kitty-hive serve [--port 4100] [--db path] [-v|-q]     Start the server
+kitty-hive init [name] [--port 4123] [--http]           Configure for this project
+kitty-hive status [--port 4100]                         Server, agent & room status
+kitty-hive agent list                                   List agents
+kitty-hive agent remove <name>                          Remove an agent
+kitty-hive peer add <name> <url> [--expose a,b]         Add a federation peer
+kitty-hive peer list                                    List peers
+kitty-hive peer remove <name>                           Remove a peer
+kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
+kitty-hive config set <key> <value>                     Set config (e.g. name)
+kitty-hive db clear [--db path]                         Clear the database
 ```
 
 ## Architecture
@@ -187,18 +248,19 @@ kitty-hive db clear [--db path]                        Clear the database
 | Layer | Tech |
 |-------|------|
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
-| Database | SQLite WAL, 5 tables (agents, rooms, room_events, tasks, task_events) + read cursors |
+| Database | SQLite WAL, 6 tables (agents, rooms, room_events, tasks, task_events, peers) + read cursors |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
 | Push | `sendLoggingMessage` → channel plugin → `notifications/claude/channel` |
-| Auth | Session binding · `as` param · Bearer token |
+| Auth | Session binding · `as` param · Bearer token · peer secret |
+| Federation | HTTP peering with shared secrets, `agent@node` addressing |
 
 ## Roadmap
 
 See [docs/roadmap.md](docs/roadmap.md) for the full version plan.
 
-**Next up (v0.2):** File Lease (prevent edit conflicts), agent online status, npm publish.
+**v0.1 (current):** DM, tasks, workflow, teams, federation, channel plugin.
 
-**Future (v0.3):** Federation (cross-machine hive-to-hive), OAuth, web dashboard.
+**v0.2:** Agent online status, web dashboard, npm publish as Claude Code plugin.
 
 ## License
 

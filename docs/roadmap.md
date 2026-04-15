@@ -24,22 +24,13 @@
 
 ## v0.2 (Next)
 
-- [ ] **File Lease** — lock files during editing to prevent multi-agent conflicts
-  - `hive.file.lock({ path, duration })` / `hive.file.unlock()`
-  - Other agents see lock status before editing
-  - Auto-expire after duration
+- [ ] **npm publish** — `npm install -g kitty-hive` without cloning repo
+- [ ] **Claude Code plugin marketplace** — publish as official plugin
 - [ ] **Agent online status** — heartbeat-based, auto-mark offline after timeout
-- [ ] **Summary compaction** — compress old messages/events to save storage
-- [ ] **npm publish** — `npx kitty-hive serve` without cloning repo
-- [ ] **Apple Reminders sync** — server-side hook for task → Reminders
+- [ ] **Web dashboard** — visual task board, agent status, room activity
 
 ## v0.3 (Future)
 
-- [ ] **Federation** — hive-to-hive communication across machines
-  - Discovery protocol (mDNS or manual peering)
-  - Cross-hive DM and task delegation
-  - Agent identity across federated nodes
 - [ ] **OAuth authentication** — proper auth for multi-user deployments
-- [ ] **Web dashboard** — visual task board, agent status, room activity
-- [ ] **Channel plugin marketplace** — publish as official Claude Code plugin
 - [ ] **ANP identity layer** — standardized agent identity protocol
+- [ ] **Summary compaction** — compress old messages/events to save storage
