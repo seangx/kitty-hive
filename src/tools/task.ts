@@ -1,7 +1,7 @@
 import {
   getAgentById, getAgentByName, findAgentByRole,
   createTask, getTaskById, updateTaskStatus,
-  appendTaskEvent, getTaskEvents,
+  appendTaskEvent, getTaskEvents, getPeerByName,
 } from '../db.js';
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
 import type { TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
@@ -47,6 +47,77 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
   updateTaskStatus(task.id, status, assignee ? { assignee_agent_id: assignee.id } : {});
 
   return { task_id: task.id, title: task.title, status, assignee };
+}
+
+// --- Federated task ---
+
+function parseTarget(to: string): { agent: string; node?: string } {
+  const at = to.lastIndexOf('@');
+  if (at > 0) return { agent: to.slice(0, at), node: to.slice(at + 1) };
+  return { agent: to };
+}
+
+export async function handleTaskCreateAsync(actorId: string, input: TaskInput): Promise<TaskOutput> {
+  if (!input.to) return handleTaskCreate(actorId, input);
+
+  const { agent: targetName, node } = parseTarget(input.to);
+  if (!node) return handleTaskCreate(actorId, { ...input, to: targetName });
+
+  // Federated task
+  const peer = getPeerByName(node);
+  if (!peer) throw new Error(`Peer "${node}" not found`);
+
+  const actor = getAgentById(actorId);
+  const fromName = actor?.display_name ?? actorId;
+
+  const res = await fetch(peer.url.replace('/mcp', '/federation/task'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${peer.secret}`,
+      'X-Hive-Peer': node,
+    },
+    body: JSON.stringify({ from: fromName, to: targetName, title: input.title, input: input.input }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(`Federation task failed: ${(err as any).error || res.statusText}`);
+  }
+
+  const result = await res.json() as { task_id: string; status: string };
+  return {
+    task_id: result.task_id, title: input.title,
+    status: result.status as TaskStatus,
+    assignee: { id: targetName, display_name: `${targetName}@${node}` },
+  };
+}
+
+// --- Federated task event ---
+
+export async function sendFederatedTaskEvent(
+  taskId: string, peerNode: string, fromName: string,
+  type: string, extras: Record<string, any> = {},
+): Promise<any> {
+  const peer = getPeerByName(peerNode);
+  if (!peer) throw new Error(`Peer "${peerNode}" not found`);
+
+  const res = await fetch(peer.url.replace('/mcp', '/federation/task/event'), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${peer.secret}`,
+      'X-Hive-Peer': peerNode,
+    },
+    body: JSON.stringify({ from: fromName, task_id: taskId, type, ...extras }),
+  });
+
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(`Federation task event failed: ${(err as any).error || res.statusText}`);
+  }
+
+  return res.json();
 }
 
 // --- hive.task.claim ---

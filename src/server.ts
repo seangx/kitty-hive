@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks, getPeerBySecret, isPeerExposed, touchPeer, listPeers, getPeerByName } from './db.js';
 import { handleStart } from './tools/start.js';
 import { handleDM, handleDMAsync } from './tools/dm.js';
-import { handleTaskCreate, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
+import { handleTaskCreate, handleTaskCreateAsync, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
 import { handleEvents, handleList, handleInfo } from './tools/room.js';
 import { handleTeamCreate, handleTeamJoin, handleTeamList } from './tools/team.js';
 import { ROOM_EVENT_TYPES } from './models.js';
@@ -250,17 +250,17 @@ function createMcpServer(): McpServer {
 
   mcp.tool(
     'hive.task',
-    'Create a task and delegate to an agent or role.',
+    'Create a task and delegate. Use "agent@node" for cross-node delegation.',
     {
       as: asParam,
-      to: z.string().optional().describe('Target: agent ID, display name, or "role:ux"'),
+      to: z.string().optional().describe('Target: agent name, "role:ux", or "agent@node" for federation'),
       title: z.string().describe('Task title'),
       input: z.record(z.string(), z.unknown()).optional().describe('Structured task input (optional)'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = handleTaskCreate(agent.id, { to: params.to, title: params.title, input: params.input as object });
+      const result = await handleTaskCreateAsync(agent.id, { to: params.to, title: params.title, input: params.input as object });
       if (result.assignee) {
         notifyAgents([result.assignee.id], agent.id, JSON.stringify({
           type: 'task-assigned', from: agent.display_name,
@@ -543,6 +543,47 @@ function createMcpServer(): McpServer {
     async () => {
       const result = handleTeamList();
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  // --- Federation MCP tools ---
+
+  mcp.tool(
+    'hive.peers',
+    'List connected federation peers.',
+    {},
+    async () => {
+      const peers = db.listPeers();
+      const result = peers.map(p => ({
+        name: p.name, url: p.url, status: p.status,
+        exposed: p.exposed, last_seen: p.last_seen,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.remote.agents',
+    'List agents on a remote peer node.',
+    {
+      peer: z.string().describe('Peer node name'),
+    },
+    async (params) => {
+      const peer = db.getPeerByName(params.peer);
+      if (!peer) throw new Error(`Peer "${params.peer}" not found`);
+
+      const res = await fetch(peer.url.replace('/mcp', '/federation/agents'), {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${peer.secret}`,
+          'X-Hive-Peer': peer.name,
+        },
+      });
+
+      if (!res.ok) throw new Error(`Failed to fetch agents from peer "${params.peer}"`);
+      const data = await res.json();
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
     },
   );
 
@@ -855,6 +896,105 @@ async function handleFederation(req: IncomingMessage, res: ServerResponse, url: 
       'Content-Disposition': `attachment; filename="${files[0]}"`,
     });
     res.end(fileData);
+    return;
+  }
+
+  // --- POST /federation/task ---
+  if (url.pathname === '/federation/task' && req.method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    const { from, to, title, input } = body;
+
+    if (!from || !to || !title) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing from, to, or title' }));
+      return;
+    }
+
+    if (!db.isPeerExposed(peer.name, to)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Agent "${to}" is not accessible` }));
+      return;
+    }
+
+    // Create remote agent placeholder
+    let remoteAgent = db.getAgentByName(from);
+    if (!remoteAgent) {
+      remoteAgent = db.createAgent(from, 'remote', `peer:${peerName}`, '');
+    }
+
+    const targetAgent = db.getAgentByName(to);
+    if (!targetAgent) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Agent "${to}" not found` }));
+      return;
+    }
+
+    const result = handleTaskCreate(remoteAgent.id, { to, title, input });
+
+    // Notify assignee
+    notifyTaskParticipants(result.task_id, remoteAgent.id, JSON.stringify({
+      type: 'task-assigned', from, task_id: result.task_id, preview: title,
+    }));
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ task_id: result.task_id, status: result.status }));
+    return;
+  }
+
+  // --- POST /federation/task/event ---
+  if (url.pathname === '/federation/task/event' && req.method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    const { from, task_id, type, workflow, step, reason, result: stepResult } = body;
+
+    if (!from || !task_id || !type) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing from, task_id, or type' }));
+      return;
+    }
+
+    let remoteAgent = db.getAgentByName(from);
+    if (!remoteAgent) {
+      remoteAgent = db.createAgent(from, 'remote', `peer:${peerName}`, '');
+    }
+
+    const task = db.getTaskById(task_id);
+    if (!task) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Task not found: ${task_id}` }));
+      return;
+    }
+
+    try {
+      let action: any = null;
+      switch (type) {
+        case 'task-propose':
+          handleWorkflowPropose(task_id, remoteAgent.id, workflow);
+          break;
+        case 'task-approve':
+          action = handleWorkflowApprove(task_id, remoteAgent.id);
+          break;
+        case 'step-complete':
+          action = handleStepComplete(task_id, remoteAgent.id, step, stepResult);
+          break;
+        case 'task-reject':
+          action = handleWorkflowReject(task_id, remoteAgent.id, step, reason);
+          break;
+        default:
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: `Unknown event type: ${type}` }));
+          return;
+      }
+
+      notifyTaskParticipants(task_id, remoteAgent.id, JSON.stringify({
+        type, from, task_id, preview: `${type} from ${from}`,
+      }));
+
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, action }));
+    } catch (err: any) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 

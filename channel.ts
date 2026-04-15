@@ -106,6 +106,7 @@ const mcp = new Server(
       'Teams: hive-team-create, hive-team-join (by name), hive-team-list.',
       'Tasks: hive-task (create), hive-claim (claim unassigned), hive-tasks (list/board), hive-check (status).',
       'Workflow: hive-propose (propose steps), hive-approve, hive-step-complete, hive-reject.',
+      'Federation: hive-peers (list peers), hive-remote-agents (list remote agents). Use agent@node for cross-node DM/task.',
       '',
       'IMPORTANT: When you receive a task, propose a workflow (hive-propose) before starting.',
       'When you see an unassigned task, claim it with hive-claim.',
@@ -298,6 +299,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['task_id', 'step'],
       },
     },
+    {
+      name: 'hive-peers',
+      description: 'List connected federation peers',
+      inputSchema: { type: 'object', properties: {} },
+    },
+    {
+      name: 'hive-remote-agents',
+      description: 'List agents on a remote peer node',
+      inputSchema: {
+        type: 'object',
+        properties: { peer: { type: 'string', description: 'Peer node name' } },
+        required: ['peer'],
+      },
+    },
   ],
 }))
 
@@ -415,6 +430,16 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       step: Number(args.step),
       reason: args.reason,
     })
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-peers') {
+    const result = await hiveCallTool('hive.peers', {})
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
+
+  if (name === 'hive-remote-agents') {
+    const result = await hiveCallTool('hive.remote.agents', { peer: args.peer })
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }
 
