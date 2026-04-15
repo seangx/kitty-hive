@@ -16,7 +16,7 @@ const args = process.argv.slice(2);
 const command = args[0];
 
 function parseFlags(startIdx: number) {
-  let port = 4100;
+  let port = 4123;
   let dbPath: string | undefined;
   for (let i = startIdx; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
@@ -399,9 +399,9 @@ function showHelp() {
   console.log(`🐝 kitty-hive — multi-agent collaboration server
 
 Usage:
-  kitty-hive serve [--port 4100] [--db path] [-v|-q]     Start the server
+  kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
   kitty-hive init [name] [--port 4123] [--http]           Configure for this project
-  kitty-hive status [--port 4100]                         Server & agent status
+  kitty-hive status [--port 4123]                         Server & agent status
   kitty-hive agent list                                   List agents
   kitty-hive agent remove <name>                          Remove an agent
   kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer
