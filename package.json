@@ -1,18 +1,38 @@
 {
   "name": "kitty-hive",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Room-first MCP server for multi-agent collaboration",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
     "kitty-hive": "dist/index.js"
   },
+  "files": [
+    "dist/",
+    "channel.ts",
+    "README.md",
+    "README.zh.md"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "start": "node dist/index.js serve",
+    "prepublishOnly": "npm run build",
     "test": "node --test dist/**/*.test.js"
   },
+  "keywords": [
+    "mcp",
+    "multi-agent",
+    "collaboration",
+    "ai-agent",
+    "streamable-http",
+    "claude-code"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/seangx/kitty-hive"
+  },
+  "license": "MIT",
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.12.0",
     "better-sqlite3": "^11.8.0"
