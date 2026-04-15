@@ -1,0 +1,24 @@
+{
+  "name": "kitty-hive",
+  "owner": {
+    "name": "seangx",
+    "email": "seangx@github.com"
+  },
+  "metadata": {
+    "description": "Multi-agent collaboration — DM, tasks, workflow, federation"
+  },
+  "plugins": [
+    {
+      "name": "kitty-hive",
+      "source": ".",
+      "description": "Multi-agent collaboration MCP server with real-time push via channels",
+      "version": "0.1.1",
+      "author": {
+        "name": "seangx"
+      },
+      "homepage": "https://github.com/seangx/kitty-hive",
+      "license": "MIT",
+      "keywords": ["mcp", "multi-agent", "collaboration", "federation", "channels"]
+    }
+  ]
+}
