@@ -4,9 +4,9 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
-import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks } from './db.js';
+import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks, getPeerBySecret, isPeerExposed, touchPeer, listPeers, getPeerByName } from './db.js';
 import { handleStart } from './tools/start.js';
-import { handleDM } from './tools/dm.js';
+import { handleDM, handleDMAsync } from './tools/dm.js';
 import { handleTaskCreate, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
 import { handleEvents, handleList, handleInfo } from './tools/room.js';
 import { handleTeamCreate, handleTeamJoin, handleTeamList } from './tools/team.js';
@@ -228,20 +228,22 @@ function createMcpServer(): McpServer {
 
   mcp.tool(
     'hive.dm',
-    'Send a direct message to another agent. Auto-creates a DM room if needed.',
+    'Send a direct message. Use "agent@node" for cross-node DM (federation).',
     {
       as: asParam,
-      to: z.string().describe('Target agent ID or display name'),
+      to: z.string().describe('Target agent name, or "agent@node" for federation'),
       content: z.string().describe('Message content'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = handleDM(agent.id, params);
-      notifyRoomMembers(result.room_id, agent.id, JSON.stringify({
-        type: 'dm', from: agent.display_name, room_id: result.room_id,
-        preview: params.content && params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content,
-      }));
+      const result = await handleDMAsync(agent.id, params);
+      if (!result.federated) {
+        notifyRoomMembers(result.room_id, agent.id, JSON.stringify({
+          type: 'dm', from: agent.display_name, room_id: result.room_id,
+          preview: params.content && params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content,
+        }));
+      }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
@@ -577,6 +579,12 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
 
+    // --- Federation routes ---
+    if (url.pathname.startsWith('/federation/')) {
+      await handleFederation(req, res, url);
+      return;
+    }
+
     if (url.pathname !== '/mcp') {
       res.writeHead(404, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Not found. MCP endpoint is at /mcp' }));
@@ -695,4 +703,172 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
     }
     process.exit(0);
   });
+}
+
+// --- Federation handler ---
+
+import { mkdirSync as mkdirSyncFs, writeFileSync as writeFileSyncFs, readFileSync as readFileSyncFs, existsSync as existsSyncFs } from 'node:fs';
+import { join as joinPath } from 'node:path';
+import { homedir as homedirFn } from 'node:os';
+
+function authenticatePeer(req: IncomingMessage): db.Peer | null {
+  const authHeader = req.headers.authorization;
+  if (!authHeader) return null;
+  const match = authHeader.match(/^Bearer\s+(\S+)$/i);
+  if (!match) return null;
+  const peer = db.getPeerBySecret(match[1]);
+  if (peer) db.touchPeer(peer.name);
+  return peer ?? null;
+}
+
+async function readBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of req) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString();
+}
+
+function filesDir(): string {
+  const dir = joinPath(homedirFn(), '.kitty-hive', 'files');
+  mkdirSyncFs(dir, { recursive: true });
+  return dir;
+}
+
+async function handleFederation(req: IncomingMessage, res: ServerResponse, url: URL) {
+  const peer = authenticatePeer(req);
+  if (!peer) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
+
+  const peerName = req.headers['x-hive-peer'] as string || peer.name;
+  log("info", `[federation] ${req.method} ${url.pathname} from peer=${peerName}`);
+
+  // --- GET /federation/agents ---
+  if (url.pathname === '/federation/agents' && req.method === 'POST') {
+    const exposed = peer.exposed ? peer.exposed.split(',').map(s => s.trim()).filter(Boolean) : [];
+    const agents = exposed.map(name => {
+      const agent = db.getAgentByName(name);
+      return agent ? { name: agent.display_name, roles: agent.roles, status: agent.status } : null;
+    }).filter(Boolean);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ node: getNodeName(), agents }));
+    return;
+  }
+
+  // --- POST /federation/dm ---
+  if (url.pathname === '/federation/dm' && req.method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    const { from, to, content, file_id } = body;
+
+    if (!from || !to || !content) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing from, to, or content' }));
+      return;
+    }
+
+    // Check if target agent is exposed to this peer
+    if (!db.isPeerExposed(peer.name, to)) {
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Agent "${to}" is not accessible` }));
+      return;
+    }
+
+    // Create or find remote agent placeholder
+    const remoteAgentName = `${from}`;
+    let remoteAgent = db.getAgentByName(remoteAgentName);
+    if (!remoteAgent) {
+      remoteAgent = db.createAgent(remoteAgentName, 'remote', `peer:${peerName}`, '');
+    }
+
+    // Deliver DM
+    const targetAgent = db.getAgentByName(to);
+    if (!targetAgent) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `Agent "${to}" not found` }));
+      return;
+    }
+
+    const msgContent = file_id ? `${content}\n\n[file: ${file_id}]` : content;
+    const result = handleDM(remoteAgent.id, { to, content: msgContent });
+
+    // Notify local agent
+    notifyRoomMembers(result.room_id, remoteAgent.id, JSON.stringify({
+      type: 'dm', from: remoteAgentName, room_id: result.room_id,
+      preview: content.length > 200 ? content.slice(0, 200) + ' [summary]' : content,
+    }));
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ delivered: true, event_id: result.event_id }));
+    return;
+  }
+
+  // --- POST /federation/file (upload) ---
+  if (url.pathname === '/federation/file' && req.method === 'POST') {
+    const chunks: Buffer[] = [];
+    for await (const chunk of req) chunks.push(chunk as Buffer);
+    const data = Buffer.concat(chunks);
+
+    const filename = (req.headers['x-filename'] as string) || 'upload';
+    const fileId = 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+    const fileDir = joinPath(filesDir(), fileId);
+    mkdirSyncFs(fileDir, { recursive: true });
+    writeFileSyncFs(joinPath(fileDir, filename), data);
+
+    log("info", `[federation] file received: ${fileId}/${filename} (${data.length} bytes)`);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ file_id: fileId, filename, size: data.length }));
+    return;
+  }
+
+  // --- GET /federation/file/:id ---
+  if (url.pathname.startsWith('/federation/file/') && req.method === 'GET') {
+    const fileId = url.pathname.split('/').pop();
+    if (!fileId) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing file ID' }));
+      return;
+    }
+
+    const fileDir = joinPath(filesDir(), fileId);
+    if (!existsSyncFs(fileDir)) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'File not found' }));
+      return;
+    }
+
+    // Read first file in directory
+    const { readdirSync } = await import('node:fs');
+    const files = readdirSync(fileDir);
+    if (files.length === 0) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'File not found' }));
+      return;
+    }
+
+    const filePath = joinPath(fileDir, files[0]);
+    const fileData = readFileSyncFs(filePath);
+    res.writeHead(200, {
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${files[0]}"`,
+    });
+    res.end(fileData);
+    return;
+  }
+
+  res.writeHead(404, { 'Content-Type': 'application/json' });
+  res.end(JSON.stringify({ error: 'Unknown federation endpoint' }));
+}
+
+function getNodeName(): string {
+  try {
+    const configPath = joinPath(homedirFn(), '.kitty-hive', 'config.json');
+    if (existsSyncFs(configPath)) {
+      const config = JSON.parse(readFileSyncFs(configPath, 'utf8'));
+      if (config.name) return config.name;
+    }
+  } catch { /* ignore */ }
+  return require('os').hostname().split('.')[0];
 }
