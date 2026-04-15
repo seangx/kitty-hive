@@ -133,15 +133,36 @@ async function cmdStatus() {
   // Check DB
   try {
     const db = initDB(dbPath);
-    const agents = db.prepare('SELECT display_name, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
-    const rooms = db.prepare('SELECT count(*) as cnt FROM rooms').get() as { cnt: number };
-    const events = db.prepare('SELECT count(*) as cnt FROM room_events').get() as { cnt: number };
+    const agents = db.prepare('SELECT id, display_name, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
+    const rooms = db.prepare("SELECT id, name, kind FROM rooms WHERE closed_at IS NULL").all() as any[];
+    const tasks = db.prepare("SELECT count(*) as cnt FROM tasks WHERE status NOT IN ('completed','failed','canceled')").get() as { cnt: number };
 
     console.log(`\n📊 Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
-    console.log(`   Rooms: ${rooms.cnt}  Events: ${events.cnt}`);
+    console.log(`   Rooms: ${rooms.length}  Active tasks: ${tasks.cnt}`);
+
     console.log(`\n👥 Agents (${agents.length}):`);
     for (const a of agents) {
-      console.log(`   ${a.display_name} (${a.status}) — last seen ${a.last_seen}`);
+      // Find rooms this agent is in
+      const memberRooms = db.prepare(`
+        SELECT DISTINCT r.name FROM rooms r
+        JOIN room_events e ON e.room_id = r.id AND e.type = 'join' AND e.actor_agent_id = ?
+        WHERE r.closed_at IS NULL AND NOT EXISTS (
+          SELECT 1 FROM room_events e2 WHERE e2.room_id = r.id AND e2.type = 'leave' AND e2.actor_agent_id = ? AND e2.seq > e.seq
+        )
+      `).all(a.id, a.id) as any[];
+      const roomNames = memberRooms.map((r: any) => r.name).filter(Boolean).join(', ');
+      console.log(`   ${a.display_name} (${a.status}) — ${roomNames || 'no rooms'}`);
+    }
+
+    if (rooms.length > 0) {
+      console.log(`\n🏠 Rooms:`);
+      for (const r of rooms) {
+        const memberCount = db.prepare(`
+          SELECT COUNT(DISTINCT e.actor_agent_id) as cnt FROM room_events e
+          WHERE e.room_id = ? AND e.type = 'join'
+        `).get(r.id) as { cnt: number };
+        console.log(`   ${r.name || r.id} (${r.kind}) — ${memberCount.cnt} members`);
+      }
     }
   } catch (err) {
     console.log(`\n⚠️  Cannot read database`);
@@ -170,6 +191,49 @@ async function cmdDbClear() {
   console.log('✅ Database cleared.');
 }
 
+async function cmdAgentRemove() {
+  const { dbPath } = parseFlags(1);
+  const name = args[2];
+  if (!name) {
+    console.log('Usage: kitty-hive agent remove <name>');
+    process.exit(1);
+  }
+
+  const db = initDB(dbPath);
+  const agent = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ?').get(name) as any;
+  if (!agent) {
+    console.log(`Agent "${name}" not found.`);
+    process.exit(1);
+  }
+
+  const confirm = await ask(`Remove agent "${name}" and all related data? (y/n)`, 'n');
+  if (confirm.toLowerCase() !== 'y') {
+    console.log('Cancelled.');
+    process.exit(0);
+  }
+
+  db.prepare('DELETE FROM read_cursors WHERE agent_id = ?').run(agent.id);
+  db.prepare('DELETE FROM task_events WHERE actor_agent_id = ?').run(agent.id);
+  db.prepare('DELETE FROM room_events WHERE actor_agent_id = ?').run(agent.id);
+  db.prepare('UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?').run(agent.id);
+  db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
+
+  console.log(`✅ Removed agent "${name}".`);
+}
+
+async function cmdAgentList() {
+  const { dbPath } = parseFlags(1);
+  const db = initDB(dbPath);
+  const agents = db.prepare('SELECT display_name, roles, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
+  if (agents.length === 0) {
+    console.log('No agents registered.');
+    return;
+  }
+  for (const a of agents) {
+    console.log(`  ${a.display_name} (${a.status}) roles=${a.roles || 'none'} last_seen=${a.last_seen}`);
+  }
+}
+
 function getDefaultAgentName(): string {
   // Try package.json name
   const pkgPath = join(process.cwd(), 'package.json');
@@ -187,22 +251,19 @@ function showHelp() {
   console.log(`🐝 kitty-hive — multi-agent collaboration server
 
 Usage:
-  kitty-hive serve [--port 4100] [--db path]    Start the server
-  kitty-hive init <name> [--port 4123] [--http]  Configure hive for this project
-  kitty-hive status [--port 4100]                Check server & agent status
-  kitty-hive db clear [--db path]                Clear the database
-
-Examples:
-  kitty-hive init myagent                  Channel mode (push notifications)
-  kitty-hive init myagent --http           HTTP mode (for Antigravity/Cursor)
-  kitty-hive init myagent --port 4200      Custom server port
+  kitty-hive serve [--port 4100] [--db path] [-v|-q]  Start the server
+  kitty-hive init [name] [--port 4123] [--http]        Configure hive for this project
+  kitty-hive status [--port 4100]                      Server & agent status
+  kitty-hive agent list                                List all agents
+  kitty-hive agent remove <name>                       Remove an agent
+  kitty-hive db clear [--db path]                      Clear the database
 
 Options:
   --port, -p   Port (default: 4100 for serve, 4123 for init)
   --db         Database path (default: ~/.kitty-hive/hive.db)
   --http       Use HTTP MCP instead of channel plugin
-  --verbose/-v Show debug logs (serve)
-  --quiet/-q   Only show warnings and errors (serve)`);
+  -v/--verbose Show debug logs (serve)
+  -q/--quiet   Only show warnings and errors (serve)`);
 }
 
 // --- Main ---
@@ -216,6 +277,15 @@ switch (command) {
     break;
   case 'status':
     cmdStatus().catch(err => { console.error('Failed:', err); process.exit(1); });
+    break;
+  case 'agent':
+    if (args[1] === 'remove') {
+      cmdAgentRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'list') {
+      cmdAgentList().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else {
+      showHelp();
+    }
     break;
   case 'db':
     if (args[1] === 'clear') {
