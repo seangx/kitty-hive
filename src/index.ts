@@ -51,38 +51,23 @@ async function cmdServe() {
 }
 
 async function cmdInit() {
-  console.log('🐝 kitty-hive init\n');
+  console.log('🐝 kitty-hive init — configure HTTP MCP for non-Claude-Code clients\n');
+  console.log('   (Claude Code users: install the kitty-hive plugin instead)\n');
 
-  // Parse flags first
-  let explicitPort = false;
-  let explicitHttp = false;
-  let agentName = '';
   let port = 4123;
+  let explicitPort = false;
 
   for (let i = 1; i < args.length; i++) {
-    if (args[i] === '--http') { explicitHttp = true; }
-    else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
+    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
       port = parseInt(args[i + 1], 10); explicitPort = true; i++;
     }
-    else if (args[i] === '--db') { i++; }
-    else if (!args[i].startsWith('-')) { agentName = args[i]; }
   }
 
-  // Interactive: ask what wasn't provided
-  if (!agentName) {
-    agentName = await ask('Agent name', getDefaultAgentName());
-  }
   if (!explicitPort) {
     const p = await ask('Hive server port', '4123');
     port = parseInt(p, 10) || 4123;
   }
-  let useChannel = !explicitHttp;
-  if (!explicitHttp) {
-    const mode = await ask('Mode: (c)hannel push or (h)ttp pull?', 'c');
-    useChannel = mode.toLowerCase() !== 'h';
-  }
 
-  const channelPath = join(__dirname, '..', 'channel.ts');
   const mcpJsonPath = join(process.cwd(), '.mcp.json');
   let existing: any = {};
   if (existsSync(mcpJsonPath)) {
@@ -90,32 +75,16 @@ async function cmdInit() {
   }
   if (!existing.mcpServers) existing.mcpServers = {};
 
-  if (useChannel) {
-    existing.mcpServers['hive-channel'] = {
-      command: 'npx',
-      args: ['tsx', channelPath],
-      env: {
-        HIVE_URL: `http://localhost:${port}/mcp`,
-        HIVE_AGENT_NAME: agentName,
-      },
-    };
-    delete existing.mcpServers['hive'];
-  } else {
-    existing.mcpServers['hive'] = {
-      url: `http://localhost:${port}/mcp`,
-    };
-    delete existing.mcpServers['hive-channel'];
-  }
+  existing.mcpServers['hive'] = {
+    url: `http://localhost:${port}/mcp`,
+  };
+  delete existing.mcpServers['hive-channel'];
 
   writeFileSync(mcpJsonPath, JSON.stringify(existing, null, 2) + '\n');
-  console.log(`\n🐝 kitty-hive configured`);
-  console.log(`   Agent: ${agentName}`);
+  console.log(`🐝 Configured`);
   console.log(`   Server: http://localhost:${port}/mcp`);
-  console.log(`   Mode: ${useChannel ? 'channel (push)' : 'HTTP (pull)'}`);
-
-  if (useChannel) {
-    console.log(`\n   Run: claude --dangerously-load-development-channels server:hive-channel`);
-  }
+  console.log(`   Mode: HTTP MCP (for Antigravity, Cursor, VS Code, etc.)`);
+  console.log(`\n   Agent registers via hive.start when first used.`);
 }
 
 async function cmdStatus() {
@@ -400,7 +369,7 @@ function showHelp() {
 
 Usage:
   kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
-  kitty-hive init [name] [--port 4123] [--http]           Configure for this project
+  kitty-hive init [--port 4123]                           Configure HTTP MCP for this project
   kitty-hive status [--port 4123]                         Server & agent status
   kitty-hive agent list                                   List agents
   kitty-hive agent remove <name>                          Remove an agent

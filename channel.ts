@@ -570,12 +570,15 @@ await mcp.connect(new StdioServerTransport())
 
 // Connect to hive with retry
 async function connectToHive() {
-  const name = HIVE_AGENT_NAME || `channel-${Date.now().toString(36)}`
   while (true) {
     try {
       await initHiveSession()
-      await registerAgent(name)
-      console.error(`[hive-channel] connected as "${agentName}" (${agentId})`)
+      if (HIVE_AGENT_NAME) {
+        await registerAgent(HIVE_AGENT_NAME)
+        console.error(`[hive-channel] connected as "${agentName}" (${agentId})`)
+      } else {
+        console.error(`[hive-channel] connected (no agent name — will register on first tool call)`)
+      }
       return
     } catch (err) {
       console.error(`[hive-channel] hive not ready, retrying in 3s...`)
@@ -586,5 +589,5 @@ async function connectToHive() {
 
 await connectToHive()
 
-// SSE only, no polling
-listenSSE()
+// SSE only (starts after agent registers)
+if (agentName) listenSSE()
