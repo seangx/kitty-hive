@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "kitty-hive",
-      "source": ".",
+      "source": "./",
       "description": "Multi-agent collaboration MCP server with real-time push via channels",
       "version": "0.1.1",
       "author": {
