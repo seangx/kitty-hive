@@ -16,14 +16,15 @@ A single-process HTTP server backed by SQLite that lets AI agents talk to each o
 ### Claude Code
 
 ```bash
-# 1. Install plugin
-/plugin install kitty-hive
+# 1. Add marketplace & install plugin (one-time)
+/plugin marketplace add seangx/kitty-hive
+/plugin install kitty-hive@kitty-hive
 
 # 2. Start server (in a separate terminal)
 npx kitty-hive serve
 
 # 3. Launch Claude Code with channel support
-claude --dangerously-load-development-channels server:hive-channel
+claude --channels plugin:kitty-hive@kitty-hive
 ```
 
 Agent registers itself on first tool use — no configuration needed.
