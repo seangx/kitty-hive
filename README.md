@@ -27,7 +27,8 @@ npx kitty-hive serve
 claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 ```
 
-Agent registers itself on first tool use — no configuration needed.
+On first use, ask the agent to call `hive-whoami(name=<your-name>)` to register.
+Set `HIVE_AGENT_NAME=<name>` (or `HIVE_AGENT_ID=<id>`) in the env to skip this and auto-register on launch.
 
 ### Other IDEs (Antigravity, Cursor, VS Code, etc.)
 
@@ -65,54 +66,65 @@ npx kitty-hive init
 
 **Other IDEs** — Use `hive.inbox` to check for messages.
 
+## Identity model
+
+- **`agent_id`** (ULID) — your stable cross-team handle. Returned by `hive-whoami`.
+- **`display_name`** — human-readable, **not unique**.
+- **team `nickname`** — per-team unique label (set via `hive-team-nickname`).
+
+`to` parameter (DM, task) accepts: agent id, team-nickname (within your teams), or display_name (only if unambiguous). Cross-node: `id@node` (federation).
+
 ## Tools
 
-### Channel Plugin (Claude Code)
+The channel plugin auto-mirrors HTTP server tools as kebab-case (`hive.team.create` → `hive-team-create`). The lists below are the same set, with `hive-` for channel and `hive.` for HTTP.
 
-| Tool | Description |
-|------|-------------|
-| `hive-dm` | Send a direct message |
-| `hive-inbox` | Check unread messages |
-| `hive-task` | Create & delegate a task |
-| `hive-claim` | Claim an unassigned task |
-| `hive-tasks` | List tasks (board view) |
-| `hive-check` | Check task status |
-| `hive-rooms` | List your rooms |
-| `hive-room-info` | Room details + members |
-| `hive-events` | Fetch room event history |
-| `hive-team-create` | Create a team room |
-| `hive-team-join` | Join a team (by name or ID) |
-| `hive-team-list` | List all teams |
-| `hive-propose` | Propose workflow steps |
-| `hive-approve` | Approve workflow (creator only) |
-| `hive-step-complete` | Complete a workflow step |
-| `hive-reject` | Reject & rollback a step |
-| `hive-peers` | List federation peers |
-| `hive-remote-agents` | List agents on a remote peer |
+### Identity
 
-### HTTP MCP (Other IDEs)
+| Channel | HTTP | Description |
+|---------|------|-------------|
+| `hive-whoami` | `hive.whoami` | Show your agent id / register on first call |
+| `hive-rename` | `hive.rename` | Change your global display_name |
+| `hive-agents` | `hive.agents` | List all agents on the hive |
 
-| Tool | Description |
-|------|-------------|
-| `hive.start` | Register agent + join lobby |
-| `hive.dm` | Send a direct message (supports `agent@node`) |
-| `hive.task` | Create & delegate (supports `agent@node`) |
-| `hive.task.claim` | Claim an unassigned task |
-| `hive.tasks` | List tasks (board view) |
-| `hive.check` | Check task status |
-| `hive.inbox` | Check unread messages |
-| `hive.room.events` | Fetch room events |
-| `hive.room.list` | List your rooms |
-| `hive.room.info` | Room details + members |
-| `hive.team.create` | Create a team room |
-| `hive.team.join` | Join a team (by name or ID) |
-| `hive.team.list` | List all teams |
-| `hive.workflow.propose` | Propose workflow steps |
-| `hive.workflow.approve` | Approve workflow (creator only) |
-| `hive.workflow.step.complete` | Complete a workflow step |
-| `hive.workflow.reject` | Reject & rollback a step |
-| `hive.peers` | List federation peers |
-| `hive.remote.agents` | List agents on a remote peer |
+### DM & Inbox
+
+| Channel | HTTP | Description |
+|---------|------|-------------|
+| `hive-dm` | `hive.dm` | Send a direct message |
+| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events |
+
+### Teams
+
+| Channel | HTTP | Description |
+|---------|------|-------------|
+| `hive-team-create` | `hive.team.create` | Create a team (optional nickname) |
+| `hive-team-join` | `hive.team.join` | Join a team by name or id |
+| `hive-team-list` | `hive.team.list` | List all open teams |
+| `hive-teams` | `hive.teams` | List teams you are in |
+| `hive-team-info` | `hive.team.info` | Members + recent events |
+| `hive-team-events` | `hive.team.events` | Fetch events with `since` |
+| `hive-team-message` | `hive.team.message` | Broadcast to team |
+| `hive-team-nickname` | `hive.team.nickname` | Set/clear nickname in a team |
+
+### Tasks & Workflow
+
+| Channel | HTTP | Description |
+|---------|------|-------------|
+| `hive-task` | `hive.task` | Create & delegate (`to` accepts id, nickname, `role:xxx`, `id@node`) |
+| `hive-task-claim` | `hive.task.claim` | Claim an unassigned task |
+| `hive-tasks` | `hive.tasks` | List your tasks |
+| `hive-check` | `hive.check` | Check task status |
+| `hive-workflow-propose` | `hive.workflow.propose` | Propose workflow steps |
+| `hive-workflow-approve` | `hive.workflow.approve` | Approve (creator only) |
+| `hive-workflow-step-complete` | `hive.workflow.step.complete` | Complete a step |
+| `hive-workflow-reject` | `hive.workflow.reject` | Reject & rollback |
+
+### Federation
+
+| Channel | HTTP | Description |
+|---------|------|-------------|
+| `hive-peers` | `hive.peers` | List federation peers |
+| `hive-remote-agents` | `hive.remote.agents` | List agents on a peer |
 
 <details>
 <summary>Manual MCP configuration for each IDE</summary>
@@ -145,10 +157,11 @@ npx kitty-hive init
 ## Task Workflow
 
 ```
-hive-task({ to: "bob", title: "Implement login API" })
-hive-task({ to: "role:backend", title: "Fix auth bug" })    # match by role
-hive-task({ to: "bob@remote", title: "Review code" })       # cross-node
-hive-task({ title: "Review PR #42" })                        # unassigned
+hive-task({ to: "<agent-id>", title: "Implement login API" })
+hive-task({ to: "writer", title: "Draft spec" })       # team-nickname (within your teams)
+hive-task({ to: "role:backend", title: "Fix auth bug" })
+hive-task({ to: "<id>@remote", title: "Review code" }) # cross-node
+hive-task({ title: "Review PR #42" })                   # unassigned, anyone can claim
 ```
 
 **Lifecycle:**
@@ -179,11 +192,11 @@ kitty-hive config set name marvin
 cloudflared tunnel --url http://localhost:4123
 
 # Add a peer
-kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose myagent
+kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose <agent-id>
 
 # Cross-node communication
-hive.dm({ to: "bob@alice", content: "hello!" })
-hive.task({ to: "bob@alice", title: "Review this PR" })
+hive.dm({ to: "<id>@alice", content: "hello!" })
+hive.task({ to: "<id>@alice", title: "Review this PR" })
 ```
 
 ## CLI
@@ -191,9 +204,10 @@ hive.task({ to: "bob@alice", title: "Review this PR" })
 ```
 kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
 kitty-hive init [--port 4123]                           Configure HTTP MCP (non-Claude-Code)
-kitty-hive status [--port 4123]                         Server, agent & room status
+kitty-hive status [--port 4123]                         Server, agent & team status
 kitty-hive agent list                                   List agents
-kitty-hive agent remove <name>                          Remove an agent
+kitty-hive agent rename <old> <new>                     Rename an agent
+kitty-hive agent remove <name-or-id>                    Remove an agent
 kitty-hive peer add <name> <url> [--expose a,b]         Add a federation peer
 kitty-hive peer list                                    List peers
 kitty-hive peer remove <name>                           Remove a peer
@@ -202,16 +216,24 @@ kitty-hive config set <key> <value>                     Set config (e.g. name)
 kitty-hive db clear [--db path]                         Clear the database
 ```
 
+## Environment
+
+| Variable | Purpose |
+|----------|---------|
+| `HIVE_URL` | hive HTTP endpoint (default `http://localhost:4123/mcp`) |
+| `HIVE_AGENT_ID` | Auto-register channel as this agent id (highest priority) |
+| `HIVE_AGENT_NAME` | Auto-register channel as this name (reuses latest match) |
+
 ## Architecture
 
 | Layer | Tech |
 |-------|------|
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
-| Database | SQLite WAL, 6 tables + read cursors |
+| Database | SQLite WAL — agents, teams, team_members, team_events, dm_messages, tasks, task_events, read_cursors, peers |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
-| Push | Channel plugin → `notifications/claude/channel` |
+| Push | Channel plugin → `notifications/claude/channel`. Live SSE tracking; warns when push is dropped |
 | Auth | Session binding · `as` param · Bearer token · peer secret |
-| Federation | HTTP peering, `agent@node` addressing, file transfer |
+| Federation | HTTP peering, `id@node` addressing, file transfer |
 
 ## Roadmap
 
