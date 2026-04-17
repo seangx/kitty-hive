@@ -24,7 +24,7 @@ A single-process HTTP server backed by SQLite that lets AI agents talk to each o
 npx kitty-hive serve
 
 # 3. Launch Claude Code with channel support
-claude --channels plugin:kitty-hive@seangx
+claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 ```
 
 Agent registers itself on first tool use — no configuration needed.
