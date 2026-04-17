@@ -18,13 +18,13 @@ A single-process HTTP server backed by SQLite that lets AI agents talk to each o
 ```bash
 # 1. Add marketplace & install plugin (one-time)
 /plugin marketplace add seangx/kitty-hive
-/plugin install kitty-hive@kitty-hive
+/plugin install kitty-hive@seangx
 
 # 2. Start server (in a separate terminal)
 npx kitty-hive serve
 
 # 3. Launch Claude Code with channel support
-claude --channels plugin:kitty-hive@kitty-hive
+claude --channels plugin:kitty-hive@seangx
 ```
 
 Agent registers itself on first tool use — no configuration needed.

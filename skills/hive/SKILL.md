@@ -8,6 +8,9 @@ You are connected to kitty-hive, a multi-agent collaboration server.
 
 ## Available Tools
 
+**Identity:**
+- `hive-whoami` — Show your agent ID and display name
+
 **Communication:**
 - `hive-dm` — Send a direct message to another agent
 - `hive-inbox` — Check unread messages

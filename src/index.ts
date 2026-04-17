@@ -182,13 +182,47 @@ async function cmdAgentRemove() {
     process.exit(0);
   }
 
+  // Delete in dependency order to satisfy foreign keys
   db.prepare('DELETE FROM read_cursors WHERE agent_id = ?').run(agent.id);
+  // Task events for tasks created by this agent
+  db.prepare(`DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE creator_agent_id = ?)`).run(agent.id);
   db.prepare('DELETE FROM task_events WHERE actor_agent_id = ?').run(agent.id);
-  db.prepare('DELETE FROM room_events WHERE actor_agent_id = ?').run(agent.id);
+  // Tasks created by this agent
+  db.prepare('DELETE FROM tasks WHERE creator_agent_id = ?').run(agent.id);
   db.prepare('UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?').run(agent.id);
+  // Room events
+  db.prepare('DELETE FROM room_events WHERE actor_agent_id = ?').run(agent.id);
+  // Rooms hosted by this agent (and their events)
+  db.prepare(`DELETE FROM room_events WHERE room_id IN (SELECT id FROM rooms WHERE host_agent_id = ?)`).run(agent.id);
+  db.prepare(`DELETE FROM read_cursors WHERE target_id IN (SELECT id FROM rooms WHERE host_agent_id = ?)`).run(agent.id);
+  db.prepare('DELETE FROM rooms WHERE host_agent_id = ?').run(agent.id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
 
   console.log(`✅ Removed agent "${name}".`);
+}
+
+async function cmdAgentRename() {
+  const { dbPath } = parseFlags(1);
+  const oldName = args[2];
+  const newName = args[3];
+  if (!oldName || !newName) {
+    console.log('Usage: kitty-hive agent rename <old-name> <new-name>');
+    process.exit(1);
+  }
+
+  const db = initDB(dbPath);
+  const agent = db.prepare('SELECT id FROM agents WHERE display_name = ?').get(oldName) as any;
+  if (!agent) {
+    console.log(`Agent "${oldName}" not found.`);
+    process.exit(1);
+  }
+  const conflict = db.prepare('SELECT id FROM agents WHERE display_name = ?').get(newName) as any;
+  if (conflict) {
+    console.log(`Name "${newName}" is already taken.`);
+    process.exit(1);
+  }
+  db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, agent.id);
+  console.log(`✅ Renamed "${oldName}" → "${newName}".`);
 }
 
 async function cmdAgentList() {
@@ -372,6 +406,7 @@ Usage:
   kitty-hive init [--port 4123]                           Configure HTTP MCP for this project
   kitty-hive status [--port 4123]                         Server & agent status
   kitty-hive agent list                                   List agents
+  kitty-hive agent rename <old> <new>                     Rename an agent
   kitty-hive agent remove <name>                          Remove an agent
   kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer
   kitty-hive peer list                                    List peers
@@ -396,6 +431,8 @@ switch (command) {
   case 'agent':
     if (args[1] === 'remove') {
       cmdAgentRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'rename') {
+      cmdAgentRename().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'list') {
       cmdAgentList().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else {

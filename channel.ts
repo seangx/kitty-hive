@@ -82,10 +82,17 @@ async function initHiveSession() {
   })
 }
 
+let sseStarted = false
+
 async function registerAgent(name: string) {
   const result = await hiveCallTool('hive.start', { name, tool: 'claude', roles: 'channel' })
   agentId = result.agent_id
   agentName = result.display_name
+  // Auto-start SSE after registration
+  if (!sseStarted) {
+    sseStarted = true
+    listenSSE()
+  }
   return result
 }
 
@@ -102,12 +109,14 @@ const mcp = new Server(
       'You are connected to kitty-hive, a multi-agent collaboration server.',
       'Messages arrive as <channel source="hive-channel" from="..." room_id="..." type="...">.',
       '',
+      'Identity: hive-whoami (show your agent ID and name).',
       'Communication: hive-dm (send DM), hive-inbox (check unread).',
       'Teams: hive-team-create, hive-team-join (by name), hive-team-list.',
       'Tasks: hive-task (create), hive-claim (claim unassigned), hive-tasks (list/board), hive-check (status).',
       'Workflow: hive-propose (propose steps), hive-approve, hive-step-complete, hive-reject.',
       'Federation: hive-peers (list peers), hive-remote-agents (list remote agents). Use agent@node for cross-node DM/task.',
       '',
+      'IMPORTANT: On first use, you MUST ask the user "What name should I register with on the hive?" before calling any hive tool. Do NOT use default names like "kitty-hive" or the plugin name. Call hive-whoami with the name the user provides.',
       'IMPORTANT: When you receive a task, propose a workflow (hive-propose) before starting.',
       'When you see an unassigned task, claim it with hive-claim.',
       'NEVER auto-approve a workflow — always show the proposal to the user and wait for explicit confirmation before calling hive-approve.',
@@ -120,6 +129,17 @@ const mcp = new Server(
 
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
+    {
+      name: 'hive-rename',
+      description: 'Change your display name on the hive',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'New display name' },
+        },
+        required: ['name'],
+      },
+    },
     {
       name: 'hive-dm',
       description: 'Send a direct message to another agent on kitty-hive',
@@ -300,6 +320,16 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: 'hive-whoami',
+      description: 'Show your own agent ID, display name, and registration info on the hive. If not registered yet, provide a name to register.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: { type: 'string', description: 'Agent name to register with (only needed if not yet registered)' },
+        },
+      },
+    },
+    {
       name: 'hive-peers',
       description: 'List connected federation peers',
       inputSchema: { type: 'object', properties: {} },
@@ -319,6 +349,20 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name } = req.params
   const args = req.params.arguments as Record<string, string>
+
+  // Lazy registration: if not registered, require hive-whoami with a name first
+  if (!agentName && name !== 'hive-whoami') {
+    return {
+      content: [{ type: 'text', text: 'Not registered yet. Call hive-whoami with a name to register first.' }],
+      isError: true,
+    }
+  }
+
+  if (name === 'hive-rename') {
+    const result = await hiveCallTool('hive.rename', { as: agentName, name: args.name })
+    agentName = result.new_name
+    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  }
 
   if (name === 'hive-dm') {
     const result = await hiveCallTool('hive.dm', {
@@ -433,6 +477,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
   }
 
+  if (name === 'hive-whoami') {
+    // Register if not yet registered and name provided
+    if (!agentName) {
+      if (!args.name) {
+        return {
+          content: [{ type: 'text', text: 'Not registered. Provide a "name" parameter to register.' }],
+          isError: true,
+        }
+      }
+      await registerAgent(args.name)
+    }
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          agent_id: agentId,
+          agent_name: agentName,
+          hive_url: HIVE_URL,
+          session_id: sessionId,
+        }, null, 2),
+      }],
+    }
+  }
+
   if (name === 'hive-peers') {
     const result = await hiveCallTool('hive.peers', {})
     return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
@@ -464,16 +532,21 @@ function dedup(from: string, roomId: string, content: string): boolean {
 
 async function listenSSE() {
   const url = HIVE_URL
-  const headers: Record<string, string> = {
-    'Accept': 'text/event-stream',
-    'Mcp-Session-Id': sessionId!,
-  }
 
   while (true) {
     try {
-      const res = await fetch(url, { method: 'GET', headers })
+      const res = await fetch(url, { method: 'GET', headers: {
+        'Accept': 'text/event-stream',
+        'Mcp-Session-Id': sessionId!,
+      }})
       if (!res.ok || !res.body) {
-        console.error(`[hive-channel] SSE connect failed: ${res.status}`)
+        console.error(`[hive-channel] SSE connect failed: ${res.status}, re-registering...`)
+        try {
+          await initHiveSession()
+          if (agentName) await registerAgent(agentName)
+        } catch (e) {
+          console.error(`[hive-channel] re-register failed:`, e)
+        }
         await new Promise(r => setTimeout(r, 3000))
         continue
       }
@@ -495,6 +568,7 @@ async function listenSSE() {
           if (!line.startsWith('data:')) continue
           try {
             const data = JSON.parse(line.slice(5))
+            console.error(`[hive-channel] SSE event: method=${data.method}`)
             // logging notification from hive server
             if (data.method === 'notifications/message' && data.params?.data) {
               const raw = data.params.data
@@ -588,6 +662,3 @@ async function connectToHive() {
 }
 
 await connectToHive()
-
-// SSE only (starts after agent registers)
-if (agentName) listenSSE()

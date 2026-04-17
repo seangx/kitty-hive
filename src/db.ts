@@ -20,7 +20,7 @@ export function initDB(dbPath?: string): Database.Database {
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id            TEXT PRIMARY KEY,
-      display_name  TEXT NOT NULL,
+      display_name  TEXT NOT NULL UNIQUE,
       token         TEXT UNIQUE NOT NULL,
       tool          TEXT DEFAULT '',
       roles         TEXT DEFAULT '',
@@ -146,6 +146,10 @@ export function findAgentByRole(role: string): Agent | undefined {
 
 export function touchAgent(id: string): void {
   getDB().prepare('UPDATE agents SET last_seen = ? WHERE id = ?').run(nowISO(), id);
+}
+
+export function renameAgent(id: string, newName: string): void {
+  getDB().prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, id);
 }
 
 // --- Room queries ---

@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { z } from 'zod';
-import { getAgentById, getAgentByName, touchAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks, getPeerBySecret, isPeerExposed, touchPeer, listPeers, getPeerByName } from './db.js';
+import { getAgentById, getAgentByName, touchAgent, renameAgent, initDB, getUnreadForAgent, setReadCursor, cleanupStaleTasks, getPeerBySecret, isPeerExposed, touchPeer, listPeers, getPeerByName } from './db.js';
 import { handleStart } from './tools/start.js';
 import { handleDM, handleDMAsync } from './tools/dm.js';
 import { handleTaskCreate, handleTaskCreateAsync, handleTaskClaim, handleCheck, handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject } from './tools/task.js';
@@ -69,26 +69,26 @@ function unbindSession(sessionId: string) {
 
 // --- Push notifications ---
 
-function notifyRoomMembers(roomId: string, excludeAgentId?: string, message?: string) {
+async function notifyRoomMembers(roomId: string, excludeAgentId?: string, message?: string) {
   const members = db.getRoomMembers(roomId);
   log("debug", `[notify] room=${roomId} members=${members.join(',')} exclude=${excludeAgentId}`);
   for (const memberId of members) {
     if (memberId === excludeAgentId) continue;
     const sids = agentSessions.get(memberId);
-    log("debug", `[notify] agent=${memberId} sessions=${sids ? [...sids].join(',') : 'NONE'}`);
+    log("info", `[notify] agent=${memberId} sessions=${sids ? [...sids].join(',') : 'NONE'}`);
     if (!sids) continue;
     for (const sid of sids) {
       const session = sessions[sid];
       if (!session) { log("warn", `[notify] session ${sid} NOT FOUND in sessions map`); continue; }
       try {
         // Logging notification (generic)
-        session.server.sendLoggingMessage({
+        await session.server.sendLoggingMessage({
           level: 'info',
           data: message ?? `New event in room ${roomId}`,
         }, sid);
         // Resource updated notification (inbox changed)
         session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
-        log("debug", `[notify] sent to session ${sid} OK (logging + resource updated)`);
+        log("info", `[notify] sent to session ${sid} OK`);
       } catch (err) {
         log("warn", `[notify] failed to send to session ${sid}: ${err}`);
       }
@@ -223,6 +223,26 @@ function createMcpServer(): McpServer {
       const result = handleStart(params);
       if (extra.sessionId) bindSession(extra.sessionId, result.agent_id);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.rename',
+    'Change your display name.',
+    {
+      as: asParam,
+      name: z.string().describe('New display name'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const existing = getAgentByName(params.name);
+      if (existing && existing.id !== agent.id) {
+        return { content: [{ type: 'text', text: `Error: Name "${params.name}" is already taken.` }], isError: true };
+      }
+      const oldName = agent.display_name;
+      renameAgent(agent.id, params.name);
+      return { content: [{ type: 'text', text: JSON.stringify({ agent_id: agent.id, old_name: oldName, new_name: params.name }) }] };
     },
   );
 
@@ -644,7 +664,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
         return;
       }
-      log("debug", `[sse] opening SSE stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
+      log("info", `[sse] opening SSE stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
       await sessions[sid].transport.handleRequest(req, res);
       return;
     }
