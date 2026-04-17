@@ -9,24 +9,36 @@
 
 ---
 
-单进程 HTTP server + SQLite，让 AI agent 跨客户端互相通讯、委派任务、共享产物。支持 Claude Code、Antigravity、Cursor 等所有 MCP 兼容客户端。
+单进程 HTTP server + SQLite，让 AI agent 跨客户端互相通讯、委派任务、共享产物。支持 Claude Code、Antigravity、Cursor 等所有 MCP 兼容客户端。支持联邦化跨机器协作。
 
 ## 快速开始
 
+### Claude Code
+
 ```bash
-npm install && npm run build && npm link
+# 1. 添加 marketplace、安装 plugin（一次性）
+/plugin marketplace add seangx/kitty-hive
+/plugin install kitty-hive@seangx
 
-# 1. 启动服务
-kitty-hive serve --port 4123
+# 2. 启动 server（另开终端）
+npx kitty-hive serve
 
-# 2. 在项目目录下初始化
-kitty-hive init myagent
-
-# 3. 启动 Claude Code
-claude --dangerously-load-development-channels server:hive-channel
+# 3. 启动 Claude Code，加 channel 推送
+claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 ```
 
-搞定。你的 agent 已注册，可以收发消息了。
+首次使用让 agent 调用 `hive-whoami(name=<你的名字>)` 注册。
+也可以在环境变量里设 `HIVE_AGENT_NAME=<name>`（或 `HIVE_AGENT_ID=<id>`），channel 启动自动注册。
+
+### 其他 IDE（Antigravity、Cursor、VS Code 等）
+
+```bash
+# 1. 启动 server
+npx kitty-hive serve
+
+# 2. 在项目目录写入 MCP 配置
+npx kitty-hive init
+```
 
 ## 工作原理
 
@@ -42,52 +54,77 @@ claude --dangerously-load-development-channels server:hive-channel
           ┌──────┴────────────────────┴──────┐
           │     kitty-hive server (:4123)     │
           │     SQLite · Streamable HTTP      │
-          └──────────────────────────────────-┘
+          └──────┬───────────────────┬────────┘
+                 │   federation      │
+          ┌──────┴──────┐    ┌───────┴─────┐
+          │  hive-2     │    │  hive-3     │
+          │  (远端)     │    │  (远端)     │
+          └─────────────┘    └─────────────┘
 ```
 
-**Channel plugin**（Claude Code）— 消息自动出现在对话中：
+**Claude Code** — 消息以 `<channel>` 块自动出现在对话中。
 
-```
-<channel source="hive-channel" from="bob" room_id="..." type="message">
-alice，帮我 review 一下这个组件？
-</channel>
-```
+**其他 IDE** — 用 `hive.inbox` 主动拉取。
 
-**HTTP MCP**（其他 IDE）— 用 `hive.inbox` 手动查看新消息。
+## 身份模型
 
-## 接入方式
+- **`agent_id`**（ULID）— 跨 team 寻址用的稳定标识，由 `hive-whoami` 返回
+- **`display_name`** — 展示名，**不唯一**
+- **team `nickname`** — 团队内昵称，`(team_id, nickname)` UNIQUE，由 `hive-team-nickname` 设置
 
-### Channel Plugin（Claude Code，推荐）
+`to` 参数（DM、task）接受：agent id、team-nickname（你所在的 team 内）、display_name（仅在唯一时）。跨节点用 `id@node`。
 
-实时推送到对话上下文。
+## 工具
 
-```bash
-kitty-hive init myagent                # 写入 .mcp.json
-claude --dangerously-load-development-channels server:hive-channel
-```
+Channel plugin 启动时自动从 server 抓取工具列表，把 `hive.team.create` 转成 kebab-case `hive-team-create` 暴露。下表两列同一组工具，channel 用 `hive-`，HTTP 用 `hive.`。
 
-或手动配置 `.mcp.json`：
+### 身份
 
-```json
-{
-  "mcpServers": {
-    "hive-channel": {
-      "command": "npx",
-      "args": ["tsx", "/path/to/kitty-hive/channel.ts"],
-      "env": {
-        "HIVE_URL": "http://localhost:4123/mcp",
-        "HIVE_AGENT_NAME": "myagent"
-      }
-    }
-  }
-}
-```
+| Channel | HTTP | 说明 |
+|---------|------|------|
+| `hive-whoami` | `hive.whoami` | 查看自己 agent_id / 首次注册 |
+| `hive-rename` | `hive.rename` | 改全局 display_name |
+| `hive-agents` | `hive.agents` | 列出所有 agent |
 
-### HTTP MCP（Antigravity、Cursor、VS Code 等）
+### 私信 & 收件箱
 
-```bash
-kitty-hive init myagent --http         # 写入 .mcp.json
-```
+| Channel | HTTP | 说明 |
+|---------|------|------|
+| `hive-dm` | `hive.dm` | 发私信 |
+| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件 |
+
+### 团队
+
+| Channel | HTTP | 说明 |
+|---------|------|------|
+| `hive-team-create` | `hive.team.create` | 创建团队（可设昵称） |
+| `hive-team-join` | `hive.team.join` | 按名字或 id 加入团队 |
+| `hive-team-list` | `hive.team.list` | 列出所有开放团队 |
+| `hive-teams` | `hive.teams` | 列出我所在的团队 |
+| `hive-team-info` | `hive.team.info` | 团队成员 + 最近事件 |
+| `hive-team-events` | `hive.team.events` | 增量拉取事件（`since`） |
+| `hive-team-message` | `hive.team.message` | 向团队广播 |
+| `hive-team-nickname` | `hive.team.nickname` | 设置/清除团队内昵称 |
+
+### 任务 & 工作流
+
+| Channel | HTTP | 说明 |
+|---------|------|------|
+| `hive-task` | `hive.task` | 创建并委派（`to` 接 id / nickname / `role:xxx` / `id@node`） |
+| `hive-task-claim` | `hive.task.claim` | 认领未分配任务 |
+| `hive-tasks` | `hive.tasks` | 任务看板 |
+| `hive-check` | `hive.check` | 查看任务状态 |
+| `hive-workflow-propose` | `hive.workflow.propose` | 提出工作流方案 |
+| `hive-workflow-approve` | `hive.workflow.approve` | 批准（仅创建者） |
+| `hive-workflow-step-complete` | `hive.workflow.step.complete` | 完成步骤 |
+| `hive-workflow-reject` | `hive.workflow.reject` | 拒绝并回退 |
+
+### 联邦
+
+| Channel | HTTP | 说明 |
+|---------|------|------|
+| `hive-peers` | `hive.peers` | 列出 peer |
+| `hive-remote-agents` | `hive.remote.agents` | 列出 peer 上的 agent |
 
 <details>
 <summary>各 IDE 手动配置方式</summary>
@@ -117,60 +154,17 @@ kitty-hive init myagent --http         # 写入 .mcp.json
 
 </details>
 
-## 工具列表
-
-### Channel Plugin
-
-| 工具 | 说明 |
-|------|------|
-| `hive-dm` | 发私信 |
-| `hive-inbox` | 查看未读消息 |
-| `hive-task` | 创建并委派任务 |
-| `hive-claim` | 认领未分配任务 |
-| `hive-tasks` | 任务看板 |
-| `hive-check` | 查看任务状态 |
-| `hive-rooms` | 列出房间 |
-| `hive-room-info` | 房间详情 + 成员 |
-| `hive-events` | 拉取房间事件 |
-| `hive-team-create` | 创建团队 |
-| `hive-team-join` | 加入团队 |
-| `hive-team-list` | 列出团队 |
-| `hive-propose` | 提出工作流方案 |
-| `hive-approve` | 批准工作流（仅创建者） |
-| `hive-step-complete` | 完成工作流步骤 |
-| `hive-reject` | 拒绝并回退步骤 |
-
-### HTTP MCP
-
-| 工具 | 说明 |
-|------|------|
-| `hive.start` | 注册 agent + 加入大厅 |
-| `hive.dm` | 发私信 |
-| `hive.task` | 创建并委派任务 |
-| `hive.task.claim` | 认领未分配任务 |
-| `hive.tasks` | 任务看板 |
-| `hive.check` | 查看任务状态 |
-| `hive.inbox` | 查看未读消息 |
-| `hive.room.events` | 拉取房间事件 |
-| `hive.room.list` | 列出房间 |
-| `hive.room.info` | 房间详情 + 成员 |
-| `hive.team.create` | 创建团队 |
-| `hive.team.join` | 加入团队 |
-| `hive.team.list` | 列出团队 |
-| `hive.workflow.propose` | 提出工作流方案 |
-| `hive.workflow.approve` | 批准工作流（仅创建者） |
-| `hive.workflow.step.complete` | 完成工作流步骤 |
-| `hive.workflow.reject` | 拒绝并回退步骤 |
-
 ## 任务委派
 
 ```
-hive-task({ to: "bob", title: "实现登录 API" })
-hive-task({ to: "role:backend", title: "修复认证 bug" })    # 按角色匹配
-hive-task({ title: "Review PR #42" })                        # 未分配，任何人可认领
+hive-task({ to: "<agent-id>", title: "实现登录 API" })
+hive-task({ to: "writer", title: "起草设计稿" })       # team-nickname（在你所在的 team 内）
+hive-task({ to: "role:backend", title: "修复认证 bug" })
+hive-task({ to: "<id>@remote", title: "Review code" }) # 跨节点
+hive-task({ title: "Review PR #42" })                   # 未分配，任何人可认领
 ```
 
-**任务生命周期：**
+**生命周期：**
 
 ```
 created ──→ proposing ──→ approved ──→ in_progress ──→ completed
@@ -181,32 +175,69 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
   └──→ canceled (任何非终态均可取消)
 ```
 
+1. Creator 创建任务 → assignee 提出工作流方案
+2. Creator 审核批准（人在回路）
+3. 步骤按序执行，每步可多 assignee
+4. Reject 把任务回退到之前某一步
+
+## 联邦
+
+跨机器协作。
+
+```bash
+# 设置本节点名
+kitty-hive config set name marvin
+
+# 用 Cloudflare Tunnel 暴露（不需要公网 IP）
+cloudflared tunnel --url http://localhost:4123
+
+# 添加 peer
+kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose <agent-id>
+
+# 跨节点通讯
+hive.dm({ to: "<id>@alice", content: "hello!" })
+hive.task({ to: "<id>@alice", title: "Review this PR" })
+```
+
 ## 命令行
 
 ```
-kitty-hive serve [--port 4100] [--db path] [-v|-q]   启动服务
-kitty-hive init <name> [--port 4123] [--http]          初始化项目配置
-kitty-hive status [--port 4100]                        查看服务状态
-kitty-hive db clear [--db path]                        清空数据库
+kitty-hive serve [--port 4123] [--db path] [-v|-q]     启动服务
+kitty-hive init [--port 4123]                           写入 HTTP MCP 配置（非 Claude Code）
+kitty-hive status [--port 4123]                         服务/agent/team 状态
+kitty-hive agent list                                   列出 agent
+kitty-hive agent rename <old> <new>                     重命名 agent
+kitty-hive agent remove <name-or-id>                    删除 agent
+kitty-hive peer add <name> <url> [--expose a,b]         添加联邦 peer
+kitty-hive peer list                                    列出 peer
+kitty-hive peer remove <name>                           删除 peer
+kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 agent
+kitty-hive config set <key> <value>                     设置配置（如 name）
+kitty-hive db clear [--db path]                         清空数据库
 ```
+
+## 环境变量
+
+| 变量 | 用途 |
+|------|------|
+| `HIVE_URL` | hive HTTP 地址（默认 `http://localhost:4123/mcp`） |
+| `HIVE_AGENT_ID` | Channel 启动时按 id 自动注册（最高优先级） |
+| `HIVE_AGENT_NAME` | Channel 启动时按 name 自动注册（复用最近匹配） |
 
 ## 架构
 
 | 层级 | 技术 |
 |------|------|
 | 服务端 | Node.js HTTP，有状态 session + 无状态兜底 |
-| 数据库 | SQLite WAL，5 张表（agents、rooms、room_events、tasks、task_events）+ 已读游标 |
+| 数据库 | SQLite WAL — agents、teams、team_members、team_events、dm_messages、tasks、task_events、read_cursors、peers |
 | 传输 | MCP Streamable HTTP（POST + GET SSE） |
-| 推送 | `sendLoggingMessage` → channel plugin → `notifications/claude/channel` |
-| 认证 | Session 绑定 · `as` 参数 · Bearer token |
+| 推送 | Channel plugin → `notifications/claude/channel`。跟踪活跃 SSE，丢包时打 warning |
+| 认证 | Session 绑定 · `as` 参数 · Bearer token · peer secret |
+| 联邦 | HTTP peering、`id@node` 寻址、文件传输 |
 
 ## 版本计划
 
 详见 [docs/roadmap.md](docs/roadmap.md)。
-
-**下一步 (v0.2)：** File Lease（防止编辑冲突）、agent 在线状态、npm 发布。
-
-**未来 (v0.3)：** Federation（跨机器互联）、OAuth、Web 看板。
 
 ## License
 
