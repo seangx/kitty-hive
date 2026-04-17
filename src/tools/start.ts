@@ -1,7 +1,8 @@
-import { createAgent, getAgentByName, getLobby, createRoom, appendRoomEvent, getRoomEvents, isMember, touchAgent, getDB } from '../db.js';
-import type { RoomEvent } from '../models.js';
+import { createAgent, getAgentById, getAgentsByName, touchAgent, getDB, getAgentTeams } from '../db.js';
+import type { Team } from '../models.js';
 
 interface StartInput {
+  id?: string;
   name?: string;
   roles?: string;
   tool?: string;
@@ -12,8 +13,7 @@ interface StartOutput {
   agent_id: string;
   token: string;
   display_name: string;
-  lobby_room_id: string;
-  pending: RoomEvent[];
+  teams: Team[];
 }
 
 const ADJECTIVES = ['Swift', 'Calm', 'Bold', 'Keen', 'Warm', 'Wise', 'Fair', 'True', 'Deft', 'Glad'];
@@ -27,12 +27,20 @@ function randomDisplayName(): string {
 }
 
 export function handleStart(input: StartInput): StartOutput {
-  const displayName = input.name || randomDisplayName();
-
-  let agent = input.name ? getAgentByName(input.name) : undefined;
-  if (agent) {
+  let agent;
+  // Priority: id (exact reconnect) > name (reuse latest match) > create new
+  if (input.id) {
+    agent = getAgentById(input.id);
+    if (!agent) throw new Error(`Agent id "${input.id}" not found`);
     touchAgent(agent.id);
-    // Update roles/tool/expertise if provided
+  } else if (input.name) {
+    const matches = getAgentsByName(input.name);
+    if (matches.length > 0) {
+      agent = matches.sort((a, b) => b.last_seen.localeCompare(a.last_seen))[0];
+      touchAgent(agent.id);
+    }
+  }
+  if (agent) {
     const updates: string[] = [];
     const params: any[] = [];
     if (input.tool) { updates.push('tool = ?'); params.push(input.tool); }
@@ -43,25 +51,14 @@ export function handleStart(input: StartInput): StartOutput {
       getDB().prepare(`UPDATE agents SET ${updates.join(', ')} WHERE id = ?`).run(...params);
     }
   } else {
+    const displayName = input.name || randomDisplayName();
     agent = createAgent(displayName, input.tool ?? '', input.roles ?? '', input.expertise ?? '');
   }
-
-  let lobby = getLobby();
-  if (!lobby) {
-    lobby = createRoom('lobby', null, 'Lobby');
-  }
-
-  if (!isMember(lobby.id, agent.id)) {
-    appendRoomEvent(lobby.id, 'join', agent.id, { display_name: agent.display_name });
-  }
-
-  const pending = getRoomEvents(lobby.id, 0, 20);
 
   return {
     agent_id: agent.id,
     token: agent.token,
     display_name: agent.display_name,
-    lobby_room_id: lobby.id,
-    pending,
+    teams: getAgentTeams(agent.id, true),
   };
 }

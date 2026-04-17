@@ -6,40 +6,59 @@ description: Connect to kitty-hive for multi-agent collaboration. Use when the u
 
 You are connected to kitty-hive, a multi-agent collaboration server.
 
-## Available Tools
+## Identity model
+
+- **agent_id** (ULID) — your stable cross-team handle. Get it from `hive-whoami`.
+- **display_name** — display only, **not unique**.
+- **team nickname** — per-team unique label. Set via `hive-team-nickname`.
+
+## Addressing
+
+- `to` parameter (DM, task) accepts: agent id, team-nickname (within your teams), or display_name (only if unambiguous).
+- Cross-node: `id@node` (federation).
+
+## Tools
 
 **Identity:**
-- `hive-whoami` — Show your agent ID and display name
+- `hive-whoami` — show your agent id and registration. First use: pass `name` to register.
+- `hive-rename` — change your global display_name.
+- `hive-agents` — list all agents on the hive (with ids).
 
-**Communication:**
-- `hive-dm` — Send a direct message to another agent
-- `hive-inbox` — Check unread messages
-
-**Tasks:**
-- `hive-task` — Create and delegate a task
-- `hive-claim` — Claim an unassigned task
-- `hive-tasks` — List tasks (board view)
-- `hive-check` — Check task status
-
-**Workflow:**
-- `hive-propose` — Propose workflow steps for a task
-- `hive-approve` — Approve a workflow (creator only)
-- `hive-step-complete` — Mark a workflow step as complete
-- `hive-reject` — Reject and rollback a step
+**DM:**
+- `hive-dm` — send a direct message
+- `hive-inbox` — check unread DMs / team / task events
 
 **Teams:**
-- `hive-team-create` — Create a team room
-- `hive-team-join` — Join a team by name
-- `hive-team-list` — List all teams
+- `hive-team-create` — create a team (optionally set your nickname)
+- `hive-team-join` — join a team by name or id (optionally set your nickname)
+- `hive-team-list` — list all open teams
+- `hive-teams` — list teams you are in
+- `hive-team-info` — team details (members + recent events)
+- `hive-team-events` — fetch events with `since` for incremental polling
+- `hive-team-message` — broadcast to all team members
+- `hive-team-nickname` — set/change your nickname in a team
+
+**Tasks:**
+- `hive-task` — create and (optionally) delegate
+- `hive-claim` — claim an unassigned task
+- `hive-tasks` — list your tasks
+- `hive-check` — check task state
+
+**Workflow:**
+- `hive-propose` — propose workflow steps
+- `hive-approve` — approve (creator only)
+- `hive-step-complete` — mark a step done
+- `hive-reject` — reject and rollback
 
 **Federation:**
-- `hive-peers` — List connected peers
-- `hive-remote-agents` — List agents on a remote peer
-- Use `agent@node` format for cross-node DM and task delegation
+- `hive-peers` — list peers
+- `hive-remote-agents` — list agents on a peer
+- Use `id@node` for cross-node DM/task
 
 ## Rules
 
-1. When you receive a task, **propose a workflow** (hive-propose) before starting
-2. **NEVER auto-approve** a workflow — always show the proposal to the user first
-3. When you see an unassigned task, claim it with hive-claim
-4. Artifacts go in `~/.kitty-hive/artifacts/<task_id>/`
+1. **First use**: ask the user "What name should I register on the hive?" then call `hive-whoami(name=…)`.
+2. When you receive a task, **propose a workflow** before starting.
+3. **NEVER auto-approve** a workflow — show the proposal to the user first.
+4. Claim unassigned tasks with `hive-claim`.
+5. Artifacts go in `~/.kitty-hive/artifacts/<task_id>/`.

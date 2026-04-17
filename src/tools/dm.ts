@@ -1,4 +1,4 @@
-import { getAgentById, getAgentByName, findDMRoom, createRoom, appendRoomEvent, getPeerByName } from '../db.js';
+import { getAgentById, appendDM, resolveAddressee, getPeerByName } from '../db.js';
 
 interface DMInput {
   to: string;
@@ -6,19 +6,19 @@ interface DMInput {
 }
 
 interface DMOutput {
-  room_id: string;
-  event_id: number;
+  to_agent_id: string;
+  message_id: number;
+  seq: number;
   federated?: boolean;
 }
 
-// Parse "bob@alice" → { agent: "bob", node: "alice" }
-function parseTarget(to: string): { agent: string; node?: string } {
+// Parse "agent_id_or_nickname@node" → { target, node }
+function parseTarget(to: string): { target: string; node?: string } {
   const at = to.lastIndexOf('@');
-  if (at > 0) return { agent: to.slice(0, at), node: to.slice(at + 1) };
-  return { agent: to };
+  if (at > 0) return { target: to.slice(0, at), node: to.slice(at + 1) };
+  return { target: to };
 }
 
-// Send DM to a remote peer
 async function sendFederatedDM(fromName: string, toAgent: string, peerName: string, content: string): Promise<DMOutput> {
   const peer = getPeerByName(peerName);
   if (!peer) throw new Error(`Peer "${peerName}" not found. Add it with: kitty-hive peer add ${peerName} <url>`);
@@ -38,45 +38,28 @@ async function sendFederatedDM(fromName: string, toAgent: string, peerName: stri
     throw new Error(`Federation DM failed: ${(err as any).error || res.statusText}`);
   }
 
-  const result = await res.json() as { delivered: boolean; event_id: number };
-  return { room_id: `federated:${peerName}`, event_id: result.event_id, federated: true };
+  const result = await res.json() as { delivered: boolean; message_id: number; seq: number };
+  return { to_agent_id: `federated:${peerName}`, message_id: result.message_id, seq: result.seq, federated: true };
 }
 
 export function handleDM(actorId: string, input: DMInput): DMOutput {
-  const actor = getAgentById(actorId);
-  const { agent: targetName, node } = parseTarget(input.to);
-
-  // Federated DM — handled async, return promise-like
-  // Note: caller must handle the async case
-  if (node) {
-    // Store as pending — actual send happens in handleDMAsync
-    throw new Error(`__FEDERATED__:${targetName}:${node}`);
-  }
-
-  const target = getAgentById(targetName) || getAgentByName(targetName);
-  if (!target) throw new Error(`Agent not found: ${input.to}`);
+  const resolved = resolveAddressee(actorId, input.to);
+  if ('error' in resolved) throw new Error(resolved.error);
+  const target = resolved.agent!;
   if (target.id === actorId) throw new Error('Cannot DM yourself');
 
-  let room = findDMRoom(actorId, target.id);
-  if (!room) {
-    const actorName = actor?.display_name ?? actorId;
-    room = createRoom('dm', actorId, `DM: ${actorName} ↔ ${target.display_name}`);
-    appendRoomEvent(room.id, 'join', actorId);
-    appendRoomEvent(room.id, 'join', target.id);
-  }
-
-  const event = appendRoomEvent(room.id, 'message', actorId, { content: input.content });
-  return { room_id: room.id, event_id: event.id };
+  const msg = appendDM(actorId, target.id, input.content);
+  return { to_agent_id: target.id, message_id: msg.id, seq: msg.seq };
 }
 
 export async function handleDMAsync(actorId: string, input: DMInput): Promise<DMOutput> {
   const actor = getAgentById(actorId);
-  const { agent: targetName, node } = parseTarget(input.to);
+  const { target, node } = parseTarget(input.to);
 
   if (node) {
     const fromName = actor?.display_name ?? actorId;
-    return sendFederatedDM(fromName, targetName, node, input.content);
+    return sendFederatedDM(fromName, target, node, input.content);
   }
 
-  return handleDM(actorId, input);
+  return handleDM(actorId, { to: target, content: input.content });
 }

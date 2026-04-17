@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
-import type { Agent, Room, RoomEvent, RoomEventType, Task, TaskEvent, TaskEventType } from './models.js';
+import type { Agent, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
 import { ulid, generateToken, nowISO } from './utils.js';
 
 let db: Database.Database;
@@ -20,7 +20,7 @@ export function initDB(dbPath?: string): Database.Database {
   db.exec(`
     CREATE TABLE IF NOT EXISTS agents (
       id            TEXT PRIMARY KEY,
-      display_name  TEXT NOT NULL UNIQUE,
+      display_name  TEXT NOT NULL,
       token         TEXT UNIQUE NOT NULL,
       tool          TEXT DEFAULT '',
       roles         TEXT DEFAULT '',
@@ -33,26 +33,45 @@ export function initDB(dbPath?: string): Database.Database {
     CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
     CREATE INDEX IF NOT EXISTS idx_agents_roles ON agents(roles);
 
-    CREATE TABLE IF NOT EXISTS rooms (
+    CREATE TABLE IF NOT EXISTS teams (
       id              TEXT PRIMARY KEY,
-      name            TEXT,
-      kind            TEXT NOT NULL CHECK(kind IN ('lobby','dm','team')),
+      name            TEXT NOT NULL UNIQUE,
       host_agent_id   TEXT REFERENCES agents(id),
       created_at      TEXT NOT NULL,
       closed_at       TEXT
     );
-    CREATE INDEX IF NOT EXISTS idx_rooms_kind ON rooms(kind);
 
-    CREATE TABLE IF NOT EXISTS room_events (
+    CREATE TABLE IF NOT EXISTS team_members (
+      team_id     TEXT NOT NULL REFERENCES teams(id),
+      agent_id    TEXT NOT NULL REFERENCES agents(id),
+      nickname    TEXT,
+      joined_at   TEXT NOT NULL,
+      PRIMARY KEY (team_id, agent_id),
+      UNIQUE (team_id, nickname)
+    );
+    CREATE INDEX IF NOT EXISTS idx_team_members_agent ON team_members(agent_id);
+
+    CREATE TABLE IF NOT EXISTS team_events (
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
-      room_id         TEXT NOT NULL REFERENCES rooms(id),
+      team_id         TEXT NOT NULL REFERENCES teams(id),
       seq             INTEGER NOT NULL,
-      type            TEXT NOT NULL CHECK(type IN ('join','leave','message')),
+      type            TEXT NOT NULL CHECK(type IN ('join','leave','message','rename')),
       actor_agent_id  TEXT REFERENCES agents(id),
       payload_json    TEXT DEFAULT '{}',
       ts              TEXT NOT NULL
     );
-    CREATE INDEX IF NOT EXISTS idx_room_events_room_seq ON room_events(room_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_team_events_team_seq ON team_events(team_id, seq);
+
+    CREATE TABLE IF NOT EXISTS dm_messages (
+      id              INTEGER PRIMARY KEY AUTOINCREMENT,
+      seq             INTEGER NOT NULL,
+      from_agent_id   TEXT NOT NULL REFERENCES agents(id),
+      to_agent_id     TEXT NOT NULL REFERENCES agents(id),
+      content         TEXT NOT NULL,
+      ts              TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_dm_to_seq ON dm_messages(to_agent_id, seq);
+    CREATE INDEX IF NOT EXISTS idx_dm_from_seq ON dm_messages(from_agent_id, seq);
 
     CREATE TABLE IF NOT EXISTS tasks (
       id                TEXT PRIMARY KEY,
@@ -63,7 +82,7 @@ export function initDB(dbPath?: string): Database.Database {
                         CHECK(status IN ('created','proposing','approved','in_progress','completed','failed','canceled')),
       workflow_json     TEXT,
       current_step      INTEGER DEFAULT 0,
-      source_room_id    TEXT REFERENCES rooms(id),
+      source_team_id    TEXT REFERENCES teams(id),
       input_json        TEXT DEFAULT '{}',
       created_at        TEXT NOT NULL,
       completed_at      TEXT
@@ -85,7 +104,7 @@ export function initDB(dbPath?: string): Database.Database {
 
     CREATE TABLE IF NOT EXISTS read_cursors (
       agent_id    TEXT NOT NULL REFERENCES agents(id),
-      target_type TEXT NOT NULL CHECK(target_type IN ('room','task')),
+      target_type TEXT NOT NULL CHECK(target_type IN ('team','task','dm')),
       target_id   TEXT NOT NULL,
       last_seq    INTEGER NOT NULL DEFAULT 0,
       PRIMARY KEY (agent_id, target_type, target_id)
@@ -134,8 +153,15 @@ export function getAgentById(id: string): Agent | undefined {
   return getDB().prepare('SELECT * FROM agents WHERE id = ?').get(id) as Agent | undefined;
 }
 
-export function getAgentByName(name: string): Agent | undefined {
-  return getDB().prepare('SELECT * FROM agents WHERE display_name = ?').get(name) as Agent | undefined;
+export function getAgentsByName(name: string): Agent[] {
+  return getDB().prepare('SELECT * FROM agents WHERE display_name = ?').all(name) as Agent[];
+}
+
+export function listAllAgents(activeOnly: boolean = false): Agent[] {
+  const sql = activeOnly
+    ? "SELECT * FROM agents WHERE status = 'active' ORDER BY last_seen DESC"
+    : 'SELECT * FROM agents ORDER BY last_seen DESC';
+  return getDB().prepare(sql).all() as Agent[];
 }
 
 export function findAgentByRole(role: string): Agent | undefined {
@@ -152,116 +178,191 @@ export function renameAgent(id: string, newName: string): void {
   getDB().prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, id);
 }
 
-// --- Room queries ---
+// --- Address resolution ---
+// Resolves "id_or_nickname" to an agent.
+// 1) If it matches an agent id directly, use that.
+// 2) Otherwise, search nicknames of teams the caller is in.
+// 3) Falls back to global display_name (only if exactly 1 match).
+// Returns: { agent, source } where source = 'id' | 'team-nickname' | 'display-name' | 'ambiguous' | 'not-found'
+export interface ResolvedAgent {
+  agent?: Agent;
+  source: 'id' | 'team-nickname' | 'display-name';
+}
 
-export function createRoom(kind: string, hostAgentId: string | null, name?: string): Room {
-  const room: Room = {
-    id: ulid(), name: name ?? null, kind: kind as Room['kind'],
-    host_agent_id: hostAgentId, created_at: nowISO(), closed_at: null,
+export function resolveAddressee(callerAgentId: string, target: string): ResolvedAgent | { error: string } {
+  // 1) direct id
+  const byId = getAgentById(target);
+  if (byId) return { agent: byId, source: 'id' };
+
+  // 2) nickname in caller's teams
+  const nickMatches = getDB().prepare(`
+    SELECT DISTINCT a.* FROM agents a
+    JOIN team_members tm ON tm.agent_id = a.id
+    WHERE tm.nickname = ?
+      AND tm.team_id IN (SELECT team_id FROM team_members WHERE agent_id = ?)
+  `).all(target, callerAgentId) as Agent[];
+  if (nickMatches.length === 1) return { agent: nickMatches[0], source: 'team-nickname' };
+  if (nickMatches.length > 1) return { error: `Nickname "${target}" matches multiple agents in your teams. Use agent id instead.` };
+
+  // 3) global display_name
+  const nameMatches = getAgentsByName(target);
+  if (nameMatches.length === 1) return { agent: nameMatches[0], source: 'display-name' };
+  if (nameMatches.length > 1) return { error: `Display name "${target}" matches multiple agents. Use agent id instead.` };
+
+  return { error: `No agent found matching "${target}".` };
+}
+
+// --- Team queries ---
+
+export function createTeam(name: string, hostAgentId: string | null): Team {
+  const team: Team = {
+    id: ulid(), name,
+    host_agent_id: hostAgentId,
+    created_at: nowISO(), closed_at: null,
   };
   getDB().prepare(`
-    INSERT INTO rooms (id, name, kind, host_agent_id, created_at, closed_at)
-    VALUES (@id, @name, @kind, @host_agent_id, @created_at, @closed_at)
-  `).run(room);
-  return room;
+    INSERT INTO teams (id, name, host_agent_id, created_at, closed_at)
+    VALUES (@id, @name, @host_agent_id, @created_at, @closed_at)
+  `).run(team);
+  return team;
 }
 
-export function getRoomById(id: string): Room | undefined {
-  return getDB().prepare('SELECT * FROM rooms WHERE id = ?').get(id) as Room | undefined;
+export function getTeamById(id: string): Team | undefined {
+  return getDB().prepare('SELECT * FROM teams WHERE id = ?').get(id) as Team | undefined;
 }
 
-export function getLobby(): Room | undefined {
-  return getDB().prepare("SELECT * FROM rooms WHERE kind = 'lobby' LIMIT 1").get() as Room | undefined;
+export function getTeamByName(name: string): Team | undefined {
+  return getDB().prepare('SELECT * FROM teams WHERE name = ?').get(name) as Team | undefined;
 }
 
-export function findDMRoom(agentA: string, agentB: string): Room | undefined {
-  return getDB().prepare(`
-    SELECT r.* FROM rooms r
-    WHERE r.kind = 'dm'
-      AND EXISTS (SELECT 1 FROM room_events e WHERE e.room_id = r.id AND e.type = 'join' AND e.actor_agent_id = ?)
-      AND EXISTS (SELECT 1 FROM room_events e WHERE e.room_id = r.id AND e.type = 'join' AND e.actor_agent_id = ?)
-    LIMIT 1
-  `).get(agentA, agentB) as Room | undefined;
+export function listTeams(activeOnly: boolean = true): Team[] {
+  const sql = activeOnly
+    ? 'SELECT * FROM teams WHERE closed_at IS NULL ORDER BY created_at DESC'
+    : 'SELECT * FROM teams ORDER BY created_at DESC';
+  return getDB().prepare(sql).all() as Team[];
 }
 
-export function listTeams(): Room[] {
-  return getDB().prepare("SELECT * FROM rooms WHERE kind = 'team' AND closed_at IS NULL ORDER BY created_at DESC").all() as Room[];
+export function getAgentTeams(agentId: string, activeOnly: boolean = true): Team[] {
+  const sql = activeOnly
+    ? `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.agent_id = ? AND t.closed_at IS NULL ORDER BY tm.joined_at DESC`
+    : `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.agent_id = ? ORDER BY tm.joined_at DESC`;
+  return getDB().prepare(sql).all(agentId) as Team[];
 }
 
-// --- Room event queries ---
+// --- Team membership ---
 
-export function appendRoomEvent(roomId: string, type: RoomEventType, actorAgentId: string | null, payload: object = {}): RoomEvent {
+export function addTeamMember(teamId: string, agentId: string, nickname: string | null = null): TeamMember {
+  const member: TeamMember = { team_id: teamId, agent_id: agentId, nickname, joined_at: nowISO() };
+  getDB().prepare(`
+    INSERT INTO team_members (team_id, agent_id, nickname, joined_at)
+    VALUES (@team_id, @agent_id, @nickname, @joined_at)
+    ON CONFLICT(team_id, agent_id) DO NOTHING
+  `).run(member);
+  return member;
+}
+
+export function removeTeamMember(teamId: string, agentId: string): void {
+  getDB().prepare('DELETE FROM team_members WHERE team_id = ? AND agent_id = ?').run(teamId, agentId);
+}
+
+export function isTeamMember(teamId: string, agentId: string): boolean {
+  const row = getDB().prepare('SELECT 1 FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, agentId);
+  return !!row;
+}
+
+export function getTeamMembers(teamId: string): TeamMember[] {
+  return getDB().prepare('SELECT * FROM team_members WHERE team_id = ?').all(teamId) as TeamMember[];
+}
+
+export function getTeamMemberAgentIds(teamId: string): string[] {
+  return (getDB().prepare('SELECT agent_id FROM team_members WHERE team_id = ?').all(teamId) as Array<{ agent_id: string }>).map(r => r.agent_id);
+}
+
+export function setTeamNickname(teamId: string, agentId: string, nickname: string | null): void {
+  getDB().prepare('UPDATE team_members SET nickname = ? WHERE team_id = ? AND agent_id = ?').run(nickname, teamId, agentId);
+}
+
+export function getTeamMember(teamId: string, agentId: string): TeamMember | undefined {
+  return getDB().prepare('SELECT * FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, agentId) as TeamMember | undefined;
+}
+
+// Display name for an agent in a team context (nickname || display_name)
+export function getTeamDisplayName(teamId: string, agentId: string): string {
+  const member = getTeamMember(teamId, agentId);
+  if (member?.nickname) return member.nickname;
+  const agent = getAgentById(agentId);
+  return agent?.display_name ?? 'unknown';
+}
+
+// --- Team event queries ---
+
+export function appendTeamEvent(teamId: string, type: TeamEventType, actorAgentId: string | null, payload: object = {}): TeamEvent {
   const d = getDB();
   const ts = nowISO();
   const payloadJson = JSON.stringify(payload);
   const insert = d.transaction(() => {
-    const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM room_events WHERE room_id = ?').get(roomId) as { max_seq: number };
+    const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM team_events WHERE team_id = ?').get(teamId) as { max_seq: number };
     const seq = maxSeq.max_seq + 1;
-    const result = d.prepare('INSERT INTO room_events (room_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(roomId, seq, type, actorAgentId, payloadJson, ts);
+    const result = d.prepare('INSERT INTO team_events (team_id, seq, type, actor_agent_id, payload_json, ts) VALUES (?, ?, ?, ?, ?, ?)').run(teamId, seq, type, actorAgentId, payloadJson, ts);
     return { id: result.lastInsertRowid as number, seq };
   });
   const { id, seq } = insert();
-  return { id, room_id: roomId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
+  return { id, team_id: teamId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
 }
 
-export function getRoomEvents(roomId: string, since: number = 0, limit: number = 50): RoomEvent[] {
-  return getDB().prepare('SELECT * FROM room_events WHERE room_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?').all(roomId, since, limit) as RoomEvent[];
+export function getTeamEvents(teamId: string, since: number = 0, limit: number = 50): TeamEvent[] {
+  return getDB().prepare('SELECT * FROM team_events WHERE team_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?').all(teamId, since, limit) as TeamEvent[];
 }
 
-export function getLastRoomEventTs(roomId: string): string | null {
-  const row = getDB().prepare('SELECT ts FROM room_events WHERE room_id = ? ORDER BY seq DESC LIMIT 1').get(roomId) as { ts: string } | undefined;
-  return row?.ts ?? null;
+export function getLatestTeamEvents(teamId: string, limit: number = 10): TeamEvent[] {
+  return getDB().prepare('SELECT * FROM (SELECT * FROM team_events WHERE team_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC').all(teamId, limit) as TeamEvent[];
 }
 
-export function getLatestRoomEvents(roomId: string, limit: number = 10): RoomEvent[] {
-  return getDB().prepare('SELECT * FROM (SELECT * FROM room_events WHERE room_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC').all(roomId, limit) as RoomEvent[];
+// --- DM queries ---
+
+export function appendDM(fromAgentId: string, toAgentId: string, content: string): DMMessage {
+  const d = getDB();
+  const ts = nowISO();
+  const insert = d.transaction(() => {
+    const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM dm_messages WHERE to_agent_id = ?').get(toAgentId) as { max_seq: number };
+    const seq = maxSeq.max_seq + 1;
+    const result = d.prepare('INSERT INTO dm_messages (seq, from_agent_id, to_agent_id, content, ts) VALUES (?, ?, ?, ?, ?)').run(seq, fromAgentId, toAgentId, content, ts);
+    return { id: result.lastInsertRowid as number, seq };
+  });
+  const { id, seq } = insert();
+  return { id, seq, from_agent_id: fromAgentId, to_agent_id: toAgentId, content, ts };
 }
 
-export function getRoomMembers(roomId: string): string[] {
-  const events = getDB().prepare(
-    "SELECT type, actor_agent_id FROM room_events WHERE room_id = ? AND type IN ('join', 'leave') ORDER BY seq ASC"
-  ).all(roomId) as Array<{ type: string; actor_agent_id: string }>;
-  const members = new Set<string>();
-  for (const e of events) {
-    if (e.type === 'join') members.add(e.actor_agent_id);
-    if (e.type === 'leave') members.delete(e.actor_agent_id);
-  }
-  return [...members];
+export function getMaxIncomingDMId(toAgentId: string, fromAgentId: string): number {
+  const row = getDB().prepare(
+    'SELECT MAX(id) AS max_id FROM dm_messages WHERE to_agent_id = ? AND from_agent_id = ?'
+  ).get(toAgentId, fromAgentId) as { max_id: number | null } | undefined;
+  return row?.max_id ?? 0;
 }
 
-export function isMember(roomId: string, agentId: string): boolean {
-  return getRoomMembers(roomId).includes(agentId);
-}
-
-export function getAgentRooms(agentId: string, kind?: string, activeOnly?: boolean): Room[] {
-  let sql = `
-    SELECT DISTINCT r.* FROM rooms r
-    JOIN room_events e ON e.room_id = r.id AND e.type = 'join' AND e.actor_agent_id = ?
-    WHERE NOT EXISTS (
-      SELECT 1 FROM room_events e2
-      WHERE e2.room_id = r.id AND e2.type = 'leave' AND e2.actor_agent_id = ? AND e2.seq > e.seq
-    )
-  `;
-  const params: any[] = [agentId, agentId];
-  if (kind) { sql += ' AND r.kind = ?'; params.push(kind); }
-  if (activeOnly) { sql += ' AND r.closed_at IS NULL'; }
-  return getDB().prepare(sql).all(...params) as Room[];
+export function getDMConversation(agentA: string, agentB: string, since: number = 0, limit: number = 50): DMMessage[] {
+  return getDB().prepare(`
+    SELECT * FROM dm_messages
+    WHERE ((from_agent_id = ? AND to_agent_id = ?) OR (from_agent_id = ? AND to_agent_id = ?))
+      AND id > ?
+    ORDER BY id ASC LIMIT ?
+  `).all(agentA, agentB, agentB, agentA, since, limit) as DMMessage[];
 }
 
 // --- Task queries ---
 
-export function createTask(title: string, creatorId: string, assigneeId?: string, sourceRoomId?: string, input?: object): Task {
+export function createTask(title: string, creatorId: string, assigneeId?: string, sourceTeamId?: string, input?: object): Task {
   const task: Task = {
     id: ulid(), title, creator_agent_id: creatorId,
     assignee_agent_id: assigneeId ?? null,
     status: 'created', workflow_json: null, current_step: 0,
-    source_room_id: sourceRoomId ?? null,
+    source_team_id: sourceTeamId ?? null,
     input_json: JSON.stringify(input ?? {}),
     created_at: nowISO(), completed_at: null,
   };
   getDB().prepare(`
-    INSERT INTO tasks (id, title, creator_agent_id, assignee_agent_id, status, workflow_json, current_step, source_room_id, input_json, created_at, completed_at)
-    VALUES (@id, @title, @creator_agent_id, @assignee_agent_id, @status, @workflow_json, @current_step, @source_room_id, @input_json, @created_at, @completed_at)
+    INSERT INTO tasks (id, title, creator_agent_id, assignee_agent_id, status, workflow_json, current_step, source_team_id, input_json, created_at, completed_at)
+    VALUES (@id, @title, @creator_agent_id, @assignee_agent_id, @status, @workflow_json, @current_step, @source_team_id, @input_json, @created_at, @completed_at)
   `).run(task);
   return task;
 }
@@ -331,7 +432,7 @@ export function setReadCursor(agentId: string, targetType: string, targetId: str
 // --- Inbox ---
 
 export interface UnreadSummary {
-  type: 'room' | 'task';
+  type: 'team' | 'task' | 'dm';
   id: string;
   name: string | null;
   kind: string;
@@ -341,29 +442,46 @@ export interface UnreadSummary {
 
 export function getUnreadForAgent(agentId: string): UnreadSummary[] {
   const result: UnreadSummary[] = [];
+  const d = getDB();
 
-  // Room unread
-  const rooms = getAgentRooms(agentId, undefined, true);
-  for (const room of rooms) {
-    const cursor = getReadCursor(agentId, 'room', room.id);
-    const unread = getDB().prepare(
-      'SELECT * FROM room_events WHERE room_id = ? AND seq > ? AND actor_agent_id != ? ORDER BY seq ASC LIMIT 10'
-    ).all(room.id, cursor, agentId) as RoomEvent[];
+  // Team unread
+  const teams = getAgentTeams(agentId, true);
+  for (const team of teams) {
+    const cursor = getReadCursor(agentId, 'team', team.id);
+    const unread = d.prepare(
+      'SELECT * FROM team_events WHERE team_id = ? AND seq > ? AND actor_agent_id != ? ORDER BY seq ASC LIMIT 10'
+    ).all(team.id, cursor, agentId) as TeamEvent[];
     if (unread.length === 0) continue;
-    const totalUnread = (getDB().prepare(
-      'SELECT COUNT(*) as cnt FROM room_events WHERE room_id = ? AND seq > ? AND actor_agent_id != ?'
-    ).get(room.id, cursor, agentId) as { cnt: number }).cnt;
-    const latest = unread.slice(-5).map(e => {
-      const actor = getAgentById(e.actor_agent_id ?? '');
-      let preview = '';
-      try { const p = JSON.parse(e.payload_json); preview = p.content || ''; } catch {}
-      return {
-        from: actor?.display_name ?? 'unknown', type: e.type,
-        preview: preview.length > 200 ? preview.slice(0, 200) + ' [summary — this is a preview, not a broken message]' : preview,
-        ts: e.ts,
-      };
-    });
-    result.push({ type: 'room', id: room.id, name: room.name, kind: room.kind, unread_count: totalUnread, latest });
+    const totalUnread = (d.prepare(
+      'SELECT COUNT(*) as cnt FROM team_events WHERE team_id = ? AND seq > ? AND actor_agent_id != ?'
+    ).get(team.id, cursor, agentId) as { cnt: number }).cnt;
+    const latest = unread.slice(-5).map(e => ({
+      from: e.actor_agent_id ? getTeamDisplayName(team.id, e.actor_agent_id) : 'system',
+      type: e.type,
+      preview: previewFromPayload(e.payload_json),
+      ts: e.ts,
+    }));
+    result.push({ type: 'team', id: team.id, name: team.name, kind: 'team', unread_count: totalUnread, latest });
+  }
+
+  // DM unread (per-sender cursor: target_id = sender_agent_id)
+  const senders = d.prepare(
+    'SELECT DISTINCT from_agent_id FROM dm_messages WHERE to_agent_id = ?'
+  ).all(agentId) as Array<{ from_agent_id: string }>;
+  for (const { from_agent_id: senderId } of senders) {
+    const cursor = getReadCursor(agentId, 'dm', senderId);
+    const msgs = d.prepare(
+      'SELECT * FROM dm_messages WHERE to_agent_id = ? AND from_agent_id = ? AND id > ? ORDER BY id ASC'
+    ).all(agentId, senderId, cursor) as DMMessage[];
+    if (msgs.length === 0) continue;
+    const sender = getAgentById(senderId);
+    const latest = msgs.slice(-5).map(m => ({
+      from: sender?.display_name ?? 'unknown',
+      type: 'dm',
+      preview: m.content.length > 200 ? m.content.slice(0, 200) + ' [summary]' : m.content,
+      ts: m.ts,
+    }));
+    result.push({ type: 'dm', id: senderId, name: sender?.display_name ?? null, kind: 'dm', unread_count: msgs.length, latest });
   }
 
   // Task unread
@@ -371,15 +489,15 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
   for (const task of tasks) {
     if (['completed', 'failed', 'canceled'].includes(task.status)) continue;
     const cursor = getReadCursor(agentId, 'task', task.id);
-    const unread = getDB().prepare(
+    const unread = d.prepare(
       'SELECT * FROM task_events WHERE task_id = ? AND seq > ? AND actor_agent_id != ? ORDER BY seq ASC LIMIT 10'
     ).all(task.id, cursor, agentId) as TaskEvent[];
     if (unread.length === 0) continue;
-    const totalUnread = (getDB().prepare(
+    const totalUnread = (d.prepare(
       'SELECT COUNT(*) as cnt FROM task_events WHERE task_id = ? AND seq > ? AND actor_agent_id != ?'
     ).get(task.id, cursor, agentId) as { cnt: number }).cnt;
     const latest = unread.slice(-5).map(e => {
-      const actor = getAgentById(e.actor_agent_id ?? '');
+      const actor = e.actor_agent_id ? getAgentById(e.actor_agent_id) : null;
       let preview = '';
       try { const p = JSON.parse(e.payload_json); preview = p.result || p.reason || ''; } catch {}
       return {
@@ -392,6 +510,16 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
   }
 
   return result;
+}
+
+function previewFromPayload(payloadJson: string): string {
+  try {
+    const p = JSON.parse(payloadJson);
+    const text = p.content || p.message || p.preview || '';
+    return text.length > 200 ? text.slice(0, 200) + ' [summary]' : text;
+  } catch {
+    return '';
+  }
 }
 
 // --- Peers ---

@@ -104,34 +104,28 @@ async function cmdStatus() {
   try {
     const db = initDB(dbPath);
     const agents = db.prepare('SELECT id, display_name, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
-    const rooms = db.prepare("SELECT id, name, kind FROM rooms WHERE closed_at IS NULL").all() as any[];
+    const teams = db.prepare("SELECT id, name FROM teams WHERE closed_at IS NULL").all() as any[];
     const tasks = db.prepare("SELECT count(*) as cnt FROM tasks WHERE status NOT IN ('completed','failed','canceled')").get() as { cnt: number };
 
     console.log(`\n📊 Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
-    console.log(`   Rooms: ${rooms.length}  Active tasks: ${tasks.cnt}`);
+    console.log(`   Teams: ${teams.length}  Active tasks: ${tasks.cnt}`);
 
     console.log(`\n👥 Agents (${agents.length}):`);
     for (const a of agents) {
-      // Find rooms this agent is in
-      const memberRooms = db.prepare(`
-        SELECT DISTINCT r.name FROM rooms r
-        JOIN room_events e ON e.room_id = r.id AND e.type = 'join' AND e.actor_agent_id = ?
-        WHERE r.closed_at IS NULL AND NOT EXISTS (
-          SELECT 1 FROM room_events e2 WHERE e2.room_id = r.id AND e2.type = 'leave' AND e2.actor_agent_id = ? AND e2.seq > e.seq
-        )
-      `).all(a.id, a.id) as any[];
-      const roomNames = memberRooms.map((r: any) => r.name).filter(Boolean).join(', ');
-      console.log(`   ${a.display_name} (${a.status}) — ${roomNames || 'no rooms'}`);
+      const memberTeams = db.prepare(`
+        SELECT t.name, tm.nickname FROM teams t
+        JOIN team_members tm ON tm.team_id = t.id
+        WHERE tm.agent_id = ? AND t.closed_at IS NULL
+      `).all(a.id) as any[];
+      const teamLabels = memberTeams.map((t: any) => t.nickname ? `${t.name}:${t.nickname}` : t.name).join(', ');
+      console.log(`   ${a.display_name} [${a.id.slice(0, 8)}…] (${a.status}) — ${teamLabels || 'no teams'}`);
     }
 
-    if (rooms.length > 0) {
-      console.log(`\n🏠 Rooms:`);
-      for (const r of rooms) {
-        const memberCount = db.prepare(`
-          SELECT COUNT(DISTINCT e.actor_agent_id) as cnt FROM room_events e
-          WHERE e.room_id = ? AND e.type = 'join'
-        `).get(r.id) as { cnt: number };
-        console.log(`   ${r.name || r.id} (${r.kind}) — ${memberCount.cnt} members`);
+    if (teams.length > 0) {
+      console.log(`\n🏠 Teams:`);
+      for (const t of teams) {
+        const memberCount = db.prepare('SELECT COUNT(*) as cnt FROM team_members WHERE team_id = ?').get(t.id) as { cnt: number };
+        console.log(`   ${t.name} — ${memberCount.cnt} members`);
       }
     }
   } catch (err) {
@@ -163,18 +157,25 @@ async function cmdDbClear() {
 
 async function cmdAgentRemove() {
   const { dbPath } = parseFlags(1);
-  const name = args[2];
-  if (!name) {
-    console.log('Usage: kitty-hive agent remove <name>');
+  const target = args[2];
+  if (!target) {
+    console.log('Usage: kitty-hive agent remove <name-or-id>');
     process.exit(1);
   }
 
   const db = initDB(dbPath);
-  const agent = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ?').get(name) as any;
-  if (!agent) {
-    console.log(`Agent "${name}" not found.`);
+  const matches = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').all(target, target) as any[];
+  if (matches.length === 0) {
+    console.log(`Agent "${target}" not found.`);
     process.exit(1);
   }
+  if (matches.length > 1) {
+    console.log(`"${target}" matches ${matches.length} agents. Use id to disambiguate.`);
+    for (const m of matches) console.log(`  ${m.id}  ${m.display_name}`);
+    process.exit(1);
+  }
+  const agent = matches[0];
+  const name = agent.display_name;
 
   const confirm = await ask(`Remove agent "${name}" and all related data? (y/n)`, 'n');
   if (confirm.toLowerCase() !== 'y') {
@@ -184,18 +185,21 @@ async function cmdAgentRemove() {
 
   // Delete in dependency order to satisfy foreign keys
   db.prepare('DELETE FROM read_cursors WHERE agent_id = ?').run(agent.id);
-  // Task events for tasks created by this agent
+  // Tasks
   db.prepare(`DELETE FROM task_events WHERE task_id IN (SELECT id FROM tasks WHERE creator_agent_id = ?)`).run(agent.id);
   db.prepare('DELETE FROM task_events WHERE actor_agent_id = ?').run(agent.id);
-  // Tasks created by this agent
   db.prepare('DELETE FROM tasks WHERE creator_agent_id = ?').run(agent.id);
   db.prepare('UPDATE tasks SET assignee_agent_id = NULL WHERE assignee_agent_id = ?').run(agent.id);
-  // Room events
-  db.prepare('DELETE FROM room_events WHERE actor_agent_id = ?').run(agent.id);
-  // Rooms hosted by this agent (and their events)
-  db.prepare(`DELETE FROM room_events WHERE room_id IN (SELECT id FROM rooms WHERE host_agent_id = ?)`).run(agent.id);
-  db.prepare(`DELETE FROM read_cursors WHERE target_id IN (SELECT id FROM rooms WHERE host_agent_id = ?)`).run(agent.id);
-  db.prepare('DELETE FROM rooms WHERE host_agent_id = ?').run(agent.id);
+  // DMs
+  db.prepare('DELETE FROM dm_messages WHERE from_agent_id = ? OR to_agent_id = ?').run(agent.id, agent.id);
+  // Team membership + events
+  db.prepare('DELETE FROM team_members WHERE agent_id = ?').run(agent.id);
+  db.prepare('DELETE FROM team_events WHERE actor_agent_id = ?').run(agent.id);
+  // Teams hosted by this agent (and their content)
+  db.prepare(`DELETE FROM team_events WHERE team_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
+  db.prepare(`DELETE FROM team_members WHERE team_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
+  db.prepare(`DELETE FROM read_cursors WHERE target_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
+  db.prepare('DELETE FROM teams WHERE host_agent_id = ?').run(agent.id);
   db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
 
   console.log(`✅ Removed agent "${name}".`);
@@ -211,17 +215,16 @@ async function cmdAgentRename() {
   }
 
   const db = initDB(dbPath);
-  const agent = db.prepare('SELECT id FROM agents WHERE display_name = ?').get(oldName) as any;
-  if (!agent) {
+  const matches = db.prepare('SELECT id FROM agents WHERE display_name = ? OR id = ?').all(oldName, oldName) as Array<{ id: string }>;
+  if (matches.length === 0) {
     console.log(`Agent "${oldName}" not found.`);
     process.exit(1);
   }
-  const conflict = db.prepare('SELECT id FROM agents WHERE display_name = ?').get(newName) as any;
-  if (conflict) {
-    console.log(`Name "${newName}" is already taken.`);
+  if (matches.length > 1) {
+    console.log(`"${oldName}" matches ${matches.length} agents. Use agent id to disambiguate.`);
     process.exit(1);
   }
-  db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, agent.id);
+  db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, matches[0].id);
   console.log(`✅ Renamed "${oldName}" → "${newName}".`);
 }
 

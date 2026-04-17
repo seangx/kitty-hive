@@ -10,32 +10,43 @@ export interface Agent {
   last_seen: string;
 }
 
-export type RoomKind = 'lobby' | 'dm' | 'team';
-
-export interface Room {
+export interface Team {
   id: string;
-  name: string | null;
-  kind: RoomKind;
+  name: string;
   host_agent_id: string | null;
   created_at: string;
   closed_at: string | null;
 }
 
-// Room events: only communication
-export const ROOM_EVENT_TYPES = ['join', 'leave', 'message'] as const;
-export type RoomEventType = typeof ROOM_EVENT_TYPES[number];
+export interface TeamMember {
+  team_id: string;
+  agent_id: string;
+  nickname: string | null;
+  joined_at: string;
+}
 
-export interface RoomEvent {
+export const TEAM_EVENT_TYPES = ['join', 'leave', 'message', 'rename'] as const;
+export type TeamEventType = typeof TEAM_EVENT_TYPES[number];
+
+export interface TeamEvent {
   id: number;
-  room_id: string;
+  team_id: string;
   seq: number;
-  type: RoomEventType;
+  type: TeamEventType;
   actor_agent_id: string | null;
   payload_json: string;
   ts: string;
 }
 
-// Task status
+export interface DMMessage {
+  id: number;
+  seq: number;
+  from_agent_id: string;
+  to_agent_id: string;
+  content: string;
+  ts: string;
+}
+
 export type TaskStatus =
   | 'created'
   | 'proposing'
@@ -53,13 +64,12 @@ export interface Task {
   status: TaskStatus;
   workflow_json: string | null;
   current_step: number;
-  source_room_id: string | null;
+  source_team_id: string | null;
   input_json: string;
   created_at: string;
   completed_at: string | null;
 }
 
-// Task events
 export const TASK_EVENT_TYPES = [
   'task-start', 'task-claim', 'task-update',
   'task-propose', 'task-approve', 'task-reject',
@@ -78,7 +88,6 @@ export interface TaskEvent {
   ts: string;
 }
 
-// Workflow
 export interface WorkflowStep {
   step: number;
   title: string;
@@ -88,4 +97,3 @@ export interface WorkflowStep {
   on_reject?: 'revise' | `back:${number}`;
   completed_by: string[];
 }
-

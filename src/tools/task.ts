@@ -1,5 +1,5 @@
 import {
-  getAgentById, getAgentByName, findAgentByRole,
+  getAgentById, findAgentByRole, resolveAddressee,
   createTask, getTaskById, updateTaskStatus,
   appendTaskEvent, getTaskEvents, getPeerByName,
 } from '../db.js';
@@ -12,7 +12,7 @@ interface TaskInput {
   to?: string;
   title: string;
   input?: object;
-  source_room_id?: string;
+  source_team_id?: string;
 }
 
 interface TaskOutput {
@@ -30,12 +30,13 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
       const agent = findAgentByRole(input.to.slice(5));
       if (agent) assignee = { id: agent.id, display_name: agent.display_name };
     } else {
-      const agent = getAgentById(input.to) || getAgentByName(input.to);
-      if (agent) assignee = { id: agent.id, display_name: agent.display_name };
+      const resolved = resolveAddressee(actorId, input.to);
+      if ('error' in resolved) throw new Error(resolved.error);
+      assignee = { id: resolved.agent!.id, display_name: resolved.agent!.display_name };
     }
   }
 
-  const task = createTask(input.title, actorId, assignee?.id, input.source_room_id, input.input);
+  const task = createTask(input.title, actorId, assignee?.id, input.source_team_id, input.input);
 
   // task-start → proposing (assignee should propose workflow)
   validateWorkflowTransition('created' as TaskStatus, 'task-start');

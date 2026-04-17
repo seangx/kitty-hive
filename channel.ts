@@ -2,14 +2,11 @@
 /**
  * kitty-hive channel plugin for Claude Code
  *
- * Bridges kitty-hive MCP server events to Claude Code sessions via Channels.
- * Polls hive inbox for new messages and pushes them as <channel> notifications.
- * Exposes a reply tool so Claude can respond directly.
- *
- * Usage:
- *   claude --dangerously-load-development-channels server:hive-channel
- *
- * Requires kitty-hive server running (default: http://localhost:4123/mcp)
+ * Bridges kitty-hive HTTP MCP server events to Claude Code via Channels.
+ * - Maintains an MCP session against the hive HTTP server
+ * - Listens to SSE for push notifications (DMs, team events, task events)
+ * - Forwards them as <channel> notifications into the Claude Code session
+ * - Re-exposes hive tools as `hive-*` (kebab-case) so Claude can call them directly
  */
 
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
@@ -17,8 +14,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 
 const HIVE_URL = process.env.HIVE_URL || 'http://localhost:4123/mcp'
+const HIVE_AGENT_ID = process.env.HIVE_AGENT_ID || ''
 const HIVE_AGENT_NAME = process.env.HIVE_AGENT_NAME || ''
-const POLL_INTERVAL = parseInt(process.env.HIVE_POLL_INTERVAL || '3000', 10)
 
 // --- Hive HTTP client ---
 
@@ -26,19 +23,29 @@ let sessionId: string | null = null
 let agentId: string | null = null
 let agentName: string | null = null
 let rpcId = 0
+let sseStarted = false
 
-async function hivePost(method: string, params: any = {}) {
+async function hivePost(method: string, params: any = {}, _retried = false): Promise<any> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'Accept': 'application/json, text/event-stream',
   }
-  if (sessionId) headers['Mcp-Session-Id'] = sessionId
+  // initialize must not carry a session id (server creates one)
+  if (sessionId && method !== 'initialize') headers['Mcp-Session-Id'] = sessionId
 
   const res = await fetch(HIVE_URL, {
-    method: 'POST',
-    headers,
+    method: 'POST', headers,
     body: JSON.stringify({ jsonrpc: '2.0', id: ++rpcId, method, params }),
   })
+
+  // Server lost our session (restarted) — re-init and retry once
+  if (res.status === 404 && !_retried && method !== 'initialize') {
+    console.error(`[hive-channel] server returned 404 (stale session); re-initializing...`)
+    sessionId = null
+    await initHiveSession()
+    if (agentId) await hiveCallTool('hive.start', { id: agentId, tool: 'claude', roles: 'channel' }, true)
+    return hivePost(method, params, true)
+  }
 
   const sid = res.headers.get('mcp-session-id')
   if (sid) sessionId = sid
@@ -56,21 +63,20 @@ async function hivePost(method: string, params: any = {}) {
   return data.result
 }
 
-async function hiveCallTool(name: string, args: any = {}) {
-  const result = await hivePost('tools/call', { name, arguments: args })
+async function hiveCallTool(name: string, args: any = {}, _retried = false) {
+  const result = await hivePost('tools/call', { name, arguments: args }, _retried)
   const text = result.content[0].text
   if (result.isError) throw new Error(text)
   try { return JSON.parse(text) } catch { return text }
 }
 
 async function initHiveSession() {
-  // Initialize MCP session with hive
+  sessionId = null  // ensure no stale id is sent
   await hivePost('initialize', {
     protocolVersion: '2025-03-26',
     capabilities: {},
     clientInfo: { name: 'hive-channel', version: '1.0' },
   })
-  // Send initialized notification
   await fetch(HIVE_URL, {
     method: 'POST',
     headers: {
@@ -82,13 +88,13 @@ async function initHiveSession() {
   })
 }
 
-let sseStarted = false
-
-async function registerAgent(name: string) {
-  const result = await hiveCallTool('hive.start', { name, tool: 'claude', roles: 'channel' })
+async function registerAgent(opts: { id?: string; name?: string }) {
+  const args: any = { tool: 'claude', roles: 'channel' }
+  if (opts.id) args.id = opts.id
+  if (opts.name) args.name = opts.name
+  const result = await hiveCallTool('hive.start', args)
   agentId = result.agent_id
   agentName = result.display_name
-  // Auto-start SSE after registration
   if (!sseStarted) {
     sseStarted = true
     listenSSE()
@@ -96,454 +102,171 @@ async function registerAgent(name: string) {
   return result
 }
 
-// --- Channel MCP server ---
+// --- MCP server (stdio, plugin-side) ---
 
 const mcp = new Server(
-  { name: 'hive-channel', version: '0.1.0' },
+  { name: 'hive-channel', version: '0.2.0' },
   {
-    capabilities: {
-      experimental: { 'claude/channel': {} },
-      tools: {},
-    },
+    capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
     instructions: [
       'You are connected to kitty-hive, a multi-agent collaboration server.',
-      'Messages arrive as <channel source="hive-channel" from="..." room_id="..." type="...">.',
+      'Push notifications arrive as <channel source="hive-channel" from_agent_id="..." type="..."> blocks.',
       '',
-      'Identity: hive-whoami (show your agent ID and name).',
-      'Communication: hive-dm (send DM), hive-inbox (check unread).',
-      'Teams: hive-team-create, hive-team-join (by name), hive-team-list.',
-      'Tasks: hive-task (create), hive-claim (claim unassigned), hive-tasks (list/board), hive-check (status).',
-      'Workflow: hive-propose (propose steps), hive-approve, hive-step-complete, hive-reject.',
-      'Federation: hive-peers (list peers), hive-remote-agents (list remote agents). Use agent@node for cross-node DM/task.',
+      '## Identity',
+      '- IMPORTANT: On first use, ask the user "What name should I register on the hive?" and call hive-whoami(name=<that name>).',
+      '- Your agent_id (returned by whoami) is the stable handle for cross-team addressing.',
+      '- display_name is for display only; not unique. Per-team you can also have a unique nickname (hive-team-nickname).',
       '',
-      'IMPORTANT: On first use, you MUST ask the user "What name should I register with on the hive?" before calling any hive tool. Do NOT use default names like "kitty-hive" or the plugin name. Call hive-whoami with the name the user provides.',
-      'IMPORTANT: When you receive a task, propose a workflow (hive-propose) before starting.',
-      'When you see an unassigned task, claim it with hive-claim.',
-      'NEVER auto-approve a workflow — always show the proposal to the user and wait for explicit confirmation before calling hive-approve.',
-      'Artifacts: ~/.kitty-hive/artifacts/<task_id>/',
+      '## Tools',
+      '- Identity: hive-whoami, hive-rename, hive-agents (list all agents on the hive)',
+      '- DM: hive-dm (to=agent id or team-nickname), hive-inbox',
+      '- Teams: hive-team-create, hive-team-join, hive-team-list, hive-teams (mine), hive-team-info, hive-team-events, hive-team-message, hive-team-nickname',
+      '- Tasks: hive-task, hive-claim, hive-tasks, hive-check',
+      '- Workflow: hive-propose, hive-approve, hive-step-complete, hive-reject',
+      '- Federation: hive-peers, hive-remote-agents (use id@node)',
+      '',
+      '## Workflow rules',
+      '- When you receive a task, propose a workflow (hive-propose) before starting.',
+      '- NEVER auto-approve a workflow — show the proposal to the user and wait for explicit confirmation.',
+      '- Mark each step with hive-step-complete.',
+      '- Claim unassigned tasks with hive-claim.',
+      '',
+      '## Artifacts',
+      '~/.kitty-hive/artifacts/<task_id>/',
     ].join('\n'),
   },
 )
 
-// --- Tools ---
+// --- Dynamic tool proxy ---
+// Channel discovers hive.* tools from the HTTP server at startup, then exposes
+// them as kebab-case `hive-*` tools. Calls are forwarded with `as: agentId`
+// injected. Only `hive-whoami` is implemented locally (manages session state).
 
-mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
-  tools: [
-    {
-      name: 'hive-rename',
-      description: 'Change your display name on the hive',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'New display name' },
-        },
-        required: ['name'],
-      },
-    },
-    {
-      name: 'hive-dm',
-      description: 'Send a direct message to another agent on kitty-hive',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: 'Target agent name or ID' },
-          content: { type: 'string', description: 'Message content' },
-        },
-        required: ['to', 'content'],
-      },
-    },
-    {
-      name: 'hive-inbox',
-      description: 'Check all unread messages on kitty-hive',
-      inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'hive-task',
-      description: 'Create a task and delegate to an agent or role.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          to: { type: 'string', description: 'Target: agent name or "role:ux"' },
-          title: { type: 'string', description: 'Task title' },
-          input: { type: 'object', description: 'Structured task input (description, output_path, output_format)' },
-        },
-        required: ['title'],
-      },
-    },
-    {
-      name: 'hive-claim',
-      description: 'Claim an unassigned task',
-      inputSchema: {
-        type: 'object',
-        properties: { task_id: { type: 'string', description: 'Task ID' } },
-        required: ['task_id'],
-      },
-    },
-    {
-      name: 'hive-tasks',
-      description: 'List your tasks (created or assigned), grouped by status',
-      inputSchema: {
-        type: 'object',
-        properties: { status: { type: 'string', description: 'Filter: created, in_progress, completed, etc.' } },
-      },
-    },
-    {
-      name: 'hive-check',
-      description: 'Check the current state of a task by task ID',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          task_id: { type: 'string', description: 'Task ID to check' },
-        },
-        required: ['task_id'],
-      },
-    },
-    {
-      name: 'hive-rooms',
-      description: 'List rooms you are a member of',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          kind: { type: 'string', description: 'Filter by room kind: dm, team, lobby' },
-        },
-      },
-    },
-    {
-      name: 'hive-room-info',
-      description: 'Get detailed info about a room including members and recent events',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          room_id: { type: 'string', description: 'Room ID' },
-        },
-        required: ['room_id'],
-      },
-    },
-    {
-      name: 'hive-events',
-      description: 'Fetch events from a room. Use "since" for incremental polling.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          room_id: { type: 'string', description: 'Room ID' },
-          since: { type: 'number', description: 'Return events after this seq number' },
-          limit: { type: 'number', description: 'Max events to return (default 50)' },
-        },
-        required: ['room_id'],
-      },
-    },
-    {
-      name: 'hive-team-create',
-      description: 'Create a team room for group collaboration',
-      inputSchema: {
-        type: 'object',
-        properties: { name: { type: 'string', description: 'Team name' } },
-        required: ['name'],
-      },
-    },
-    {
-      name: 'hive-team-join',
-      description: 'Join an existing team room by name or ID',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          room_id: { type: 'string', description: 'Team room ID' },
-          name: { type: 'string', description: 'Team name' },
-        },
-      },
-    },
-    {
-      name: 'hive-team-list',
-      description: 'List all available teams',
-      inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'hive-propose',
-      description: 'Propose a workflow for a task. Define steps with assignees, actions, and completion criteria.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          task_id: { type: 'string', description: 'Task ID' },
-          workflow: {
-            type: 'array',
-            description: 'Workflow steps',
-            items: {
-              type: 'object',
-              properties: {
-                step: { type: 'number' },
-                title: { type: 'string' },
-                assignees: { type: 'array', items: { type: 'string' }, description: 'Agent names or "role:xxx"' },
-                action: { type: 'string' },
-                completion: { type: 'string', description: '"all" or "any"' },
-                on_reject: { type: 'string', description: '"revise" or "back:N"' },
-              },
-              required: ['step', 'title', 'assignees', 'action'],
-            },
-          },
-        },
-        required: ['task_id', 'workflow'],
-      },
-    },
-    {
-      name: 'hive-approve',
-      description: 'Approve a proposed workflow. Automatically starts step 1.',
-      inputSchema: {
-        type: 'object',
-        properties: { task_id: { type: 'string', description: 'Task ID' } },
-        required: ['task_id'],
-      },
-    },
-    {
-      name: 'hive-step-complete',
-      description: 'Mark your part of the current step as complete.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          task_id: { type: 'string', description: 'Task ID' },
-          step: { type: 'number', description: 'Step number' },
-          result: { type: 'string', description: 'Result description' },
-        },
-        required: ['task_id', 'step'],
-      },
-    },
-    {
-      name: 'hive-reject',
-      description: 'Reject the current step. Sends the task back to a previous step.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          task_id: { type: 'string', description: 'Task ID' },
-          step: { type: 'number', description: 'Step being rejected' },
-          reason: { type: 'string', description: 'Rejection reason' },
-        },
-        required: ['task_id', 'step'],
-      },
-    },
-    {
-      name: 'hive-whoami',
-      description: 'Show your own agent ID, display name, and registration info on the hive. If not registered yet, provide a name to register.',
-      inputSchema: {
-        type: 'object',
-        properties: {
-          name: { type: 'string', description: 'Agent name to register with (only needed if not yet registered)' },
-        },
-      },
-    },
-    {
-      name: 'hive-peers',
-      description: 'List connected federation peers',
-      inputSchema: { type: 'object', properties: {} },
-    },
-    {
-      name: 'hive-remote-agents',
-      description: 'List agents on a remote peer node',
-      inputSchema: {
-        type: 'object',
-        properties: { peer: { type: 'string', description: 'Peer node name' } },
-        required: ['peer'],
-      },
-    },
-  ],
-}))
+interface MCPTool {
+  name: string
+  description?: string
+  inputSchema: any
+}
+
+let cachedHiveTools: MCPTool[] = []
+
+function hiveToKebab(name: string): string {
+  return name.replace(/\./g, '-')
+}
+
+function kebabToHive(name: string): string {
+  return name.replace(/-/g, '.')
+}
+
+function stripAsParam(schema: any): any {
+  if (!schema?.properties) return schema
+  const { as: _as, ...rest } = schema.properties
+  const required = Array.isArray(schema.required) ? schema.required.filter((r: string) => r !== 'as') : undefined
+  const out: any = { ...schema, properties: rest }
+  if (required && required.length > 0) out.required = required
+  else delete out.required
+  return out
+}
+
+async function refreshHiveTools(): Promise<void> {
+  try {
+    const result = await hivePost('tools/list', {})
+    cachedHiveTools = (result.tools || []).filter((t: MCPTool) => t.name.startsWith('hive.'))
+  } catch (err) {
+    console.error('[hive-channel] failed to fetch tool list:', err)
+  }
+}
+
+const WHOAMI_TOOL: MCPTool = {
+  name: 'hive-whoami',
+  description: 'Show your agent id, display_name, and registration info. If not registered, pass `name` to register.',
+  inputSchema: {
+    type: 'object',
+    properties: { name: { type: 'string', description: 'Agent name (only when first registering)' } },
+  },
+}
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => {
+  if (cachedHiveTools.length === 0) await refreshHiveTools()
+  const tools: MCPTool[] = [WHOAMI_TOOL]
+  for (const t of cachedHiveTools) {
+    // hive.whoami is served locally (manages registration state)
+    if (t.name === 'hive.whoami') continue
+    tools.push({
+      name: hiveToKebab(t.name),
+      description: t.description,
+      inputSchema: stripAsParam(t.inputSchema),
+    })
+  }
+  return { tools }
+})
 
 mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   const { name } = req.params
-  const args = req.params.arguments as Record<string, string>
+  const args = (req.params.arguments || {}) as any
 
-  // Lazy registration: if not registered, require hive-whoami with a name first
-  if (!agentName && name !== 'hive-whoami') {
-    return {
-      content: [{ type: 'text', text: 'Not registered yet. Call hive-whoami with a name to register first.' }],
-      isError: true,
-    }
-  }
-
-  if (name === 'hive-rename') {
-    const result = await hiveCallTool('hive.rename', { as: agentName, name: args.name })
-    agentName = result.new_name
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-dm') {
-    const result = await hiveCallTool('hive.dm', {
-      as: agentName,
-      to: args.to,
-      content: args.content,
-    })
-    return { content: [{ type: 'text', text: `sent (room: ${result.room_id})` }] }
-  }
-
-  if (name === 'hive-inbox') {
-    const result = await hiveCallTool('hive.inbox', { as: agentName })
-    return { content: [{ type: 'text', text: typeof result === 'string' ? result : JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-task') {
-    const input = args.input ? (typeof args.input === 'string' ? JSON.parse(args.input) : args.input) : undefined
-    const result = await hiveCallTool('hive.task', {
-      as: agentName,
-      to: args.to,
-      title: args.title,
-      input,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-claim') {
-    const result = await hiveCallTool('hive.task.claim', { as: agentName, task_id: args.task_id })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-tasks') {
-    const result = await hiveCallTool('hive.tasks', { as: agentName, status: args.status })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-check') {
-    const result = await hiveCallTool('hive.check', { task_id: args.task_id })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-rooms') {
-    const result = await hiveCallTool('hive.room.list', { as: agentName, kind: args.kind })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-room-info') {
-    const result = await hiveCallTool('hive.room.info', { as: agentName, room_id: args.room_id })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-events') {
-    const result = await hiveCallTool('hive.room.events', {
-      as: agentName,
-      room_id: args.room_id,
-      since: args.since ? Number(args.since) : undefined,
-      limit: args.limit ? Number(args.limit) : undefined,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-team-create') {
-    const result = await hiveCallTool('hive.team.create', { as: agentName, name: args.name })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-team-join') {
-    const result = await hiveCallTool('hive.team.join', { as: agentName, room_id: args.room_id, name: args.name })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-team-list') {
-    const result = await hiveCallTool('hive.team.list', {})
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-propose') {
-    const workflow = typeof args.workflow === 'string' ? JSON.parse(args.workflow) : args.workflow
-    const result = await hiveCallTool('hive.workflow.propose', {
-      as: agentName,
-      task_id: args.task_id,
-      workflow,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-approve') {
-    const result = await hiveCallTool('hive.workflow.approve', {
-      as: agentName,
-      task_id: args.task_id,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-step-complete') {
-    const result = await hiveCallTool('hive.workflow.step.complete', {
-      as: agentName,
-      task_id: args.task_id,
-      step: Number(args.step),
-      result: args.result,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
-  if (name === 'hive-reject') {
-    const result = await hiveCallTool('hive.workflow.reject', {
-      as: agentName,
-      task_id: args.task_id,
-      step: Number(args.step),
-      reason: args.reason,
-    })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
-  }
-
+  // Local handler: hive-whoami
   if (name === 'hive-whoami') {
-    // Register if not yet registered and name provided
     if (!agentName) {
       if (!args.name) {
-        return {
-          content: [{ type: 'text', text: 'Not registered. Provide a "name" parameter to register.' }],
-          isError: true,
-        }
+        return { content: [{ type: 'text', text: 'Not registered. Provide a "name" parameter to register.' }], isError: true }
       }
-      await registerAgent(args.name)
+      await registerAgent({ name: args.name })
+      await refreshHiveTools()
     }
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({
-          agent_id: agentId,
-          agent_name: agentName,
-          hive_url: HIVE_URL,
-          session_id: sessionId,
-        }, null, 2),
+        text: JSON.stringify({ agent_id: agentId, agent_name: agentName, hive_url: HIVE_URL, session_id: sessionId }, null, 2),
       }],
     }
   }
 
-  if (name === 'hive-peers') {
-    const result = await hiveCallTool('hive.peers', {})
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  // Lazy-registration guard
+  if (!agentName) {
+    return {
+      content: [{ type: 'text', text: 'Not registered. Call hive-whoami(name=<your-agent-name>) first.' }],
+      isError: true,
+    }
   }
 
-  if (name === 'hive-remote-agents') {
-    const result = await hiveCallTool('hive.remote.agents', { peer: args.peer })
-    return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] }
+  // Proxy all other hive-* tools to hive.* with `as: agentId` injected
+  if (!name.startsWith('hive-')) throw new Error(`Unknown tool: ${name}`)
+  const hiveName = kebabToHive(name)
+  const result = await hiveCallTool(hiveName, { as: agentId, ...args })
+  return {
+    content: [{
+      type: 'text',
+      text: typeof result === 'string' ? result : JSON.stringify(result, null, 2),
+    }],
   }
-
-  throw new Error(`unknown tool: ${name}`)
 })
 
-// --- Dedup ---
-const pushedMessages = new Set<string>();
-function dedup(from: string, roomId: string, content: string): boolean {
-  const key = `${from}:${roomId}:${content.slice(0, 50)}`;
-  if (pushedMessages.has(key)) return false;
-  pushedMessages.add(key);
-  // Keep set bounded
+// --- Push notifications: SSE → channel ---
+
+const pushedMessages = new Set<string>()
+function dedup(key: string): boolean {
+  if (pushedMessages.has(key)) return false
+  pushedMessages.add(key)
   if (pushedMessages.size > 500) {
-    const first = pushedMessages.values().next().value;
-    if (first) pushedMessages.delete(first);
+    const first = pushedMessages.values().next().value
+    if (first) pushedMessages.delete(first)
   }
-  return true;
+  return true
 }
 
-// --- SSE listener ---
-
 async function listenSSE() {
-  const url = HIVE_URL
-
   while (true) {
     try {
-      const res = await fetch(url, { method: 'GET', headers: {
-        'Accept': 'text/event-stream',
-        'Mcp-Session-Id': sessionId!,
-      }})
+      const res = await fetch(HIVE_URL, {
+        method: 'GET',
+        headers: { 'Accept': 'text/event-stream', 'Mcp-Session-Id': sessionId! },
+      })
       if (!res.ok || !res.body) {
         console.error(`[hive-channel] SSE connect failed: ${res.status}, re-registering...`)
         try {
           await initHiveSession()
-          if (agentName) await registerAgent(agentName)
+          if (agentId) await hiveCallTool('hive.start', { id: agentId, tool: 'claude', roles: 'channel' })
         } catch (e) {
           console.error(`[hive-channel] re-register failed:`, e)
         }
@@ -568,94 +291,60 @@ async function listenSSE() {
           if (!line.startsWith('data:')) continue
           try {
             const data = JSON.parse(line.slice(5))
-            console.error(`[hive-channel] SSE event: method=${data.method}`)
-            // logging notification from hive server
-            if (data.method === 'notifications/message' && data.params?.data) {
-              const raw = data.params.data
-              let parsed: any
-              try { parsed = JSON.parse(raw) } catch { parsed = { message: raw } }
+            if (data.method !== 'notifications/message' || !data.params?.data) continue
 
-              // Skip if it's not a message-type event
-              if (!parsed.type || parsed.type === 'join' || parsed.type === 'leave') continue
+            const raw = data.params.data
+            let parsed: any
+            try { parsed = JSON.parse(raw) } catch { parsed = { type: 'message', preview: raw } }
 
-              const content = parsed.preview || parsed.title || raw;
-              const from = parsed.from || 'unknown';
-              const roomId = parsed.room_id || '';
-              if (!dedup(from, roomId, content)) continue;
+            // Skip join/leave noise
+            if (parsed.type === 'join' || parsed.type === 'leave') continue
 
-              await mcp.notification({
-                method: 'notifications/claude/channel',
-                params: {
-                  content,
-                  meta: {
-                    from,
-                    room_id: roomId,
-                    room_name: parsed.room_name || '',
-                    room_kind: parsed.room_kind || '',
-                    type: parsed.type || 'message',
-                  },
+            const content = parsed.preview || parsed.title || raw
+            const from = parsed.from || parsed.from_agent_id || 'unknown'
+            const key = `${from}:${parsed.type}:${content.slice(0, 60)}`
+            if (!dedup(key)) continue
+
+            await mcp.notification({
+              method: 'notifications/claude/channel',
+              params: {
+                content,
+                meta: {
+                  type: parsed.type,
+                  from,
+                  from_agent_id: parsed.from_agent_id || '',
+                  team_id: parsed.team_id || '',
+                  task_id: parsed.task_id || '',
                 },
-              })
-            }
+              },
+            })
           } catch { /* ignore parse errors */ }
         }
       }
     } catch (err) {
       console.error(`[hive-channel] SSE error, reconnecting...`, err)
     }
-    // Reconnect after disconnect
     await new Promise(r => setTimeout(r, 2000))
   }
-}
-
-// --- Fallback: poll inbox on startup to catch missed messages ---
-
-async function drainInbox() {
-  try {
-    const unread = await hiveCallTool('hive.inbox', { as: agentName })
-    if (!Array.isArray(unread)) return
-
-    for (const room of unread) {
-      for (const msg of room.latest) {
-        if (msg.type === 'join' || msg.type === 'leave') continue
-        const content = msg.preview || `[${msg.type} event]`;
-        if (!dedup(msg.from, room.id, content)) continue;
-        await mcp.notification({
-          method: 'notifications/claude/channel',
-          params: {
-            content,
-            meta: {
-              from: msg.from,
-              room_id: room.id,
-              room_name: room.name || '',
-              room_kind: room.kind,
-              type: msg.type,
-            },
-          },
-        })
-      }
-    }
-  } catch { /* ignore */ }
 }
 
 // --- Start ---
 
 await mcp.connect(new StdioServerTransport())
 
-// Connect to hive with retry
 async function connectToHive() {
   while (true) {
     try {
       await initHiveSession()
-      if (HIVE_AGENT_NAME) {
-        await registerAgent(HIVE_AGENT_NAME)
+      if (HIVE_AGENT_ID || HIVE_AGENT_NAME) {
+        await registerAgent({ id: HIVE_AGENT_ID || undefined, name: HIVE_AGENT_NAME || undefined })
         console.error(`[hive-channel] connected as "${agentName}" (${agentId})`)
       } else {
-        console.error(`[hive-channel] connected (no agent name — will register on first tool call)`)
+        console.error(`[hive-channel] connected (no env identity — register via hive-whoami)`)
       }
       return
     } catch (err) {
-      console.error(`[hive-channel] hive not ready, retrying in 3s...`)
+      console.error(`[hive-channel] hive not ready, retrying in 3s...`, err)
       await new Promise(r => setTimeout(r, 3000))
     }
   }
