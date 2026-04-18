@@ -1,12 +1,13 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
-import { mkdirSync, writeFileSync, readFileSync, existsSync, readdirSync, statSync, rmSync } from 'node:fs';
+import { mkdirSync, readFileSync, existsSync, readdirSync, statSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { hostname } from 'node:os';
 import { log } from './log.js';
 import * as db from './db.js';
-import type { Agent } from './models.js';
+import type { Agent, FileAttachment } from './models.js';
 import { handleDM } from './tools/dm.js';
+import { storeFileFromBuffer } from './files.js';
 import {
   handleTaskCreate, handleWorkflowPropose, handleWorkflowApprove,
   handleStepComplete, handleWorkflowReject, handleTaskClaim,
@@ -169,7 +170,7 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
   if (url.pathname === '/federation/dm' && req.method === 'POST') {
     const body = JSON.parse(await readBody(req));
     const { to, content } = body;
-    if (!body.from_agent_id || !to || !content) {
+    if (!body.from_agent_id || !to || content === undefined) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing from_agent_id, to, or content' }));
       return;
@@ -187,31 +188,32 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
     }
 
     const remoteAgent = ensureRemoteFrom(body, peerName);
-    const result = handleDM(remoteAgent.id, { to: target.id, content });
+    const attachments: FileAttachment[] = Array.isArray(body.attachments) ? body.attachments : [];
+    const msg = db.appendDM(remoteAgent.id, target.id, content, attachments);
 
+    const previewBase = content || (attachments.length > 0 ? `[${attachments.length} attachment(s)]` : '');
     await notifyAgents([target.id], remoteAgent.id, JSON.stringify({
       type: 'dm', from_agent_id: remoteAgent.id, from: remoteAgent.display_name,
-      preview: content.length > 200 ? content.slice(0, 200) + ' [summary]' : content,
+      preview: previewBase.length > 200 ? previewBase.slice(0, 200) + ' [summary]' : previewBase,
+      attachments,
     }));
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ delivered: true, message_id: result.message_id, seq: result.seq }));
+    res.end(JSON.stringify({ delivered: true, message_id: msg.id, seq: msg.seq }));
     return;
   }
 
-  // POST /federation/file
+  // POST /federation/file — receive raw binary, store under our own file_id
   if (url.pathname === '/federation/file' && req.method === 'POST') {
     const chunks: Buffer[] = [];
     for await (const chunk of req) chunks.push(chunk as Buffer);
     const data = Buffer.concat(chunks);
-    const filename = (req.headers['x-filename'] as string) || 'upload';
-    const fileId = 'f_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
-    const fileDir = join(filesDir(), fileId);
-    mkdirSync(fileDir, { recursive: true });
-    writeFileSync(join(fileDir, filename), data);
-    log('info', `[federation] file received: ${fileId}/${filename} (${data.length} bytes)`);
+    const filenameHeader = req.headers['x-filename'] as string | undefined;
+    const filename = filenameHeader ? decodeURIComponent(filenameHeader) : 'upload';
+    const meta = storeFileFromBuffer(filename, data);
+    log('info', `[federation] file received: ${meta.file_id}/${filename} (${data.length} bytes)`);
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ file_id: fileId, filename, size: data.length }));
+    res.end(JSON.stringify({ file_id: meta.file_id, filename, size: data.length }));
     return;
   }
 

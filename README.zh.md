@@ -90,8 +90,9 @@ Channel plugin 启动时自动从 server 抓取工具列表，把 `hive.team.cre
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-dm` | `hive.dm` | 发私信 |
-| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件 |
+| `hive-dm` | `hive.dm` | 发私信（可带 `attach: [paths]` 传文件/图片） |
+| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件（附件元数据内嵌） |
+| `hive-file-fetch` | `hive.file.fetch` | 按 file_id 取附件；`save_to` 可指定落盘路径 |
 
 ### 团队
 

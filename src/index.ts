@@ -571,10 +571,35 @@ async function getTunnelUrlFromHive(port: number, timeoutMs = 1500): Promise<str
   } catch { clearTimeout(timer); return ''; }
 }
 
+async function ensureNodeName(): Promise<string> {
+  const explicit = getNodeConfig().name;
+  if (explicit) return explicit;
+  const defaultName = hostname().split('.')[0];
+  if (!process.stdin.isTTY) {
+    // Non-interactive (e.g. systemd) — silently use hostname
+    return defaultName;
+  }
+  console.log(`\n📛 No node name set. Peers will see you under this name.`);
+  const answer = (await ask(`   Node name`, defaultName)).trim() || defaultName;
+  setNodeConfig({ name: answer });
+  console.log(`   → saved (kitty-hive config set name ${answer})\n`);
+  return answer;
+}
+
 async function cmdTunnelStart() {
   let port = 4123;
+  let nameOverride = '';
   for (let i = 2; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
+    else if (args[i] === '--name' && args[i + 1]) { nameOverride = args[i + 1]; i++; }
+  }
+
+  if (nameOverride) {
+    setNodeConfig({ name: nameOverride });
+    console.log(`📛 Node name: ${nameOverride}`);
+  } else {
+    const name = await ensureNodeName();
+    console.log(`📛 Node name: ${name}`);
   }
 
   const bin = findCloudflared();
@@ -900,7 +925,7 @@ Usage:
   kitty-hive config set <key> <value>                     Set config (e.g. name)
   kitty-hive db clear [--db path]                         Clear the database
   kitty-hive files clean [--days 7]                       Remove old federation transfer files
-  kitty-hive tunnel start [--port 4123]                   Run cloudflared & register URL with the hive
+  kitty-hive tunnel start [--port 4123] [--name name]     Run cloudflared & register URL with the hive
   kitty-hive tunnel status [--port 4123]                  Show currently registered tunnel URL`);
 }
 

@@ -13,7 +13,7 @@
  */
 
 import { spawn, ChildProcess, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, existsSync } from 'node:fs';
+import { mkdtempSync, rmSync, existsSync, writeFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -266,6 +266,46 @@ async function main() {
   if (bobCheck2.status !== 'completed') fail(`bob's task not completed: ${JSON.stringify(bobCheck2)}`);
   if (aliceCheck2.status !== 'completed') fail(`alice's shadow task not completed: ${JSON.stringify(aliceCheck2)}`);
   pass(`task completed on both sides`);
+
+  step('DM with attachment: alice sends an image to bob');
+  // Create a tiny PNG file (1x1 transparent pixel)
+  const pngBytes = Buffer.from([
+    0x89,0x50,0x4e,0x47,0x0d,0x0a,0x1a,0x0a,
+    0x00,0x00,0x00,0x0d,0x49,0x48,0x44,0x52,
+    0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x01,
+    0x08,0x06,0x00,0x00,0x00,0x1f,0x15,0xc4,
+    0x89,0x00,0x00,0x00,0x0d,0x49,0x44,0x41,
+    0x54,0x08,0xd7,0x63,0xf8,0xcf,0xc0,0x00,
+    0x00,0x00,0x03,0x00,0x01,0x6e,0xf2,0x14,
+    0xff,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,
+    0x44,0xae,0x42,0x60,0x82,
+  ]);
+  const pngPath = join(dirA, 'test-image.png');
+  writeFileSync(pngPath, pngBytes);
+  const dmResult = await mcpA.call('hive.dm', {
+    as: alice.agent_id,
+    to: `${bob.agent_id}@${peerNameOnA}`,
+    content: 'check this out',
+    attach: [pngPath],
+  });
+  if (!dmResult.attachments || dmResult.attachments.length !== 1) fail(`alice's DM didn't return attachment metadata: ${JSON.stringify(dmResult)}`);
+  const remoteFileId = dmResult.attachments[0].file_id;
+  pass(`alice uploaded image; peer file_id=${remoteFileId}`);
+  await sleep(200);
+
+  // Bob's hive should have received the binary
+  const bobInbox = await mcpB.call('hive.inbox', { as: bob.agent_id });
+  const dmEntry = bobInbox.find((u: any) => u.kind === 'dm' && u.latest.some((l: any) => l.attachments && l.attachments.length > 0));
+  if (!dmEntry) fail(`bob's inbox doesn't show attachments: ${JSON.stringify(bobInbox)}`);
+  const bobAttachment = dmEntry.latest.find((l: any) => l.attachments?.length).attachments[0];
+  pass(`bob's inbox shows attachment: ${bobAttachment.filename} (${bobAttachment.size} bytes)`);
+
+  // Bob fetches and verifies bytes match
+  const fetchResult = await mcpB.call('hive.file.fetch', { file_id: bobAttachment.file_id });
+  if (!fetchResult.path) fail(`bob couldn't fetch file: ${JSON.stringify(fetchResult)}`);
+  const fetched = readFileSync(fetchResult.path);
+  if (!fetched.equals(pngBytes)) fail(`bob's file bytes don't match alice's original (${fetched.length} vs ${pngBytes.length})`);
+  pass(`bob fetched and verified ${fetched.length} bytes match original`);
 
   step('URL drift self-heal: simulate A getting a new tunnel URL');
   // Pretend cloudflared on A produced a new URL (we just point at A's localhost on a different path —

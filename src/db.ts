@@ -149,6 +149,8 @@ export function initDB(dbPath?: string): Database.Database {
   addColumnIfMissing('tasks', 'delegated_peer', "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing('tasks', 'delegated_task_id', "TEXT NOT NULL DEFAULT ''");
   addColumnIfMissing('peers', 'node_name', "TEXT NOT NULL DEFAULT ''");
+  // attachments stored as JSON array of {file_id, filename, mime, size}
+  addColumnIfMissing('dm_messages', 'attachments', "TEXT NOT NULL DEFAULT '[]'");
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
@@ -373,17 +375,18 @@ export function getLatestTeamEvents(teamId: string, limit: number = 10): TeamEve
 
 // --- DM queries ---
 
-export function appendDM(fromAgentId: string, toAgentId: string, content: string): DMMessage {
+export function appendDM(fromAgentId: string, toAgentId: string, content: string, attachments: import('./models.js').FileAttachment[] = []): DMMessage {
   const d = getDB();
   const ts = nowISO();
+  const attachmentsJson = JSON.stringify(attachments);
   const insert = d.transaction(() => {
     const maxSeq = d.prepare('SELECT COALESCE(MAX(seq), 0) as max_seq FROM dm_messages WHERE to_agent_id = ?').get(toAgentId) as { max_seq: number };
     const seq = maxSeq.max_seq + 1;
-    const result = d.prepare('INSERT INTO dm_messages (seq, from_agent_id, to_agent_id, content, ts) VALUES (?, ?, ?, ?, ?)').run(seq, fromAgentId, toAgentId, content, ts);
+    const result = d.prepare('INSERT INTO dm_messages (seq, from_agent_id, to_agent_id, content, ts, attachments) VALUES (?, ?, ?, ?, ?, ?)').run(seq, fromAgentId, toAgentId, content, ts, attachmentsJson);
     return { id: result.lastInsertRowid as number, seq };
   });
   const { id, seq } = insert();
-  return { id, seq, from_agent_id: fromAgentId, to_agent_id: toAgentId, content, ts };
+  return { id, seq, from_agent_id: fromAgentId, to_agent_id: toAgentId, content, ts, attachments: attachmentsJson };
 }
 
 export function getMaxIncomingDMId(toAgentId: string, fromAgentId: string): number {
@@ -546,12 +549,17 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
     ).all(agentId, senderId, cursor) as DMMessage[];
     if (msgs.length === 0) continue;
     const sender = getAgentById(senderId);
-    const latest = msgs.slice(-5).map(m => ({
-      from: sender?.display_name ?? 'unknown',
-      type: 'dm',
-      preview: m.content.length > 200 ? m.content.slice(0, 200) + ' [summary]' : m.content,
-      ts: m.ts,
-    }));
+    const latest = msgs.slice(-5).map(m => {
+      let attachments: any[] = [];
+      try { attachments = JSON.parse(m.attachments || '[]'); } catch { /* ignore */ }
+      return {
+        from: sender?.display_name ?? 'unknown',
+        type: 'dm',
+        preview: m.content.length > 200 ? m.content.slice(0, 200) + ' [summary]' : m.content,
+        attachments,
+        ts: m.ts,
+      };
+    });
     result.push({ type: 'dm', id: senderId, name: sender?.display_name ?? null, kind: 'dm', unread_count: msgs.length, latest });
   }
 

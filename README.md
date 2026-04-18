@@ -90,8 +90,9 @@ The channel plugin auto-mirrors HTTP server tools as kebab-case (`hive.team.crea
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-dm` | `hive.dm` | Send a direct message |
-| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events |
+| `hive-dm` | `hive.dm` | Send a direct message (optional `attach: [paths]` for files/images) |
+| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events (attachments listed inline) |
+| `hive-file-fetch` | `hive.file.fetch` | Get an attachment by file_id; optional `save_to` copies to a path |
 
 ### Teams
 

@@ -40,6 +40,13 @@ export interface TeamEvent {
   ts: string;
 }
 
+export interface FileAttachment {
+  file_id: string;
+  filename: string;
+  mime: string;
+  size: number;
+}
+
 export interface DMMessage {
   id: number;
   seq: number;
@@ -47,6 +54,7 @@ export interface DMMessage {
   to_agent_id: string;
   content: string;
   ts: string;
+  attachments: string;   // JSON-encoded FileAttachment[]
 }
 
 export type TaskStatus =
