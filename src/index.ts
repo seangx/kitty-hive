@@ -248,7 +248,7 @@ function agentRows(db: ReturnType<typeof initDB>, agents: any[]): string[][] {
     const memberTeams = teamStmt.all(a.id) as any[];
     const teamLabels = memberTeams.map(t => t.nickname ? `${t.name}:${t.nickname}` : t.name).join(', ') || '-';
     return [
-      a.id.slice(0, 12),
+      a.id,
       a.display_name,
       a.tool || '-',
       a.status,
@@ -312,7 +312,7 @@ async function cmdStatus() {
       if (remotes.length > 0) {
         console.log(`\n🌐 Remote agents (placeholders)`);
         const rrows = remotes.map(a => [
-          a.id.slice(0, 12), a.display_name, a.origin_peer, a.status, relativeTime(a.last_seen),
+          a.id, a.display_name, a.origin_peer, a.status, relativeTime(a.last_seen),
         ]);
         console.log(renderTable(['ID', 'NAME', 'PEER', 'STATUS', 'LAST SEEN'], rrows, '   '));
       }
