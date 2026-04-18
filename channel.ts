@@ -105,7 +105,7 @@ async function registerAgent(opts: { id?: string; name?: string }) {
 // --- MCP server (stdio, plugin-side) ---
 
 const mcp = new Server(
-  { name: 'hive-channel', version: '0.3.1' },
+  { name: 'hive-channel', version: '0.3.2' },
   {
     capabilities: { experimental: { 'claude/channel': {} }, tools: {} },
     instructions: [

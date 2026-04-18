@@ -206,7 +206,7 @@ cloudflared tunnel --url http://localhost:4123
 **3. 在 mac 生成 invite**
 ```bash
 kitty-hive peer invite \
-  --as <mac-上要暴露的-agent-id> \
+  --expose <mac-agent-id> \
   --url https://mac-tunnel.trycloudflare.com/mcp
 # → 输出一个 token：
 #   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
@@ -215,7 +215,7 @@ kitty-hive peer invite \
 **4. 在 win 上 accept**
 ```bash
 kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
-  --as <win-上要暴露的-agent-id> \
+  --expose <win-agent-id> \
   --url https://win-tunnel.trycloudflare.com/mcp
 # 输出：
 #   ✓ Decoded invite from "marvin"
@@ -294,8 +294,8 @@ kitty-hive status [--port 4123]                         服务/agent/team 状态
 kitty-hive agent list                                   列出 agent
 kitty-hive agent rename <old> <new>                     重命名 agent
 kitty-hive agent remove <name-or-id>                    删除 agent
-kitty-hive peer invite --as <agent> [--url url]         生成 invite token（推荐）
-kitty-hive peer accept <token> --as <agent> [--url url] 接受 invite，自动握手
+kitty-hive peer invite --expose <my-agent> [--url url]      生成 invite token（推荐）
+kitty-hive peer accept <token> --expose <my-agent> [--url url]  接受 invite，自动握手
 kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  手动加 peer
 kitty-hive peer list                                    列出 peer
 kitty-hive peer remove <name>                           删除 peer

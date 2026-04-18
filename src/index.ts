@@ -578,9 +578,9 @@ async function cmdPeerInvite() {
     else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
   }
   if (!exposed) {
-    console.log('Usage: kitty-hive peer invite --as <agent-id> [--url https://your-public-url/mcp]');
-    console.log('  --as     the agent on YOUR side that the peer should be allowed to reach');
-    console.log('  --url    your hive URL as the peer will see it (default http://localhost:<port>/mcp)');
+    console.log('Usage: kitty-hive peer invite --expose <my-agent-id> [--url https://my-public-url/mcp]');
+    console.log('  --expose  YOUR local agent that the peer should be allowed to reach');
+    console.log('  --url     YOUR hive URL as the peer will see it (default http://localhost:<port>/mcp)');
     process.exit(1);
   }
   initDB(dbPath);
@@ -600,8 +600,10 @@ async function cmdPeerInvite() {
   console.log(`   Secret: ${secret}\n`);
   console.log(`   Send this token to your peer:\n`);
   console.log(`   ${token}\n`);
-  console.log(`   On the other side, run:`);
-  console.log(`     kitty-hive peer accept '${token}' --as <their-agent-id>`);
+  console.log(`   On the OTHER machine, run (substituting their own agent id and URL):`);
+  console.log(`     kitty-hive peer accept '${token}' \\`);
+  console.log(`       --expose <agent-id-on-that-machine> \\`);
+  console.log(`       --url https://their-public-url/mcp`);
 }
 
 async function cmdPeerAccept() {
@@ -617,7 +619,10 @@ async function cmdPeerAccept() {
     else if (!args[i].startsWith('-') && !token) token = args[i];
   }
   if (!token || !myExposed) {
-    console.log('Usage: kitty-hive peer accept <token> --as <your-agent-id> [--url https://your-public-url/mcp]');
+    console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id> [--url https://my-public-url/mcp]');
+    console.log('  --expose  YOUR local agent that the inviter should be allowed to reach');
+    console.log('  --url     YOUR hive URL as the inviter will see it (default http://localhost:<port>/mcp)');
+    console.log('  (the token already contains the inviter\'s URL, secret, and exposed agent)');
     process.exit(1);
   }
 
@@ -772,8 +777,8 @@ Usage:
   kitty-hive agent list                                   List agents
   kitty-hive agent rename <old> <new>                     Rename an agent
   kitty-hive agent remove <name>                          Remove an agent
-  kitty-hive peer invite --as <agent> [--url url]         Create invite token (recommended)
-  kitty-hive peer accept <token> --as <agent> [--url url] Accept an invite token
+  kitty-hive peer invite --expose <my-agent> [--url url]      Create invite token (recommended)
+  kitty-hive peer accept <token> --expose <my-agent> [--url url]  Accept an invite token (auto-handshake)
   kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer (manual)
   kitty-hive peer list                                    List peers
   kitty-hive peer remove <name>                           Remove a peer

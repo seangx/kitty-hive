@@ -206,7 +206,7 @@ On a LAN/VPN you can skip this and just use `http://<host>:4123/mcp`.
 **3. Generate an invite on mac**
 ```bash
 kitty-hive peer invite \
-  --as <mac-agent-id-to-expose> \
+  --expose <mac-agent-id> \
   --url https://mac-tunnel.trycloudflare.com/mcp
 # → prints a single token like:
 #   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
@@ -215,7 +215,7 @@ kitty-hive peer invite \
 **4. Accept on win**
 ```bash
 kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
-  --as <win-agent-id-to-expose> \
+  --expose <win-agent-id> \
   --url https://win-tunnel.trycloudflare.com/mcp
 # Output:
 #   ✓ Decoded invite from "marvin"
@@ -294,8 +294,8 @@ kitty-hive status [--port 4123]                         Server, agent & team sta
 kitty-hive agent list                                   List agents
 kitty-hive agent rename <old> <new>                     Rename an agent
 kitty-hive agent remove <name-or-id>                    Remove an agent
-kitty-hive peer invite --as <agent> [--url url]         Create an invite token (recommended)
-kitty-hive peer accept <token> --as <agent> [--url url] Accept an invite token (auto-handshakes)
+kitty-hive peer invite --expose <my-agent> [--url url]      Create an invite token (recommended)
+kitty-hive peer accept <token> --expose <my-agent> [--url url]  Accept an invite token (auto-handshake)
 kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer manually
 kitty-hive peer list                                    List peers
 kitty-hive peer remove <name>                           Remove a peer
