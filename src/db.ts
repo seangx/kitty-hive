@@ -396,6 +396,10 @@ export function getMaxIncomingDMId(toAgentId: string, fromAgentId: string): numb
   return row?.max_id ?? 0;
 }
 
+export function getDMById(id: number): DMMessage | undefined {
+  return getDB().prepare('SELECT * FROM dm_messages WHERE id = ?').get(id) as DMMessage | undefined;
+}
+
 export function getDMConversation(agentA: string, agentB: string, since: number = 0, limit: number = 50): DMMessage[] {
   return getDB().prepare(`
     SELECT * FROM dm_messages
@@ -552,10 +556,16 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
     const latest = msgs.slice(-5).map(m => {
       let attachments: any[] = [];
       try { attachments = JSON.parse(m.attachments || '[]'); } catch { /* ignore */ }
+      const INBOX_PREVIEW = 2000;
+      const truncated = m.content.length > INBOX_PREVIEW;
+      const preview = truncated
+        ? m.content.slice(0, INBOX_PREVIEW) + ` …(truncated; hive-dm-read message_id=${m.id} for full content)`
+        : m.content;
       return {
         from: sender?.display_name ?? 'unknown',
         type: 'dm',
-        preview: m.content.length > 200 ? m.content.slice(0, 200) + ' [summary]' : m.content,
+        message_id: m.id,
+        preview,
         attachments,
         ts: m.ts,
       };

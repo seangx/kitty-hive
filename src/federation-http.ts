@@ -192,9 +192,13 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
     const msg = db.appendDM(remoteAgent.id, target.id, content, attachments);
 
     const previewBase = content || (attachments.length > 0 ? `[${attachments.length} attachment(s)]` : '');
+    const truncated = previewBase.length > 200;
     await notifyAgents([target.id], remoteAgent.id, JSON.stringify({
       type: 'dm', from_agent_id: remoteAgent.id, from: remoteAgent.display_name,
-      preview: previewBase.length > 200 ? previewBase.slice(0, 200) + ' [summary]' : previewBase,
+      message_id: msg.id,
+      preview: truncated
+        ? previewBase.slice(0, 200) + ` …(truncated; hive-dm-read message_id=${msg.id} for full content)`
+        : previewBase,
       attachments,
     }));
 

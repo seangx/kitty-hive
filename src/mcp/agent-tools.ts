@@ -8,7 +8,7 @@ import { bindSession } from '../sessions.js';
 export function registerAgentTools(mcp: McpServer) {
   mcp.tool(
     'hive.start',
-    'Register or reconnect as an agent. Returns your agent_id (used for cross-team addressing). Session is auto-bound for push notifications.',
+    'Register or reconnect as an agent. Returns your agent_id (used for cross-team addressing). The MCP session is automatically bound to the returned agent so push notifications target the right session. (Channel-plugin users: prefer hive-whoami for first-time registration; this is the underlying server tool.)',
     {
       id: z.string().optional().describe('Agent id to reconnect to (exact match). Errors if not found.'),
       name: z.string().optional().describe('Display name (random if omitted). Reuses latest existing agent with this name.'),

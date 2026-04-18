@@ -48,7 +48,7 @@ export function registerTeamTools(mcp: McpServer) {
 
   mcp.tool(
     'hive.team.list',
-    'List all open teams (with their members).',
+    'List all teams on this hive (with their members).',
     {},
     async () => {
       const result = handleTeamList();

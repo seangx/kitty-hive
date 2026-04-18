@@ -22,7 +22,7 @@ async function fetchRemoteAgents(peer: db.Peer): Promise<any> {
 export function registerFederationTools(mcp: McpServer) {
   mcp.tool(
     'hive.peers',
-    'List connected federation peers.',
+    'List all known federation peers (each entry includes name, status active/inactive, exposed agents, last_seen).',
     {},
     async () => {
       const peers = db.listPeers();
@@ -36,10 +36,10 @@ export function registerFederationTools(mcp: McpServer) {
 
   mcp.tool(
     'hive.remote.agents',
-    'List agents on a remote peer node. Cached 5 minutes; pass fresh=true to bypass.',
+    'List agents that a remote peer has exposed to us. Cached 5 minutes; pass fresh=true to bypass. After getting an agent id from here, address them in DM/task as "<agent_id>@<peer-name>".',
     {
-      peer: z.string().describe('Peer node name'),
-      fresh: z.boolean().optional().describe('Bypass cache'),
+      peer: z.string().describe('Peer name (as shown by hive-peers)'),
+      fresh: z.boolean().optional().describe('Bypass the 5-minute cache and re-query the peer'),
     },
     async (params) => {
       const peer = db.getPeerByName(params.peer);

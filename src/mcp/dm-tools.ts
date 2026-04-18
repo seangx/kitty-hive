@@ -12,12 +12,15 @@ import * as db from '../db.js';
 export function registerDMTools(mcp: McpServer) {
   mcp.tool(
     'hive.dm',
-    'Send a direct message to another agent. `to` accepts agent id, or a nickname/display_name unambiguous within your teams. Use "id@node" for federation. `attach` accepts an array of local file paths (images, screenshots, PDFs, etc.) — the file binary is copied into hive storage and referenced by file_id; receivers fetch via hive.file.fetch.',
+    'Send a direct message to another agent. `to` accepts agent id, team-nickname (within your teams), display_name (only if unambiguous), or "id@node" for federation. ' +
+    'IMPORTANT: any file path you mention in `content` is local-to-YOUR-machine ONLY — the receiver cannot read it (they may be on a different OS). ' +
+    'To actually share a file, pass `attach: [absolute path on YOUR disk]`; hive copies the bytes into storage (replicating across federation if needed) and the receiver gets a `file_id` they fetch via `hive.file.fetch`. ' +
+    'Use `attach` for screenshots, PDFs, CSVs, logs, pasted-image temp files, anything binary.',
     {
       as: asParam,
       to: z.string().describe('Target: agent id, team-nickname, display_name, or "id@node"'),
-      content: z.string().describe('Message text (may be empty if only sending attachments)'),
-      attach: z.array(z.string()).optional().describe('Local file paths to attach (e.g. screenshots, PDFs, csv)'),
+      content: z.string().describe('Message text. NEVER put a local file path here expecting the receiver to read it — use `attach` instead.'),
+      attach: z.array(z.string()).optional().describe('Absolute paths on YOUR machine; bytes are copied into hive and referenced by file_id on the receiver side.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
@@ -25,9 +28,13 @@ export function registerDMTools(mcp: McpServer) {
       const result = await handleDMAsync(agent.id, params);
       if (!result.federated) {
         const previewBase = params.content || (result.attachments && result.attachments.length > 0 ? `[${result.attachments.length} attachment(s)]` : '');
-        const preview = previewBase.length > 200 ? previewBase.slice(0, 200) + ' [summary]' : previewBase;
+        const truncated = previewBase.length > 200;
+        const preview = truncated
+          ? previewBase.slice(0, 200) + ` …(truncated; hive-dm-read message_id=${result.message_id} for full content)`
+          : previewBase;
         await notifyAgents([result.to_agent_id], agent.id, JSON.stringify({
-          type: 'dm', from_agent_id: agent.id, from: agent.display_name, preview,
+          type: 'dm', from_agent_id: agent.id, from: agent.display_name,
+          message_id: result.message_id, preview,
           attachments: result.attachments || [],
         }));
       }
@@ -36,11 +43,38 @@ export function registerDMTools(mcp: McpServer) {
   );
 
   mcp.tool(
+    'hive.dm.read',
+    'Fetch a single DM in full by message_id. Use when an inbox entry or channel notification preview ends with `…(truncated; hive-dm-read message_id=N)`. Returns the full content, attachments, sender, and timestamp.',
+    { message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications') },
+    async (params) => {
+      const msg = db.getDMById(params.message_id);
+      if (!msg) return { content: [{ type: 'text', text: JSON.stringify({ error: `Message not found: ${params.message_id}` }) }], isError: true };
+      const sender = db.getAgentById(msg.from_agent_id);
+      let attachments: any[] = [];
+      try { attachments = JSON.parse(msg.attachments || '[]'); } catch { /* ignore */ }
+      return {
+        content: [{
+          type: 'text',
+          text: JSON.stringify({
+            message_id: msg.id,
+            from_agent_id: msg.from_agent_id,
+            from_display_name: sender?.display_name ?? 'unknown',
+            to_agent_id: msg.to_agent_id,
+            content: msg.content,
+            attachments,
+            ts: msg.ts,
+          }),
+        }],
+      };
+    },
+  );
+
+  mcp.tool(
     'hive.file.fetch',
-    'Fetch an attachment by file_id. Returns the local path inside hive storage; optionally copy to a destination path.',
+    'Fetch an attachment by file_id (from a DM you received). Returns a `path` on the hive node serving you (your local hive when running locally; the receiver\'s hive in federated setups — already replicated). Pass `save_to` to copy it to a path of your choice (a trailing "/" treats it as a directory and keeps the original filename).',
     {
-      file_id: z.string().describe('Attachment file_id (from a DM\'s attachments list)'),
-      save_to: z.string().optional().describe('Destination path. If a directory, the original filename is preserved.'),
+      file_id: z.string().describe('Attachment file_id (from hive-inbox latest entry attachments, or from a channel notification)'),
+      save_to: z.string().optional().describe('Optional destination path; pass a trailing "/" to copy into a directory keeping the original filename.'),
     },
     async (params) => {
       const meta = getFileMeta(params.file_id);

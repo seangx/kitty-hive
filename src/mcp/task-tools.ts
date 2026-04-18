@@ -13,10 +13,10 @@ import * as db from '../db.js';
 export function registerTaskTools(mcp: McpServer) {
   mcp.tool(
     'hive.task',
-    'Create a task and (optionally) delegate. `to` accepts agent id, team-nickname, "role:xxx", or "id@node" for federation.',
+    'Create a task and (optionally) delegate. Omit `to` to create an unassigned task that anyone can claim.',
     {
       as: asParam,
-      to: z.string().optional().describe('Target: agent id, team-nickname, "role:xxx", or "id@node"'),
+      to: z.string().optional().describe('Target. Accepts: agent id (always works) · team-nickname (only resolved within teams you both belong to) · display_name (only if globally unambiguous) · "role:xxx" (picks an active agent with that role) · "id@<peer-name>" for federation.'),
       title: z.string().describe('Task title'),
       input: z.record(z.string(), z.unknown()).optional().describe('Structured task input'),
     },
@@ -55,7 +55,7 @@ export function registerTaskTools(mcp: McpServer) {
     'List tasks you created or are assigned to.',
     {
       as: asParam,
-      status: z.string().optional().describe('Filter by status'),
+      status: z.string().optional().describe('Filter by status. Valid values: created, proposing, approved, in_progress, completed, failed, canceled.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
@@ -95,7 +95,7 @@ export function registerTaskTools(mcp: McpServer) {
         assignees: z.array(z.string()).describe('Agent ids or "role:xxx"'),
         action: z.string(),
         completion: z.enum(['all', 'any']).default('all'),
-        on_reject: z.string().optional().describe('"revise" or "back:N"'),
+        on_reject: z.string().optional().describe('What happens if THIS step is rejected. "revise" → re-do the same step (default). "back:N" → roll all the way back to step N (e.g. "back:1").'),
       })).describe('Workflow steps'),
     },
     async (params, extra) => {
