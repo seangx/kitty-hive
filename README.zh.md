@@ -182,27 +182,77 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
 
 ## 联邦
 
-跨机器协作。
+让两台（或多台）机器上的 hive 互通，agent 可跨机器 DM、委派任务。
 
+### 两台机器配置 walkthrough
+
+假设有 **mac**（本地）和 **win**（另一台），两边都跑了 `kitty-hive serve` 并已注册 agent。
+
+**1. 各自起节点名**
 ```bash
-# 设置本节点名
+# mac
 kitty-hive config set name marvin
-
-# 用 Cloudflare Tunnel 暴露（不需要公网 IP）
-cloudflared tunnel --url http://localhost:4123
-
-# 添加 peer（自动 ping 一次验证可达性 + 密钥）
-kitty-hive peer add alice https://xxx.trycloudflare.com/mcp \
-  --secret <共享密钥> --expose <agent-id>
-
-# 跨节点通讯
-hive.dm({ to: "<id>@alice", content: "hello!" })
-hive.task({ to: "<id>@alice", title: "Review this PR" })
-
-# 收到的远端 DM 直接回复就行：本地 placeholder 记得它属于哪个 peer，自动回路由。
+# win
+kitty-hive config set name win-laptop
 ```
 
-**工作机制：**
+**2. 让对方能访问到你**。最简单：cloudflared，无需公网 IP：
+```bash
+cloudflared tunnel --url http://localhost:4123
+# → 拿到 https://xxx-yyy-zzz.trycloudflare.com
+```
+内网/VPN 直接 `http://<host>:4123/mcp` 即可。
+
+**3. 拿到要暴露的 agent_id**（`kitty-hive agent list` 的 ID 列）。
+
+**4. 生成一个共享密钥，两边用同一个：**
+```bash
+echo "sk_$(openssl rand -hex 16)"
+# → sk_a1b2... 这个字符串两边都要用
+```
+
+**5. 互加 peer**（双方都要加对方）：
+```bash
+# mac 上（mac → win）
+kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
+  --secret <共享密钥> \
+  --expose <mac-上要给-win-访问的-agent-id>
+
+# win 上（win → mac）
+kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
+  --secret <共享密钥> \
+  --expose <win-上要给-mac-访问的-agent-id>
+```
+
+`peer add` 当场会 ping 对方。第一次 add 时另一边还没加你这边的 peer 记录，会显示 `failed: HTTP 401` —— 没事，等双方都加完，下一次 60s 心跳两边都会转 `active`。
+
+**6. 验证**
+```bash
+kitty-hive status
+# 🤝 Peers 表里 STATUS=active、NODE=<对方节点名> 即成功
+```
+
+### 在 agent 里用
+
+```js
+hive-remote-agents({ peer: "win" })
+// → win 暴露的 agent 列表（缓存 5 分钟；传 fresh:true 强制刷新）
+
+hive-dm({ to: "<alice-id>@win", content: "hello from mac" })
+hive-task({ to: "<alice-id>@win", title: "Review my PR" })
+hive-check({ task_id: "<影子任务-id>" })   // 实时同步对面进度
+```
+
+回复对方发来的 DM **不需要再带 `@peer`**——本地 placeholder 记得自己来自哪个 peer，直接 `hive-dm({ to: "<placeholder-id>", ... })` 自动反向路由。
+
+### 避坑
+
+- `--expose` 填的是**你这边、允许被对方联系的 agent**；不在列表里的对方完全看不到。
+- 两边的 `--secret` 必须一字不差。
+- `--expose` 接受 agent id 或唯一的 display_name；id 更稳。
+- peer status 只有 ping 成功才转 `active`；一直 `inactive`，检查对方 URL 可达 + 密钥一致。
+
+### 工作机制
 
 - **身份：** 每个远端 agent 在本地生成一个 placeholder，按 `(peer_name, remote_agent_id)` 唯一定位。对方 rename 不会断关联；回复路径靠 placeholder 上的 `origin_peer` 字段反向路由。
 - **任务：** 委派给 `<id>@peer` 时，发起方建一个**影子任务**，replica 端建真任务。propose / approve / step-complete / reject 等事件双向自动转发，两边状态同步。发起方用 `hive-check` 实时看进度。

@@ -182,28 +182,77 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
 
 ## Federation
 
-Connect multiple hive servers for cross-machine collaboration.
+Connect two (or more) hive servers across machines so agents can DM and delegate tasks across them.
 
+### Two-machine walkthrough
+
+Suppose you have **mac** (running locally) and **win** (a second machine). Both have `kitty-hive serve` running and at least one registered agent.
+
+**1. Name each node**
 ```bash
-# Set your node name
+# mac
 kitty-hive config set name marvin
-
-# Expose via Cloudflare Tunnel (no public IP needed)
-cloudflared tunnel --url http://localhost:4123
-
-# Add a peer (auto-pings to verify reachability + secret)
-kitty-hive peer add alice https://xxx.trycloudflare.com/mcp \
-  --secret <shared-secret> --expose <agent-id>
-
-# Cross-node communication
-hive.dm({ to: "<id>@alice", content: "hello!" })
-hive.task({ to: "<id>@alice", title: "Review this PR" })
-
-# Replies to incoming federated DMs route back automatically:
-# the placeholder agent for the remote sender remembers its origin peer.
+# win
+kitty-hive config set name win-laptop
 ```
 
-**How it works:**
+**2. Make each side reachable.** Easiest with no public IP — Cloudflare Tunnel:
+```bash
+cloudflared tunnel --url http://localhost:4123
+# → https://xxx-yyy-zzz.trycloudflare.com
+```
+On a LAN/VPN you can skip this and just use `http://<host>:4123/mcp`.
+
+**3. Get the agent id you want to expose** (use `kitty-hive agent list` on each side; copy the ID column).
+
+**4. Generate one shared secret and use the same value on both sides:**
+```bash
+echo "sk_$(openssl rand -hex 16)"
+# → sk_a1b2... — paste this same string on BOTH machines below
+```
+
+**5. Cross-add peers** (each side adds the other):
+```bash
+# on mac (mac → win)
+kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
+  --secret <shared-secret> \
+  --expose <mac-agent-id-you-want-win-to-talk-to>
+
+# on win (win → mac)
+kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
+  --secret <shared-secret> \
+  --expose <win-agent-id-you-want-mac-to-talk-to>
+```
+
+`peer add` immediately pings the remote. The first `add` may print `failed: HTTP 401` because the other side hasn't added you yet — that's fine; once both sides are added, the next 60s heartbeat flips both to `active`.
+
+**6. Verify**
+```bash
+kitty-hive status
+# 🤝 Peers table should show STATUS=active and NODE=<remote-node-name>
+```
+
+### Using it from your agent
+
+```js
+hive-remote-agents({ peer: "win" })
+// → list of agents win has exposed (cached 5 min; pass fresh:true to bypass)
+
+hive-dm({ to: "<alice-id>@win", content: "hello from mac" })
+hive-task({ to: "<alice-id>@win", title: "Review my PR" })
+hive-check({ task_id: "<shadow-task-id>" })   // live progress synced from win
+```
+
+Replying to an incoming federated DM **does not** need `@peer` — your local placeholder for the remote sender remembers its origin, so plain `hive-dm({ to: "<placeholder-id>", ... })` routes back automatically.
+
+### Pitfalls
+
+- `--expose` lists **the agent the *peer* should be allowed to reach** (i.e. agents on YOUR side). Anything not listed is invisible to that peer.
+- Both sides must use the exact same `--secret`.
+- `--expose` accepts agent ids or unambiguous display names; ids are safer.
+- Peer status only flips to `active` on a successful round-trip ping. If it stays `inactive`, check the URL is reachable from the other side and the secret matches.
+
+### How it works
 
 - **Identity:** every remote agent gets a local placeholder keyed by `(peer_name, remote_agent_id)`. Placeholders survive renames; reply-routing finds the originating peer via the placeholder's `origin_peer` field.
 - **Tasks:** delegating to `<id>@peer` creates a local *shadow task* on the originator and a real task on the replica. Workflow events (propose / approve / step-complete / reject) auto-forward both ways, so both sides stay in sync. The originator can `hive-check` to see live progress.
