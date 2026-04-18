@@ -70,6 +70,45 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
     return;
   }
 
+  // POST /federation/handshake — receive callback from peer that accepted our invite.
+  // Auth: token_id + secret in body must match a pending invite.
+  if (url.pathname === '/federation/handshake' && req.method === 'POST') {
+    const body = JSON.parse(await readBody(req));
+    const { token_id, secret, name: peerName, url: peerUrl, exposed: peerExposed } = body;
+    if (!token_id || !secret || !peerName || !peerUrl) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing token_id, secret, name, or url' }));
+      return;
+    }
+    db.cleanupExpiredInvites();
+    const invite = db.getPendingInvite(token_id);
+    if (!invite) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invite not found or expired' }));
+      return;
+    }
+    if (invite.secret !== secret) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Secret mismatch' }));
+      return;
+    }
+    // Avoid duplicate peer name
+    let localName = peerName;
+    if (db.getPeerByName(localName)) {
+      localName = `${peerName}-${Date.now().toString(36).slice(-4)}`;
+    }
+    // exposed = OUR local agent that THE PEER can reach (from our pending invite,
+    // i.e. what the inviter said --as). NOT the agent the peer sent in the body
+    // (that's their side's exposure, only relevant on their local peer record).
+    db.addPeer(localName, peerUrl, secret, invite.exposed_agent_id);
+    db.setPeerNodeName(localName, peerName);
+    db.deletePendingInvite(token_id);
+    log('info', `[federation] handshake accepted: peer="${localName}" url=${peerUrl}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true, peer_name: localName, node: getNodeName() }));
+    return;
+  }
+
   const peer = authenticatePeer(req);
   if (!peer) {
     res.writeHead(401, { 'Content-Type': 'application/json' });

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, createPendingInvite, deletePendingInvite, cleanupExpiredInvites } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { generateToken } from './utils.js';
 import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
@@ -542,6 +542,153 @@ async function cmdPeerRemove() {
   }
 }
 
+// --- Invite token ---
+
+interface InvitePayload {
+  v: 1;
+  n: string;   // sender's node name
+  u: string;   // sender's hive URL (with /mcp)
+  s: string;   // shared secret
+  e: string;   // sender's exposed agent_id
+  t: string;   // pending invite token id
+}
+
+function encodeInvite(p: InvitePayload): string {
+  return 'hive://' + Buffer.from(JSON.stringify(p)).toString('base64url');
+}
+
+function decodeInvite(token: string): InvitePayload {
+  let raw = token.trim();
+  if (raw.startsWith('hive://')) raw = raw.slice('hive://'.length);
+  const json = Buffer.from(raw, 'base64url').toString();
+  const p = JSON.parse(json);
+  if (p.v !== 1) throw new Error('Unsupported invite version');
+  if (!p.n || !p.u || !p.s || !p.e || !p.t) throw new Error('Invite missing required fields');
+  return p;
+}
+
+async function cmdPeerInvite() {
+  const { dbPath } = parseFlags(1);
+  let exposed = '';
+  let url = '';
+  let port = 4123;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--as' || args[i] === '--expose') && args[i + 1]) { exposed = args[i + 1]; i++; }
+    else if (args[i] === '--url' && args[i + 1]) { url = args[i + 1]; i++; }
+    else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
+  }
+  if (!exposed) {
+    console.log('Usage: kitty-hive peer invite --as <agent-id> [--url https://your-public-url/mcp]');
+    console.log('  --as     the agent on YOUR side that the peer should be allowed to reach');
+    console.log('  --url    your hive URL as the peer will see it (default http://localhost:<port>/mcp)');
+    process.exit(1);
+  }
+  initDB(dbPath);
+  cleanupExpiredInvites();
+
+  let publicUrl = url || `http://localhost:${port}/mcp`;
+  if (!/\/mcp\/?$/.test(publicUrl)) publicUrl = publicUrl.replace(/\/+$/, '') + '/mcp';
+
+  const secret = 'sk_' + generateToken().slice(0, 32);
+  const invite = createPendingInvite(secret, exposed, publicUrl);
+  const nodeName = getNodeConfig().name || hostname().split('.')[0];
+  const token = encodeInvite({ v: 1, n: nodeName, u: publicUrl, s: secret, e: exposed, t: invite.token_id });
+
+  console.log(`🤝 Invite created (expires in 24h)`);
+  console.log(`   Your URL: ${publicUrl}`);
+  console.log(`   Exposed agent: ${exposed}`);
+  console.log(`   Secret: ${secret}\n`);
+  console.log(`   Send this token to your peer:\n`);
+  console.log(`   ${token}\n`);
+  console.log(`   On the other side, run:`);
+  console.log(`     kitty-hive peer accept '${token}' --as <their-agent-id>`);
+}
+
+async function cmdPeerAccept() {
+  const { dbPath } = parseFlags(1);
+  let token = '';
+  let myExposed = '';
+  let myUrl = '';
+  let port = 4123;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--as' || args[i] === '--expose') && args[i + 1]) { myExposed = args[i + 1]; i++; }
+    else if (args[i] === '--url' && args[i + 1]) { myUrl = args[i + 1]; i++; }
+    else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
+    else if (!args[i].startsWith('-') && !token) token = args[i];
+  }
+  if (!token || !myExposed) {
+    console.log('Usage: kitty-hive peer accept <token> --as <your-agent-id> [--url https://your-public-url/mcp]');
+    process.exit(1);
+  }
+
+  let invite: InvitePayload;
+  try { invite = decodeInvite(token); }
+  catch (err) { console.log(`Invalid invite: ${(err as any).message}`); process.exit(1); }
+
+  initDB(dbPath);
+  console.log(`✓ Decoded invite from "${invite.n}"`);
+  console.log(`  Their URL: ${invite.u}`);
+  console.log(`  Their exposed agent: ${invite.e}\n`);
+
+  // Add their hive as a local peer.
+  // exposed = OUR local agent that THEY can reach (= myExposed), not their agent.
+  let peerName = invite.n;
+  if (getPeerByName(peerName)) {
+    peerName = `${invite.n}-${Date.now().toString(36).slice(-4)}`;
+    console.log(`  (peer name "${invite.n}" taken; using "${peerName}")`);
+  }
+  addPeer(peerName, invite.u, invite.s, myExposed);
+  setPeerNodeName(peerName, invite.n);
+  console.log(`✓ Added ${peerName} as local peer`);
+
+  // Decide our URL
+  let ourUrl = myUrl || `http://localhost:${port}/mcp`;
+  if (!/\/mcp\/?$/.test(ourUrl)) ourUrl = ourUrl.replace(/\/+$/, '') + '/mcp';
+  const ourNode = getNodeConfig().name || hostname().split('.')[0];
+
+  // Handshake back: tell their hive how to reach us
+  process.stdout.write(`✓ Calling handshake on ${invite.u}…`);
+  const handshakeUrl = invite.u.replace(/\/mcp\/?$/, '/federation/handshake');
+  try {
+    const res = await fetch(handshakeUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        token_id: invite.t, secret: invite.s,
+        name: ourNode, url: ourUrl, exposed: myExposed,
+      }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: res.statusText }));
+      console.log(` failed: ${(err as any).error || res.statusText}`);
+      console.log(`  Local peer record was added; their side may not auto-add you.`);
+      console.log(`  They can add you manually with:`);
+      console.log(`    kitty-hive peer add ${ourNode} ${ourUrl} --secret ${invite.s} --expose ${myExposed}`);
+      process.exit(1);
+    }
+    const result = await res.json() as { peer_name: string; node: string };
+    console.log(` ok (they added you as "${result.peer_name}")`);
+  } catch (err) {
+    console.log(` failed: ${(err as any).message}`);
+    console.log(`  Local peer record was added; their side may not auto-add you.`);
+    process.exit(1);
+  }
+
+  // Verify reachability via ping
+  process.stdout.write(`✓ Pinging ${peerName}…`);
+  const ping = await pingPeer(peerName, invite.u, invite.s, 5000);
+  if (ping.ok) {
+    setPeerStatus(peerName, 'active');
+    touchPeer(peerName);
+    console.log(` ok (node="${ping.node}")`);
+  } else {
+    console.log(` failed: ${ping.error} (will retry on next heartbeat)`);
+  }
+
+  console.log(`\n🎉 Peer "${peerName}" connected. Try:`);
+  console.log(`  hive-remote-agents({ peer: "${peerName}" })`);
+}
+
 async function cmdPeerExpose() {
   const { dbPath } = parseFlags(1);
   const peerName = args[2];
@@ -625,7 +772,9 @@ Usage:
   kitty-hive agent list                                   List agents
   kitty-hive agent rename <old> <new>                     Rename an agent
   kitty-hive agent remove <name>                          Remove an agent
-  kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer
+  kitty-hive peer invite --as <agent> [--url url]         Create invite token (recommended)
+  kitty-hive peer accept <token> --as <agent> [--url url] Accept an invite token
+  kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer (manual)
   kitty-hive peer list                                    List peers
   kitty-hive peer remove <name>                           Remove a peer
   kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
@@ -666,6 +815,10 @@ switch (command) {
       cmdPeerRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'expose') {
       cmdPeerExpose().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'invite') {
+      cmdPeerInvite().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'accept') {
+      cmdPeerAccept().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else {
       showHelp();
     }

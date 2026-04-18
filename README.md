@@ -184,9 +184,9 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
 
 Connect two (or more) hive servers across machines so agents can DM and delegate tasks across them.
 
-### Two-machine walkthrough
+### Two-machine walkthrough (invite/accept — recommended)
 
-Suppose you have **mac** (running locally) and **win** (a second machine). Both have `kitty-hive serve` running and at least one registered agent.
+Suppose you have **mac** (locally) and **win** (a second machine). Both have `kitty-hive serve` running and at least one registered agent.
 
 **1. Name each node**
 ```bash
@@ -203,34 +203,54 @@ cloudflared tunnel --url http://localhost:4123
 ```
 On a LAN/VPN you can skip this and just use `http://<host>:4123/mcp`.
 
-**3. Get the agent id you want to expose** (use `kitty-hive agent list` on each side; copy the ID column).
-
-**4. Generate one shared secret and use the same value on both sides:**
+**3. Generate an invite on mac**
 ```bash
-echo "sk_$(openssl rand -hex 16)"
-# → sk_a1b2... — paste this same string on BOTH machines below
+kitty-hive peer invite \
+  --as <mac-agent-id-to-expose> \
+  --url https://mac-tunnel.trycloudflare.com/mcp
+# → prints a single token like:
+#   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
 ```
 
-**5. Cross-add peers** (each side adds the other):
+**4. Accept on win**
 ```bash
-# on mac (mac → win)
-kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
-  --secret <shared-secret> \
-  --expose <mac-agent-id-you-want-win-to-talk-to>
-
-# on win (win → mac)
-kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
-  --secret <shared-secret> \
-  --expose <win-agent-id-you-want-mac-to-talk-to>
+kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
+  --as <win-agent-id-to-expose> \
+  --url https://win-tunnel.trycloudflare.com/mcp
+# Output:
+#   ✓ Decoded invite from "marvin"
+#   ✓ Added marvin as local peer
+#   ✓ Calling handshake on https://mac-tunnel.../mcp… ok (they added you as "win-laptop")
+#   ✓ Pinging marvin… ok (node="marvin")
+#   🎉 Peer "marvin" connected.
 ```
 
-`peer add` immediately pings the remote. The first `add` may print `failed: HTTP 401` because the other side hasn't added you yet — that's fine; once both sides are added, the next 60s heartbeat flips both to `active`.
+That's it — both sides are peered. No manual secret copying, no second `peer add`.
 
-**6. Verify**
+**5. Verify**
 ```bash
 kitty-hive status
 # 🤝 Peers table should show STATUS=active and NODE=<remote-node-name>
 ```
+
+<details>
+<summary>Manual two-step alternative (if invite/accept can't reach back)</summary>
+
+If the invitee can't HTTP back to the inviter (firewalled tunnel, etc.), use plain `peer add` on both sides with the same `--secret`:
+
+```bash
+# mac
+kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
+  --secret <shared-secret> --expose <mac-agent-id>
+
+# win
+kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
+  --secret <shared-secret> --expose <win-agent-id>
+```
+
+The first `add` may print `failed: HTTP 401` because the other side hasn't added you yet — that's fine; the next 60s heartbeat will flip both to `active`.
+
+</details>
 
 ### Using it from your agent
 
@@ -274,7 +294,9 @@ kitty-hive status [--port 4123]                         Server, agent & team sta
 kitty-hive agent list                                   List agents
 kitty-hive agent rename <old> <new>                     Rename an agent
 kitty-hive agent remove <name-or-id>                    Remove an agent
-kitty-hive peer add <name> <url> [--expose a,b]         Add a federation peer
+kitty-hive peer invite --as <agent> [--url url]         Create an invite token (recommended)
+kitty-hive peer accept <token> --as <agent> [--url url] Accept an invite token (auto-handshakes)
+kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer manually
 kitty-hive peer list                                    List peers
 kitty-hive peer remove <name>                           Remove a peer
 kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents

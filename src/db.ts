@@ -120,6 +120,15 @@ export function initDB(dbPath?: string): Database.Database {
       created_at  TEXT NOT NULL,
       last_seen   TEXT
     );
+
+    CREATE TABLE IF NOT EXISTS pending_invites (
+      token_id           TEXT PRIMARY KEY,
+      secret             TEXT NOT NULL,
+      exposed_agent_id   TEXT NOT NULL,
+      url                TEXT NOT NULL,
+      created_at         TEXT NOT NULL,
+      expires_at         TEXT NOT NULL
+    );
   `);
 
   // Idempotent column migrations for federation fields
@@ -636,6 +645,45 @@ export function setPeerStatus(name: string, status: 'active' | 'inactive'): void
 
 export function setPeerNodeName(name: string, nodeName: string): void {
   getDB().prepare('UPDATE peers SET node_name = ? WHERE name = ?').run(nodeName, name);
+}
+
+// --- Pending invites (for peer invite/accept handshake) ---
+
+export interface PendingInvite {
+  token_id: string;
+  secret: string;
+  exposed_agent_id: string;
+  url: string;
+  created_at: string;
+  expires_at: string;
+}
+
+export function createPendingInvite(secret: string, exposedAgentId: string, url: string, ttlMs = 24 * 60 * 60 * 1000): PendingInvite {
+  const tokenId = 't_' + ulid().slice(-12);
+  const now = new Date();
+  const invite: PendingInvite = {
+    token_id: tokenId, secret, exposed_agent_id: exposedAgentId, url,
+    created_at: now.toISOString(),
+    expires_at: new Date(now.getTime() + ttlMs).toISOString(),
+  };
+  getDB().prepare(`
+    INSERT INTO pending_invites (token_id, secret, exposed_agent_id, url, created_at, expires_at)
+    VALUES (@token_id, @secret, @exposed_agent_id, @url, @created_at, @expires_at)
+  `).run(invite);
+  return invite;
+}
+
+export function getPendingInvite(tokenId: string): PendingInvite | undefined {
+  return getDB().prepare('SELECT * FROM pending_invites WHERE token_id = ?').get(tokenId) as PendingInvite | undefined;
+}
+
+export function deletePendingInvite(tokenId: string): void {
+  getDB().prepare('DELETE FROM pending_invites WHERE token_id = ?').run(tokenId);
+}
+
+export function cleanupExpiredInvites(): number {
+  const result = getDB().prepare('DELETE FROM pending_invites WHERE expires_at < ?').run(nowISO());
+  return result.changes;
 }
 
 export function isPeerExposed(peerName: string, agentName: string): boolean {

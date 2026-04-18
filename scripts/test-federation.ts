@@ -175,32 +175,39 @@ async function main() {
   if (!alice.agent_id || !bob.agent_id) fail('missing agent ids');
   pass(`alice=${alice.agent_id.slice(0,8)} bob=${bob.agent_id.slice(0,8)}`);
 
-  step('cross-add peers with shared secret');
-  // On A: peer named "B-peer" pointing at hive B, expose alice (so B can interact with alice)
-  execFileSync('node', [HIVE_BIN, 'peer', 'add', 'bob-peer', `http://localhost:${PORT_B}/mcp`,
-    '--secret', SHARED_SECRET, '--expose', alice.agent_id],
-    { env: { ...process.env, HOME: dirA }, cwd: ROOT, stdio: 'pipe' });
-  // On B: peer named "alice-peer" pointing at hive A, expose bob
-  execFileSync('node', [HIVE_BIN, 'peer', 'add', 'alice-peer', `http://localhost:${PORT_A}/mcp`,
-    '--secret', SHARED_SECRET, '--expose', bob.agent_id],
-    { env: { ...process.env, HOME: dirB }, cwd: ROOT, stdio: 'pipe' });
-  pass('peers configured');
+  step('peer invite (A) → accept (B): bidirectional handshake via single token');
+  const inviteOut = execFileSync('node', [HIVE_BIN, 'peer', 'invite',
+    '--as', alice.agent_id, '--url', `http://localhost:${PORT_A}/mcp`],
+    { env: { ...process.env, HOME: dirA, USERPROFILE: dirA }, cwd: ROOT }).toString();
+  const tokenMatch = inviteOut.match(/(hive:\/\/[A-Za-z0-9_\-]+)/);
+  if (!tokenMatch) fail(`could not find invite token in output:\n${inviteOut}`);
+  const token = tokenMatch[1];
+  pass(`got invite token (${token.length} chars)`);
 
-  step('ping handshake (via hive.peers + manual)');
+  const acceptOut = execFileSync('node', [HIVE_BIN, 'peer', 'accept', token,
+    '--as', bob.agent_id, '--url', `http://localhost:${PORT_B}/mcp`],
+    { env: { ...process.env, HOME: dirB, USERPROFILE: dirB }, cwd: ROOT }).toString();
+  if (!/handshake.*ok/i.test(acceptOut)) fail(`accept output missing handshake confirmation:\n${acceptOut}`);
+  pass('handshake confirmed (both sides peered)');
+
+  step('verify peer records on both sides');
   const peersA = await mcpA.call('hive.peers');
   if (!Array.isArray(peersA) || peersA.length !== 1) fail(`expected 1 peer on A, got ${JSON.stringify(peersA)}`);
   const peersB = await mcpB.call('hive.peers');
   if (!Array.isArray(peersB) || peersB.length !== 1) fail(`expected 1 peer on B, got ${JSON.stringify(peersB)}`);
-  pass(`peers visible from both sides`);
+  // Discover peer names auto-assigned by handshake (= other side's node name)
+  const peerNameOnA = peersA[0].name;  // = NAME_B
+  const peerNameOnB = peersB[0].name;  // = NAME_A
+  pass(`A's peer="${peerNameOnA}" · B's peer="${peerNameOnB}"`);
 
   step('hive.remote.agents from A → B');
-  const remoteB = await mcpA.call('hive.remote.agents', { peer: 'bob-peer', fresh: true });
+  const remoteB = await mcpA.call('hive.remote.agents', { peer: peerNameOnA, fresh: true });
   if (!remoteB.agents || !remoteB.agents.find((a: any) => a.id === bob.agent_id))
     fail(`expected bob in remote agents, got ${JSON.stringify(remoteB)}`);
   pass(`saw bob via federation`);
 
   step('DM alice → bob via id@peer');
-  await mcpA.call('hive.dm', { as: alice.agent_id, to: `${bob.agent_id}@bob-peer`, content: 'hello bob' });
+  await mcpA.call('hive.dm', { as: alice.agent_id, to: `${bob.agent_id}@${peerNameOnA}`, content: 'hello bob' });
   await sleep(150);
   const inboxBob = await mcpB.call('hive.inbox', { as: bob.agent_id });
   const dmFromAlice = inboxBob.find((u: any) => u.kind === 'dm' && u.unread_count > 0 && u.latest.some((l: any) => l.preview.includes('hello bob')));
@@ -210,7 +217,7 @@ async function main() {
   step('bob replies via local placeholder for alice');
   // bob sees a placeholder agent for alice in his DB; he can DM that placeholder.
   // We use "alice-peer" as the node, alice.agent_id as the remote id.
-  await mcpB.call('hive.dm', { as: bob.agent_id, to: `${alice.agent_id}@alice-peer`, content: 'hello alice' });
+  await mcpB.call('hive.dm', { as: bob.agent_id, to: `${alice.agent_id}@${peerNameOnB}`, content: 'hello alice' });
   await sleep(150);
   const inboxAlice = await mcpA.call('hive.inbox', { as: alice.agent_id });
   const dmFromBob = inboxAlice.find((u: any) => u.kind === 'dm' && u.latest.some((l: any) => l.preview.includes('hello alice')));
@@ -218,7 +225,7 @@ async function main() {
   pass(`alice saw reply from bob`);
 
   step('alice delegates task to bob');
-  const task = await mcpA.call('hive.task', { as: alice.agent_id, to: `${bob.agent_id}@bob-peer`, title: 'review PR' });
+  const task = await mcpA.call('hive.task', { as: alice.agent_id, to: `${bob.agent_id}@${peerNameOnA}`, title: 'review PR' });
   if (!task.task_id) fail(`task creation failed: ${JSON.stringify(task)}`);
   pass(`shadow task on alice id=${task.task_id.slice(0,8)} status=${task.status}`);
   await sleep(150);

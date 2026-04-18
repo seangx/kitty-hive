@@ -184,7 +184,7 @@ created ──→ proposing ──→ approved ──→ in_progress ──→ c
 
 让两台（或多台）机器上的 hive 互通，agent 可跨机器 DM、委派任务。
 
-### 两台机器配置 walkthrough
+### 两台机器配置 walkthrough（invite/accept —— 推荐）
 
 假设有 **mac**（本地）和 **win**（另一台），两边都跑了 `kitty-hive serve` 并已注册 agent。
 
@@ -203,34 +203,54 @@ cloudflared tunnel --url http://localhost:4123
 ```
 内网/VPN 直接 `http://<host>:4123/mcp` 即可。
 
-**3. 拿到要暴露的 agent_id**（`kitty-hive agent list` 的 ID 列）。
-
-**4. 生成一个共享密钥，两边用同一个：**
+**3. 在 mac 生成 invite**
 ```bash
-echo "sk_$(openssl rand -hex 16)"
-# → sk_a1b2... 这个字符串两边都要用
+kitty-hive peer invite \
+  --as <mac-上要暴露的-agent-id> \
+  --url https://mac-tunnel.trycloudflare.com/mcp
+# → 输出一个 token：
+#   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
 ```
 
-**5. 互加 peer**（双方都要加对方）：
+**4. 在 win 上 accept**
 ```bash
-# mac 上（mac → win）
-kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
-  --secret <共享密钥> \
-  --expose <mac-上要给-win-访问的-agent-id>
-
-# win 上（win → mac）
-kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
-  --secret <共享密钥> \
-  --expose <win-上要给-mac-访问的-agent-id>
+kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
+  --as <win-上要暴露的-agent-id> \
+  --url https://win-tunnel.trycloudflare.com/mcp
+# 输出：
+#   ✓ Decoded invite from "marvin"
+#   ✓ Added marvin as local peer
+#   ✓ Calling handshake on https://mac-tunnel.../mcp… ok (they added you as "win-laptop")
+#   ✓ Pinging marvin… ok (node="marvin")
+#   🎉 Peer "marvin" connected.
 ```
 
-`peer add` 当场会 ping 对方。第一次 add 时另一边还没加你这边的 peer 记录，会显示 `failed: HTTP 401` —— 没事，等双方都加完，下一次 60s 心跳两边都会转 `active`。
+完事 —— 双向 peer 已建立。不用手动复制密钥，不用第二次 `peer add`。
 
-**6. 验证**
+**5. 验证**
 ```bash
 kitty-hive status
 # 🤝 Peers 表里 STATUS=active、NODE=<对方节点名> 即成功
 ```
+
+<details>
+<summary>手动两步法（invite/accept 回不到对面时备选）</summary>
+
+如果接收方没法 HTTP 回连发起方（特殊防火墙等），用 `peer add` + 共享密钥手动加：
+
+```bash
+# mac
+kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
+  --secret <共享密钥> --expose <mac-agent-id>
+
+# win
+kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
+  --secret <共享密钥> --expose <win-agent-id>
+```
+
+第一次 add 时另一边还没加你的 peer 记录，会显示 `failed: HTTP 401` —— 没事，下一次 60s 心跳两边都会转 `active`。
+
+</details>
 
 ### 在 agent 里用
 
@@ -274,7 +294,9 @@ kitty-hive status [--port 4123]                         服务/agent/team 状态
 kitty-hive agent list                                   列出 agent
 kitty-hive agent rename <old> <new>                     重命名 agent
 kitty-hive agent remove <name-or-id>                    删除 agent
-kitty-hive peer add <name> <url> [--expose a,b]         添加联邦 peer
+kitty-hive peer invite --as <agent> [--url url]         生成 invite token（推荐）
+kitty-hive peer accept <token> --as <agent> [--url url] 接受 invite，自动握手
+kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  手动加 peer
 kitty-hive peer list                                    列出 peer
 kitty-hive peer remove <name>                           删除 peer
 kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 agent
