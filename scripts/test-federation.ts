@@ -267,6 +267,28 @@ async function main() {
   if (aliceCheck2.status !== 'completed') fail(`alice's shadow task not completed: ${JSON.stringify(aliceCheck2)}`);
   pass(`task completed on both sides`);
 
+  step('URL drift self-heal: simulate A getting a new tunnel URL');
+  // Pretend cloudflared on A produced a new URL (we just point at A's localhost on a different path —
+  // here we use the same port but a new URL value to verify push propagation).
+  // In reality the URL would be a different trycloudflare subdomain; we simulate by reusing port A.
+  const newUrlA = `http://127.0.0.1:${PORT_A}/mcp`;
+  const adminRes = await fetch(`http://127.0.0.1:${PORT_A}/admin/tunnel-url`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url: newUrlA }),
+  });
+  if (!adminRes.ok) fail(`admin POST failed: ${adminRes.status}`);
+  const adminBody = await adminRes.json() as any;
+  if (adminBody.broadcast.ok < 1) fail(`broadcast didn't reach any peer: ${JSON.stringify(adminBody)}`);
+  pass(`A pushed new URL; broadcast ok=${adminBody.broadcast.ok} fail=${adminBody.broadcast.fail}`);
+  await sleep(150);
+
+  // Verify B's peer record for A was updated
+  const peersBafter = await mcpB.call('hive.peers');
+  const peerForA = peersBafter.find((p: any) => p.name === peerNameOnB);
+  if (!peerForA) fail(`B lost its peer record for A`);
+  if (peerForA.url !== newUrlA) fail(`B did not update peer URL — got ${peerForA.url}, expected ${newUrlA}`);
+  pass(`B updated peer.url → ${peerForA.url}`);
+
   console.log('\n\x1b[1;32m✓ all federation flows verified\x1b[0m');
   process.exit(0);
 }

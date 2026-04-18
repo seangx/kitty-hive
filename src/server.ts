@@ -7,6 +7,7 @@ import { log, setLogLevel } from './log.js';
 import { sessions, unbindSession, sessionAgents, activeSSE } from './sessions.js';
 import { createMcpServer } from './mcp/server.js';
 import { handleFederation, cleanupOldFiles, getNodeName } from './federation-http.js';
+import { handleAdmin } from './admin-http.js';
 import { startHeartbeat } from './federation-heartbeat.js';
 
 export { setLogLevel };
@@ -20,6 +21,12 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
     // Federation routes
     if (url.pathname.startsWith('/federation/')) {
       await handleFederation(req, res, url);
+      return;
+    }
+
+    // Admin routes (loopback only)
+    if (url.pathname.startsWith('/admin/')) {
+      await handleAdmin(req, res, url);
       return;
     }
 

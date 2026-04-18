@@ -196,18 +196,50 @@ kitty-hive config set name marvin
 kitty-hive config set name win-laptop
 ```
 
-**2. Make each side reachable.** Easiest with no public IP — Cloudflare Tunnel:
+**2. Make each side reachable.** Easiest with no public IP — Cloudflare Tunnel.
+You have two options:
+
+<details open>
+<summary><b>Option A (recommended): let kitty-hive manage cloudflared</b></summary>
+
+Open a separate terminal on each machine:
+```bash
+kitty-hive tunnel start
+# → 🌀 Starting cloudflared…
+#   ✓ Tunnel URL: https://xxx-yyy-zzz.trycloudflare.com
+#     → registered with hive at http://localhost:4123
+#   (Ctrl+C to stop. The hive will keep running.)
+```
+
+`tunnel start` is a separate process that:
+- spawns `cloudflared tunnel --url http://localhost:4123`
+- parses the URL out of cloudflared's output
+- registers it with the local hive (loopback-only admin endpoint)
+- pushes URL changes to all peers automatically (so reboots/restarts self-heal)
+
+Requires `cloudflared` on PATH (`brew install cloudflared` / `choco install cloudflared` / [releases](https://github.com/cloudflare/cloudflared/releases)).
+
+After this, `peer invite` and `peer accept` will pick up the tunnel URL automatically — you can skip `--url`.
+
+</details>
+
+<details>
+<summary>Option B: run cloudflared yourself</summary>
+
 ```bash
 cloudflared tunnel --url http://localhost:4123
 # → https://xxx-yyy-zzz.trycloudflare.com
 ```
-On a LAN/VPN you can skip this and just use `http://<host>:4123/mcp`.
+Then pass `--url https://xxx.trycloudflare.com/mcp` to `peer invite` / `peer accept`.
+
+</details>
+
+On a LAN/VPN you can skip the tunnel entirely and use `http://<host>:4123/mcp`.
 
 **3. Generate an invite on mac**
 ```bash
-kitty-hive peer invite \
-  --expose <mac-agent-id> \
-  --url https://mac-tunnel.trycloudflare.com/mcp
+kitty-hive peer invite --expose <mac-agent-id>
+# (auto-uses tunnel URL if `tunnel start` is running; otherwise pass --url)
 # → prints a single token like:
 #   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
 ```
@@ -215,8 +247,8 @@ kitty-hive peer invite \
 **4. Accept on win**
 ```bash
 kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
-  --expose <win-agent-id> \
-  --url https://win-tunnel.trycloudflare.com/mcp
+  --expose <win-agent-id>
+# (auto-uses win's tunnel URL; pass --url to override)
 # Output:
 #   ✓ Decoded invite from "marvin"
 #   ✓ Added marvin as local peer
@@ -277,6 +309,7 @@ Replying to an incoming federated DM **does not** need `@peer` — your local pl
 - **Identity:** every remote agent gets a local placeholder keyed by `(peer_name, remote_agent_id)`. Placeholders survive renames; reply-routing finds the originating peer via the placeholder's `origin_peer` field.
 - **Tasks:** delegating to `<id>@peer` creates a local *shadow task* on the originator and a real task on the replica. Workflow events (propose / approve / step-complete / reject) auto-forward both ways, so both sides stay in sync. The originator can `hive-check` to see live progress.
 - **Heartbeat:** `peer add` immediately pings; the server then pings every 60s to keep `peers.status` accurate. `kitty-hive status` shows it.
+- **Tunnel URL self-heal:** when `tunnel start` gets a new URL (cloudflared restart), it pushes to the hive via `/admin/tunnel-url`, which broadcasts to all peers via `/federation/update-url`. Heartbeat ping responses also carry `public_url` so peers self-correct on the next ping cycle.
 - **Files:** transferred files live under `~/.kitty-hive/files/<id>/` and auto-expire after 7 days. `kitty-hive files clean [--days N]` runs the sweeper manually.
 
 **Verify locally** with the included e2e test (boots two hives in temp dirs, runs the full flow):
@@ -303,6 +336,8 @@ kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
 kitty-hive config set <key> <value>                     Set config (e.g. name)
 kitty-hive db clear [--db path]                         Clear the database
 kitty-hive files clean [--days 7]                       Remove old federation transfer files
+kitty-hive tunnel start [--port 4123]                   Run cloudflared & register URL with the hive
+kitty-hive tunnel status [--port 4123]                  Show currently registered tunnel URL
 ```
 
 ## Environment

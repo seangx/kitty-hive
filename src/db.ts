@@ -129,6 +129,12 @@ export function initDB(dbPath?: string): Database.Database {
       created_at         TEXT NOT NULL,
       expires_at         TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS node_state (
+      key    TEXT PRIMARY KEY,
+      value  TEXT NOT NULL,
+      ts     TEXT NOT NULL
+    );
   `);
 
   // Idempotent column migrations for federation fields
@@ -645,6 +651,28 @@ export function setPeerStatus(name: string, status: 'active' | 'inactive'): void
 
 export function setPeerNodeName(name: string, nodeName: string): void {
   getDB().prepare('UPDATE peers SET node_name = ? WHERE name = ?').run(nodeName, name);
+}
+
+export function setPeerUrl(name: string, url: string): void {
+  getDB().prepare('UPDATE peers SET url = ? WHERE name = ?').run(url, name);
+}
+
+// --- Node state (key/value store for runtime state like current tunnel URL) ---
+
+export function getNodeState(key: string): string | undefined {
+  const row = getDB().prepare('SELECT value FROM node_state WHERE key = ?').get(key) as { value: string } | undefined;
+  return row?.value;
+}
+
+export function setNodeState(key: string, value: string): void {
+  getDB().prepare(`
+    INSERT INTO node_state (key, value, ts) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, ts = excluded.ts
+  `).run(key, value, nowISO());
+}
+
+export function deleteNodeState(key: string): void {
+  getDB().prepare('DELETE FROM node_state WHERE key = ?').run(key);
 }
 
 // --- Pending invites (for peer invite/accept handshake) ---

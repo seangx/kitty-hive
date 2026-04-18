@@ -196,18 +196,49 @@ kitty-hive config set name marvin
 kitty-hive config set name win-laptop
 ```
 
-**2. 让对方能访问到你**。最简单：cloudflared，无需公网 IP：
+**2. 让对方能访问到你**。两个选项：
+
+<details open>
+<summary><b>方式 A（推荐）：让 kitty-hive 自动管 cloudflared</b></summary>
+
+每台机器另开一个终端：
+```bash
+kitty-hive tunnel start
+# → 🌀 Starting cloudflared…
+#   ✓ Tunnel URL: https://xxx-yyy-zzz.trycloudflare.com
+#     → registered with hive at http://localhost:4123
+#   (Ctrl+C 停。hive 不受影响。)
+```
+
+`tunnel start` 是独立进程，负责：
+- spawn `cloudflared tunnel --url http://localhost:4123`
+- 解析 URL
+- 注册到本地 hive（仅 loopback 的 admin 端点）
+- URL 变化时自动推给所有 peer（重启自愈）
+
+需要 `cloudflared` 在 PATH 里（`brew install cloudflared` / `choco install cloudflared` / [releases](https://github.com/cloudflare/cloudflared/releases)）。
+
+之后 `peer invite` / `peer accept` 自动用 tunnel URL，不用传 `--url`。
+
+</details>
+
+<details>
+<summary>方式 B：自己跑 cloudflared</summary>
+
 ```bash
 cloudflared tunnel --url http://localhost:4123
-# → 拿到 https://xxx-yyy-zzz.trycloudflare.com
+# → https://xxx-yyy-zzz.trycloudflare.com
 ```
-内网/VPN 直接 `http://<host>:4123/mcp` 即可。
+然后给 `peer invite` / `peer accept` 传 `--url https://xxx.trycloudflare.com/mcp`。
+
+</details>
+
+内网/VPN 跳过 tunnel，直接 `http://<host>:4123/mcp` 即可。
 
 **3. 在 mac 生成 invite**
 ```bash
-kitty-hive peer invite \
-  --expose <mac-agent-id> \
-  --url https://mac-tunnel.trycloudflare.com/mcp
+kitty-hive peer invite --expose <mac-agent-id>
+# （自动用 tunnel URL；没 tunnel 加 --url）
 # → 输出一个 token：
 #   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
 ```
@@ -215,8 +246,8 @@ kitty-hive peer invite \
 **4. 在 win 上 accept**
 ```bash
 kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
-  --expose <win-agent-id> \
-  --url https://win-tunnel.trycloudflare.com/mcp
+  --expose <win-agent-id>
+# （自动用 win 的 tunnel URL；要覆盖加 --url）
 # 输出：
 #   ✓ Decoded invite from "marvin"
 #   ✓ Added marvin as local peer
@@ -277,6 +308,7 @@ hive-check({ task_id: "<影子任务-id>" })   // 实时同步对面进度
 - **身份：** 每个远端 agent 在本地生成一个 placeholder，按 `(peer_name, remote_agent_id)` 唯一定位。对方 rename 不会断关联；回复路径靠 placeholder 上的 `origin_peer` 字段反向路由。
 - **任务：** 委派给 `<id>@peer` 时，发起方建一个**影子任务**，replica 端建真任务。propose / approve / step-complete / reject 等事件双向自动转发，两边状态同步。发起方用 `hive-check` 实时看进度。
 - **心跳：** `peer add` 当场 ping；server 每 60s 周期 ping 维护 `peers.status`。`kitty-hive status` 直接显示。
+- **Tunnel URL 自愈：** `tunnel start` 拿到新 URL（cloudflared 重启）时，POST 到 hive 的 `/admin/tunnel-url`，hive 再广播 `/federation/update-url` 给所有 peer。心跳 ping 响应也带 `public_url`，下一轮 ping 也能自动更正。
 - **文件：** 传输文件落在 `~/.kitty-hive/files/<id>/`，7 天后自动清理。`kitty-hive files clean [--days N]` 可手动跑。
 
 **本地端到端测试**（启两个临时 hive，跑完整联邦流程）：
@@ -303,6 +335,8 @@ kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 ag
 kitty-hive config set <key> <value>                     设置配置（如 name）
 kitty-hive db clear [--db path]                         清空数据库
 kitty-hive files clean [--days 7]                       清理过期联邦传输文件
+kitty-hive tunnel start [--port 4123]                   启动 cloudflared，自动注册 URL 给 hive
+kitty-hive tunnel status [--port 4123]                  查看当前注册的 tunnel URL
 ```
 
 ## 环境变量

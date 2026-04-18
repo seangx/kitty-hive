@@ -65,8 +65,33 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
       res.end(JSON.stringify({ error: 'Unauthorized' }));
       return;
     }
+    const publicUrl = db.getNodeState('public_url') || '';
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ node: getNodeName(), time: new Date().toISOString() }));
+    res.end(JSON.stringify({ node: getNodeName(), time: new Date().toISOString(), public_url: publicUrl }));
+    return;
+  }
+
+  // POST /federation/update-url — peer announces a new URL for itself
+  if (url.pathname === '/federation/update-url' && req.method === 'POST') {
+    const peer = authenticatePeer(req);
+    if (!peer) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
+    }
+    const body = JSON.parse(await readBody(req));
+    const newUrl: string | undefined = body.url;
+    if (!newUrl || !/^https?:\/\//i.test(newUrl)) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Invalid url' }));
+      return;
+    }
+    if (peer.url !== newUrl) {
+      db.setPeerUrl(peer.name, newUrl);
+      log('info', `[federation] peer "${peer.name}" updated url → ${newUrl}`);
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
     return;
   }
 

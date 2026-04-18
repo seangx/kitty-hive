@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, createPendingInvite, deletePendingInvite, cleanupExpiredInvites } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
+import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
 import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname, basename, delimiter } from 'node:path';
@@ -273,6 +274,8 @@ async function cmdStatus() {
     process.exit(1);
   }
   console.log(`   Node: ${nodeName}`);
+  const tunnelUrl = await getTunnelUrlFromHive(port);
+  if (tunnelUrl) console.log(`   Tunnel: ${tunnelUrl}`);
 
   try {
     const db = initDB(dbPath);
@@ -542,6 +545,96 @@ async function cmdPeerRemove() {
   }
 }
 
+// --- Tunnel ---
+
+async function pushTunnelUrl(port: number, url: string): Promise<void> {
+  const res = await fetch(`http://127.0.0.1:${port}/admin/tunnel-url`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ url }),
+  });
+  if (!res.ok) {
+    const err = await res.text().catch(() => res.statusText);
+    throw new Error(`hive admin replied ${res.status}: ${err}`);
+  }
+}
+
+async function getTunnelUrlFromHive(port: number, timeoutMs = 1500): Promise<string> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/admin/tunnel-url`, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!res.ok) return '';
+    const body = await res.json() as { url?: string };
+    return body.url || '';
+  } catch { clearTimeout(timer); return ''; }
+}
+
+async function cmdTunnelStart() {
+  let port = 4123;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
+  }
+
+  const bin = findCloudflared();
+  if (!bin) {
+    console.log('❌ cloudflared not found.');
+    console.log('   Install:');
+    console.log('     macOS:    brew install cloudflared');
+    console.log('     Windows:  choco install cloudflared');
+    console.log('     Linux:    https://github.com/cloudflare/cloudflared/releases');
+    process.exit(1);
+  }
+  console.log(`🌀 Starting cloudflared (binary: ${bin})…`);
+  console.log(`   Forwarding to http://localhost:${port}`);
+
+  let firstUrl = true;
+  const tm = new TunnelManager({
+    port,
+    binary: bin,
+    onUrl: async (url) => {
+      const tag = firstUrl ? '✓' : '↻';
+      firstUrl = false;
+      console.log(`   ${tag} Tunnel URL: ${url}`);
+      try {
+        await pushTunnelUrl(port, url);
+        console.log(`     → registered with hive at http://localhost:${port}`);
+      } catch (err) {
+        console.log(`     ⚠ failed to register with hive: ${(err as any).message}`);
+        console.log(`       (is \`kitty-hive serve --port ${port}\` running?)`);
+      }
+    },
+    onError: (msg) => console.log(`   ⚠ ${msg}`),
+  });
+
+  const shutdown = async () => {
+    console.log('\n🛑 stopping tunnel…');
+    tm.stop();
+    try { await pushTunnelUrl(port, ''); } catch { /* hive may already be down */ }
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  tm.start();
+  console.log(`   (Ctrl+C to stop. The hive will keep running.)`);
+}
+
+async function cmdTunnelStatus() {
+  let port = 4123;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
+  }
+  const url = await getTunnelUrlFromHive(port);
+  if (url) {
+    console.log(`🌀 Tunnel: ${url}`);
+  } else {
+    console.log(`💤 No tunnel registered with hive on port ${port}.`);
+    console.log(`   Start one with: kitty-hive tunnel start --port ${port}`);
+  }
+}
+
 // --- Invite token ---
 
 interface InvitePayload {
@@ -586,7 +679,8 @@ async function cmdPeerInvite() {
   initDB(dbPath);
   cleanupExpiredInvites();
 
-  let publicUrl = url || `http://localhost:${port}/mcp`;
+  // Resolve URL: explicit --url > tunnel URL stored by `kitty-hive tunnel start` > localhost
+  let publicUrl = url || getNodeState('public_url') || `http://localhost:${port}/mcp`;
   if (!/\/mcp\/?$/.test(publicUrl)) publicUrl = publicUrl.replace(/\/+$/, '') + '/mcp';
 
   const secret = 'sk_' + generateToken().slice(0, 32);
@@ -646,8 +740,8 @@ async function cmdPeerAccept() {
   setPeerNodeName(peerName, invite.n);
   console.log(`✓ Added ${peerName} as local peer`);
 
-  // Decide our URL
-  let ourUrl = myUrl || `http://localhost:${port}/mcp`;
+  // Decide our URL: explicit --url > tunnel URL > localhost
+  let ourUrl = myUrl || getNodeState('public_url') || `http://localhost:${port}/mcp`;
   if (!/\/mcp\/?$/.test(ourUrl)) ourUrl = ourUrl.replace(/\/+$/, '') + '/mcp';
   const ourNode = getNodeConfig().name || hostname().split('.')[0];
 
@@ -785,7 +879,9 @@ Usage:
   kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
   kitty-hive config set <key> <value>                     Set config (e.g. name)
   kitty-hive db clear [--db path]                         Clear the database
-  kitty-hive files clean [--days 7]                       Remove old federation transfer files`);
+  kitty-hive files clean [--days 7]                       Remove old federation transfer files
+  kitty-hive tunnel start [--port 4123]                   Run cloudflared & register URL with the hive
+  kitty-hive tunnel status [--port 4123]                  Show currently registered tunnel URL`);
 }
 
 // --- Main ---
@@ -845,6 +941,15 @@ switch (command) {
   case 'files':
     if (args[1] === 'clean') {
       cmdFilesClean().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else {
+      showHelp();
+    }
+    break;
+  case 'tunnel':
+    if (args[1] === 'start') {
+      cmdTunnelStart().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'status') {
+      cmdTunnelStatus().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else {
       showHelp();
     }
