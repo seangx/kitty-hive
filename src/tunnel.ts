@@ -12,12 +12,20 @@ const COMMON_PATHS = process.platform === 'win32'
   : ['/opt/homebrew/bin/cloudflared', '/usr/local/bin/cloudflared', '/usr/bin/cloudflared'];
 
 export function findCloudflared(): string | null {
-  // Try PATH first (cross-platform)
-  const probe = process.platform === 'win32' ? 'where cloudflared' : 'command -v cloudflared';
-  try {
-    const out = execSync(probe, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
-    if (out) return out;
-  } catch { /* not in PATH */ }
+  if (process.platform === 'win32') {
+    // On Windows, prefer .exe then .cmd; the bare-name shim is a sh script that spawn() can't run.
+    for (const name of ['cloudflared.exe', 'cloudflared.cmd', 'cloudflared.ps1']) {
+      try {
+        const out = execSync(`where ${name}`, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+        if (out) return out;
+      } catch { /* not found */ }
+    }
+  } else {
+    try {
+      const out = execSync('command -v cloudflared', { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+      if (out) return out;
+    } catch { /* not in PATH */ }
+  }
   // Fallback to known install locations
   for (const p of COMMON_PATHS) {
     if (existsSync(p)) return p;
@@ -71,7 +79,10 @@ export class TunnelManager {
 
   private spawn(): void {
     const args = ['tunnel', '--url', `http://localhost:${this.opts.port}`, '--no-autoupdate'];
-    const child = spawn(this.binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    // On Windows, .cmd / .ps1 shims need a shell to invoke. Safe here because
+    // both binary path and args are under our control (no user-supplied strings).
+    const useShell = process.platform === 'win32';
+    const child = spawn(this.binary, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: useShell });
     this.child = child;
 
     const handleData = (buf: Buffer) => {
