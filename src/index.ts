@@ -671,16 +671,27 @@ async function cmdPeerInvite() {
     else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
   }
   if (!exposed) {
-    console.log('Usage: kitty-hive peer invite --expose <my-agent-id> [--url https://my-public-url/mcp]');
+    console.log('Usage: kitty-hive peer invite --expose <my-agent-id>');
     console.log('  --expose  YOUR local agent that the peer should be allowed to reach');
-    console.log('  --url     YOUR hive URL as the peer will see it (default http://localhost:<port>/mcp)');
+    console.log('');
+    console.log('  Cross-machine? Run `kitty-hive tunnel start` first; the URL will be picked up');
+    console.log('  automatically. (Advanced: --url <https://.../mcp> overrides.)');
     process.exit(1);
   }
   initDB(dbPath);
   cleanupExpiredInvites();
 
-  // Resolve URL: explicit --url > tunnel URL stored by `kitty-hive tunnel start` > localhost
-  let publicUrl = url || getNodeState('public_url') || `http://localhost:${port}/mcp`;
+  // Resolve URL: explicit --url > tunnel URL stored by `kitty-hive tunnel start`.
+  // Refuse if neither — invites are only meaningful across machines.
+  const stored = getNodeState('public_url');
+  if (!url && !stored) {
+    console.log(`❌ No tunnel URL available — invites are only useful for cross-machine federation.`);
+    console.log(`   Start a tunnel in another terminal first:`);
+    console.log(`     kitty-hive tunnel start`);
+    console.log(`   (Local agents on the same hive don't need invites; address each other by id directly.)`);
+    process.exit(1);
+  }
+  let publicUrl = url || stored!;
   if (!/\/mcp\/?$/.test(publicUrl)) publicUrl = publicUrl.replace(/\/+$/, '') + '/mcp';
 
   const secret = 'sk_' + generateToken().slice(0, 32);
@@ -694,10 +705,9 @@ async function cmdPeerInvite() {
   console.log(`   Secret: ${secret}\n`);
   console.log(`   Send this token to your peer:\n`);
   console.log(`   ${token}\n`);
-  console.log(`   On the OTHER machine, run (substituting their own agent id and URL):`);
-  console.log(`     kitty-hive peer accept '${token}' \\`);
-  console.log(`       --expose <agent-id-on-that-machine> \\`);
-  console.log(`       --url https://their-public-url/mcp`);
+  console.log(`   On the OTHER machine, run:`);
+  console.log(`     kitty-hive peer accept '${token}' --expose <their-agent-id>`);
+  console.log(`   (they should also have \`kitty-hive tunnel start\` running for cross-machine setups.)`);
 }
 
 async function cmdPeerAccept() {
@@ -713,10 +723,12 @@ async function cmdPeerAccept() {
     else if (!args[i].startsWith('-') && !token) token = args[i];
   }
   if (!token || !myExposed) {
-    console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id> [--url https://my-public-url/mcp]');
+    console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id>');
     console.log('  --expose  YOUR local agent that the inviter should be allowed to reach');
-    console.log('  --url     YOUR hive URL as the inviter will see it (default http://localhost:<port>/mcp)');
-    console.log('  (the token already contains the inviter\'s URL, secret, and exposed agent)');
+    console.log('');
+    console.log('  Cross-machine? Run `kitty-hive tunnel start` first; the URL will be picked up');
+    console.log('  automatically. (Advanced: --url <https://.../mcp> overrides.)');
+    console.log('  (The token already contains the inviter\'s URL, secret, and exposed agent.)');
     process.exit(1);
   }
 
@@ -743,6 +755,14 @@ async function cmdPeerAccept() {
   // Decide our URL: explicit --url > tunnel URL > localhost
   let ourUrl = myUrl || getNodeState('public_url') || `http://localhost:${port}/mcp`;
   if (!/\/mcp\/?$/.test(ourUrl)) ourUrl = ourUrl.replace(/\/+$/, '') + '/mcp';
+
+  // Cross-machine sanity check: their URL is public but ours is localhost → won't work
+  const isLocal = (u: string) => /\/\/(localhost|127\.0\.0\.1|\[?::1\]?)(:|\/)/.test(u);
+  if (!isLocal(invite.u) && isLocal(ourUrl)) {
+    console.log(`\n❌ Inviter is on another machine but you have no tunnel URL.`);
+    console.log(`   Run \`kitty-hive tunnel start\` in another terminal, then re-run this command.\n`);
+    process.exit(1);
+  }
   const ourNode = getNodeConfig().name || hostname().split('.')[0];
 
   // Handshake back: tell their hive how to reach us
@@ -871,8 +891,8 @@ Usage:
   kitty-hive agent list                                   List agents
   kitty-hive agent rename <old> <new>                     Rename an agent
   kitty-hive agent remove <name>                          Remove an agent
-  kitty-hive peer invite --expose <my-agent> [--url url]      Create invite token (recommended)
-  kitty-hive peer accept <token> --expose <my-agent> [--url url]  Accept an invite token (auto-handshake)
+  kitty-hive peer invite --expose <my-agent>              Create invite token (recommended)
+  kitty-hive peer accept <token> --expose <my-agent>      Accept an invite token (auto-handshake)
   kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer (manual)
   kitty-hive peer list                                    List peers
   kitty-hive peer remove <name>                           Remove a peer
