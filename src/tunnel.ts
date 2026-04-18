@@ -39,14 +39,24 @@ export interface TunnelOptions {
   onUrl: (url: string) => void;
   onError?: (msg: string) => void;
   onExit?: (code: number | null) => void;
+  onConnected?: (activeCount: number) => void;
+  onLost?: () => void;
   restartOnDeath?: boolean;    // default true
 }
+
+// cloudflared log patterns. cloudflared prints to stderr like:
+//   2024-... INF Registered tunnel connection connIndex=0 ip=... protocol=quic
+//   2024-... INF Unregistered tunnel connection connIndex=0
+//   2024-... WRN Lost connection ... connIndex=0
+const RE_CONNECTED = /Registered tunnel connection/i;
+const RE_DISCONNECTED = /(Unregistered tunnel connection|Lost connection|Connection terminated|Unable to reach the origin)/i;
 
 export class TunnelManager {
   private child: ChildProcess | null = null;
   private currentUrl: string | null = null;
   private stopRequested = false;
   private restartDelayMs = 1000;
+  private activeConnections = 0;
   private readonly opts: TunnelOptions;
   private readonly binary: string;
 
@@ -76,6 +86,7 @@ export class TunnelManager {
   }
 
   getUrl(): string | null { return this.currentUrl; }
+  getActiveConnections(): number { return this.activeConnections; }
 
   private spawn(): void {
     const args = ['tunnel', '--url', `http://localhost:${this.opts.port}`, '--no-autoupdate'];
@@ -85,13 +96,30 @@ export class TunnelManager {
     const child = spawn(this.binary, args, { stdio: ['ignore', 'pipe', 'pipe'], shell: useShell });
     this.child = child;
 
+    let lineBuf = '';
     const handleData = (buf: Buffer) => {
       const text = buf.toString();
-      const match = text.match(URL_REGEX);
-      if (match && match[0] !== this.currentUrl) {
-        const url = match[0];
+      // URL match (anywhere in the chunk)
+      const urlMatch = text.match(URL_REGEX);
+      if (urlMatch && urlMatch[0] !== this.currentUrl) {
+        const url = urlMatch[0];
         this.currentUrl = url;
         try { this.opts.onUrl(url); } catch (err) { this.opts.onError?.(`onUrl handler threw: ${(err as any).message}`); }
+      }
+      // Connection state — process line-by-line so we don't miss multiple events in one chunk
+      lineBuf += text;
+      const lines = lineBuf.split(/\r?\n/);
+      lineBuf = lines.pop() || '';
+      for (const line of lines) {
+        if (RE_CONNECTED.test(line)) {
+          this.activeConnections++;
+          try { this.opts.onConnected?.(this.activeConnections); } catch { /* ignore */ }
+        } else if (RE_DISCONNECTED.test(line)) {
+          this.activeConnections = Math.max(0, this.activeConnections - 1);
+          if (this.activeConnections === 0) {
+            try { this.opts.onLost?.(); } catch { /* ignore */ }
+          }
+        }
       }
     };
     child.stderr?.on('data', handleData);
@@ -103,6 +131,7 @@ export class TunnelManager {
 
     child.on('exit', code => {
       this.child = null;
+      this.activeConnections = 0;
       this.opts.onExit?.(code);
       if (this.stopRequested) return;
       if (!this.opts.restartOnDeath) return;

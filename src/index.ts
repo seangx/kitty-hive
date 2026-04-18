@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
@@ -615,6 +615,7 @@ async function cmdTunnelStart() {
   console.log(`   Forwarding to http://localhost:${port}`);
 
   let firstUrl = true;
+  let everConnected = false;
   const tm = new TunnelManager({
     port,
     binary: bin,
@@ -629,6 +630,15 @@ async function cmdTunnelStart() {
         console.log(`     ⚠ failed to register with hive: ${(err as any).message}`);
         console.log(`       (is \`kitty-hive serve --port ${port}\` running?)`);
       }
+    },
+    onConnected: (count) => {
+      everConnected = true;
+      const ts = new Date().toTimeString().slice(0, 8);
+      console.log(`   ${ts}  ✓ tunnel connected (active connections: ${count})`);
+    },
+    onLost: () => {
+      const ts = new Date().toTimeString().slice(0, 8);
+      console.log(`   ${ts}  ⚠ tunnel LOST — all connections dropped${everConnected ? ' (cloudflared will retry)' : ''}`);
     },
     onError: (msg) => console.log(`   ⚠ ${msg}`),
   });
@@ -833,6 +843,48 @@ async function cmdPeerAccept() {
   console.log(`  hive-remote-agents({ peer: "${peerName}" })`);
 }
 
+async function cmdPeerSetUrl() {
+  const { dbPath } = parseFlags(1);
+  const peerName = args[2];
+  let newUrl = args[3];
+  if (!peerName || !newUrl) {
+    console.log('Usage: kitty-hive peer set-url <peer-name> <new-url>');
+    console.log('  Use this when a peer\'s tunnel URL changes and the auto-sync didn\'t reach you');
+    console.log('  (e.g. you were both offline at the same time).');
+    process.exit(1);
+  }
+  initDB(dbPath);
+  const peer = getPeerByName(peerName);
+  if (!peer) {
+    console.log(`Peer "${peerName}" not found.`);
+    process.exit(1);
+  }
+  if (!/^https?:\/\//i.test(newUrl)) {
+    console.log(`URL must start with http:// or https:// — got "${newUrl}"`);
+    process.exit(1);
+  }
+  if (!/\/mcp\/?$/.test(newUrl)) newUrl = newUrl.replace(/\/+$/, '') + '/mcp';
+
+  const oldUrl = peer.url;
+  setPeerUrl(peerName, newUrl);
+  console.log(`✓ Updated peer "${peerName}" URL`);
+  console.log(`    old: ${oldUrl}`);
+  console.log(`    new: ${newUrl}`);
+
+  // Verify with a ping
+  process.stdout.write(`✓ Pinging…`);
+  const r = await pingPeer(peerName, newUrl, peer.secret, 5000);
+  if (r.ok) {
+    setPeerStatus(peerName, 'active');
+    touchPeer(peerName);
+    console.log(` ok (node="${r.node}")`);
+  } else {
+    setPeerStatus(peerName, 'inactive');
+    console.log(` failed: ${r.error}`);
+    console.log(`  (URL still saved; will be retried by heartbeat)`);
+  }
+}
+
 async function cmdPeerExpose() {
   const { dbPath } = parseFlags(1);
   const peerName = args[2];
@@ -922,6 +974,7 @@ Usage:
   kitty-hive peer list                                    List peers
   kitty-hive peer remove <name>                           Remove a peer
   kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
+  kitty-hive peer set-url <name> <url>                    Manually update a peer's URL (when auto-sync missed it)
   kitty-hive config set <key> <value>                     Set config (e.g. name)
   kitty-hive db clear [--db path]                         Clear the database
   kitty-hive files clean [--days 7]                       Remove old federation transfer files
@@ -961,6 +1014,8 @@ switch (command) {
       cmdPeerRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'expose') {
       cmdPeerExpose().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else if (args[1] === 'set-url') {
+      cmdPeerSetUrl().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'invite') {
       cmdPeerInvite().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else if (args[1] === 'accept') {
