@@ -6,7 +6,8 @@ import { initDB, cleanupStaleTasks } from './db.js';
 import { log, setLogLevel } from './log.js';
 import { sessions, unbindSession, sessionAgents, activeSSE } from './sessions.js';
 import { createMcpServer } from './mcp/server.js';
-import { handleFederation } from './federation-http.js';
+import { handleFederation, cleanupOldFiles, getNodeName } from './federation-http.js';
+import { startHeartbeat } from './federation-heartbeat.js';
 
 export { setLogLevel };
 
@@ -131,6 +132,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
 
   httpServer.listen(port, () => {
     console.log(`🐝 kitty-hive listening on http://localhost:${port}/mcp`);
+    console.log(`   Node: ${getNodeName()}`);
     console.log(`   Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
     console.log(`   Mode: stateful (SSE push enabled)`);
   });
@@ -139,6 +141,17 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
     const count = cleanupStaleTasks(7);
     if (count > 0) log('info', `[cleanup] removed ${count} stale tasks`);
   }, 60 * 60 * 1000);
+
+  // Sweep old federation files at boot, then daily
+  try {
+    const swept = cleanupOldFiles(7);
+    if (swept.removed > 0) log('info', `[cleanup] removed ${swept.removed} old federation files (kept ${swept.kept})`);
+  } catch (err) { log('warn', `[cleanup] file sweep failed: ${(err as any).message ?? err}`); }
+  setInterval(() => {
+    try { cleanupOldFiles(7); } catch { /* ignore */ }
+  }, 24 * 60 * 60 * 1000);
+
+  startHeartbeat(60 * 1000);
 
   process.on('SIGINT', async () => {
     for (const sid in sessions) {

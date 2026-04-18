@@ -1,8 +1,10 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
-  handleTaskCreateAsync, handleTaskClaim, handleCheck,
-  handleWorkflowPropose, handleWorkflowApprove, handleStepComplete, handleWorkflowReject,
+  handleTaskCreateAsync, handleCheck,
+  handleTaskClaimAsync,
+  handleWorkflowProposeAsync, handleWorkflowApproveAsync,
+  handleStepCompleteAsync, handleWorkflowRejectAsync,
 } from '../tools/task.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents, notifyTaskParticipants } from '../sessions.js';
@@ -39,7 +41,7 @@ export function registerTaskTools(mcp: McpServer) {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = handleTaskClaim(params.task_id, agent.id);
+      const result = await handleTaskClaimAsync(params.task_id, agent.id);
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: 'task-claimed', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: `${agent.display_name} claimed: ${result.title}`,
@@ -99,7 +101,7 @@ export function registerTaskTools(mcp: McpServer) {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      handleWorkflowPropose(params.task_id, agent.id, params.workflow as any);
+      await handleWorkflowProposeAsync(params.task_id, agent.id, params.workflow as any);
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: 'task-propose', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: `Workflow proposed: ${params.workflow.length} steps`,
@@ -115,7 +117,7 @@ export function registerTaskTools(mcp: McpServer) {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const action = handleWorkflowApprove(params.task_id, agent.id);
+      const action = await handleWorkflowApproveAsync(params.task_id, agent.id);
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: 'step-start', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: `Step 1 started, assignees: ${action.assignees?.join(', ')}`,
@@ -136,7 +138,7 @@ export function registerTaskTools(mcp: McpServer) {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const action = handleStepComplete(params.task_id, agent.id, params.step, params.result);
+      const action = await handleStepCompleteAsync(params.task_id, agent.id, params.step, params.result);
       const resultPreview = params.result && params.result.length > 200 ? params.result.slice(0, 200) + ' [summary]' : params.result;
       const msg = action?.type === 'task-complete' ? 'Task completed!'
         : action?.type === 'step-start' ? `Step ${action.step} started. Previous result: ${resultPreview || 'none'}`
@@ -161,7 +163,7 @@ export function registerTaskTools(mcp: McpServer) {
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const action = handleWorkflowReject(params.task_id, agent.id, params.step, params.reason);
+      const action = await handleWorkflowRejectAsync(params.task_id, agent.id, params.step, params.reason);
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: 'task-reject', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: `Step ${params.step} rejected → back to step ${action.step}`,

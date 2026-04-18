@@ -8,6 +8,8 @@ export interface Agent {
   status: 'active' | 'idle' | 'busy' | 'offline';
   created_at: string;
   last_seen: string;
+  origin_peer: string;   // empty for local agents; peer name for placeholders
+  remote_id: string;     // empty for local agents; original agent_id on the peer
 }
 
 export interface Team {
@@ -68,6 +70,11 @@ export interface Task {
   input_json: string;
   created_at: string;
   completed_at: string | null;
+  // Federation links (empty when not a federated task):
+  originator_peer: string;       // we're the replica; events echo back to this peer
+  originator_task_id: string;    // the originator's task id (use when echoing events back)
+  delegated_peer: string;        // we're the originator; receive events from this peer
+  delegated_task_id: string;     // peer's local task id (for our records / debugging)
 }
 
 export const TASK_EVENT_TYPES = [

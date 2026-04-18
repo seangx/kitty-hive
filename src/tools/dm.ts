@@ -19,7 +19,10 @@ function parseTarget(to: string): { target: string; node?: string } {
   return { target: to };
 }
 
-async function sendFederatedDM(fromName: string, toAgent: string, peerName: string, content: string): Promise<DMOutput> {
+async function sendFederatedDM(
+  fromAgentId: string, fromDisplayName: string,
+  toRemoteId: string, peerName: string, content: string,
+): Promise<DMOutput> {
   const peer = getPeerByName(peerName);
   if (!peer) throw new Error(`Peer "${peerName}" not found. Add it with: kitty-hive peer add ${peerName} <url>`);
 
@@ -30,7 +33,12 @@ async function sendFederatedDM(fromName: string, toAgent: string, peerName: stri
       'Authorization': `Bearer ${peer.secret}`,
       'X-Hive-Peer': peerName,
     },
-    body: JSON.stringify({ from: fromName, to: toAgent, content }),
+    body: JSON.stringify({
+      from_agent_id: fromAgentId,
+      from_display_name: fromDisplayName,
+      to: toRemoteId,
+      content,
+    }),
   });
 
   if (!res.ok) {
@@ -39,7 +47,7 @@ async function sendFederatedDM(fromName: string, toAgent: string, peerName: stri
   }
 
   const result = await res.json() as { delivered: boolean; message_id: number; seq: number };
-  return { to_agent_id: `federated:${peerName}`, message_id: result.message_id, seq: result.seq, federated: true };
+  return { to_agent_id: `${toRemoteId}@${peerName}`, message_id: result.message_id, seq: result.seq, federated: true };
 }
 
 export function handleDM(actorId: string, input: DMInput): DMOutput {
@@ -54,12 +62,23 @@ export function handleDM(actorId: string, input: DMInput): DMOutput {
 
 export async function handleDMAsync(actorId: string, input: DMInput): Promise<DMOutput> {
   const actor = getAgentById(actorId);
+  if (!actor) throw new Error('Actor not found');
+
   const { target, node } = parseTarget(input.to);
 
+  // Explicit cross-node addressing: id@peer
   if (node) {
-    const fromName = actor?.display_name ?? actorId;
-    return sendFederatedDM(fromName, target, node, input.content);
+    return sendFederatedDM(actor.id, actor.display_name, target, node, input.content);
   }
 
-  return handleDM(actorId, { to: target, content: input.content });
+  // Local resolve — but if target is a remote placeholder, route through its origin peer
+  const resolved = resolveAddressee(actorId, target);
+  if ('error' in resolved) throw new Error(resolved.error);
+  const targetAgent = resolved.agent!;
+  if (targetAgent.origin_peer && targetAgent.remote_id) {
+    return sendFederatedDM(actor.id, actor.display_name, targetAgent.remote_id, targetAgent.origin_peer, input.content);
+  }
+  if (targetAgent.id === actorId) throw new Error('Cannot DM yourself');
+  const msg = appendDM(actorId, targetAgent.id, input.content);
+  return { to_agent_id: targetAgent.id, message_id: msg.id, seq: msg.seq };
 }

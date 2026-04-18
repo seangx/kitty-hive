@@ -1,13 +1,15 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer } from './db.js';
+import { pingPeer } from './federation-heartbeat.js';
 import { generateToken } from './utils.js';
 import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { join, dirname, basename, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { homedir } from 'node:os';
+import { homedir, hostname } from 'node:os';
 import { createInterface } from 'node:readline';
+import { execSync } from 'node:child_process';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -50,85 +52,269 @@ async function cmdServe() {
   await startServer(port, dbPath);
 }
 
+const INIT_TOOLS = ['claude', 'cursor', 'vscode'] as const;
+type InitTool = typeof INIT_TOOLS[number];
+const ALL_INIT_TARGETS = ['claude', 'cursor', 'vscode', 'antigravity'] as const;
+
+function findNpx(): string {
+  const probe = process.platform === 'win32' ? 'where npx' : 'command -v npx';
+  try {
+    const out = execSync(probe, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+    return out || 'npx';
+  } catch { return 'npx'; }
+}
+
+function readJson(path: string): any {
+  if (!existsSync(path)) return {};
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return {}; }
+}
+
+function writeJson(path: string, data: any) {
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(data, null, 2) + '\n');
+}
+
+function writeForTool(tool: InitTool, port: number): string {
+  const url = `http://localhost:${port}/mcp`;
+  const cwd = process.cwd();
+
+  if (tool === 'claude') {
+    const p = join(cwd, '.mcp.json');
+    const data = readJson(p);
+    if (!data.mcpServers) data.mcpServers = {};
+    data.mcpServers['hive'] = { url };
+    delete data.mcpServers['hive-channel'];
+    writeJson(p, data);
+    return p;
+  }
+
+  if (tool === 'cursor') {
+    const p = join(cwd, '.cursor', 'mcp.json');
+    const data = readJson(p);
+    if (!data.mcpServers) data.mcpServers = {};
+    data.mcpServers['hive'] = { url };
+    writeJson(p, data);
+    return p;
+  }
+
+  if (tool === 'vscode') {
+    const p = join(cwd, '.vscode', 'mcp.json');
+    const data = readJson(p);
+    if (!data.servers) data.servers = {};
+    data.servers['hive'] = { type: 'http', url };
+    writeJson(p, data);
+    return p;
+  }
+
+  throw new Error(`Unknown tool: ${tool}`);
+}
+
+function antigravitySnippet(port: number): string {
+  // Antigravity has no public on-disk config path — users edit via
+  // "..." → MCP Store → Manage MCP Servers → View raw config.
+  // It also doesn't speak streamable HTTP directly, so we route through a stdio→HTTP adapter.
+  const url = `http://localhost:${port}/mcp`;
+  // Pre-seed PATH so the GUI app can find npx even when launched without a shell.
+  const pathDirs = process.platform === 'win32'
+    ? [
+        process.env.SystemRoot ? join(process.env.SystemRoot, 'System32') : 'C:\\Windows\\System32',
+        process.env.APPDATA ? join(process.env.APPDATA, 'npm') : '',
+      ].filter(Boolean)
+    : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+  return JSON.stringify({
+    mcpServers: {
+      hive: {
+        command: findNpx(),
+        args: ['-y', '@pyroprompts/mcp-stdio-to-streamable-http-adapter'],
+        env: {
+          PATH: pathDirs.join(delimiter),
+          URI: url,
+        },
+      },
+    },
+  }, null, 2);
+}
+
+function showInitUsage() {
+  console.log('🐝 kitty-hive init — write MCP config for an IDE\n');
+  console.log('Usage:');
+  console.log('  kitty-hive init <tool> [--port 4123]\n');
+  console.log('Tools:');
+  console.log('  claude        .mcp.json          (Claude Code — prefer the plugin instead)');
+  console.log('  cursor        .cursor/mcp.json');
+  console.log('  vscode        .vscode/mcp.json   (VS Code Copilot)');
+  console.log('  antigravity   prints snippet to paste via MCP Store UI');
+  console.log('  all           run all of the above');
+}
+
 async function cmdInit() {
-  console.log('🐝 kitty-hive init — configure HTTP MCP for non-Claude-Code clients\n');
-  console.log('   (Claude Code users: install the kitty-hive plugin instead)\n');
+  const tool = args[1];
+  if (!tool || tool.startsWith('-')) {
+    showInitUsage();
+    process.exit(1);
+  }
+
+  const known = (ALL_INIT_TARGETS as readonly string[]);
+  let targets: typeof ALL_INIT_TARGETS[number][];
+  if (tool === 'all') {
+    targets = [...ALL_INIT_TARGETS];
+  } else if (known.includes(tool)) {
+    targets = [tool as typeof ALL_INIT_TARGETS[number]];
+  } else {
+    console.log(`Unknown tool: "${tool}"`);
+    showInitUsage();
+    process.exit(1);
+  }
 
   let port = 4123;
-  let explicitPort = false;
-
-  for (let i = 1; i < args.length; i++) {
+  for (let i = 2; i < args.length; i++) {
     if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
-      port = parseInt(args[i + 1], 10); explicitPort = true; i++;
+      port = parseInt(args[i + 1], 10) || 4123; i++;
     }
   }
 
-  if (!explicitPort) {
-    const p = await ask('Hive server port', '4123');
-    port = parseInt(p, 10) || 4123;
+  console.log(`🐝 Configuring hive → http://localhost:${port}/mcp\n`);
+  for (const t of targets) {
+    if (t === 'antigravity') {
+      console.log(`  antigravity  (no on-disk path — paste this snippet)`);
+      console.log(`               Open: "..." → MCP Store → Manage MCP Servers → View raw config`);
+      console.log(`               Merge "hive" into mcpServers:\n`);
+      const snippet = antigravitySnippet(port).split('\n').map(l => '    ' + l).join('\n');
+      console.log(snippet);
+      console.log('');
+    } else {
+      const path = writeForTool(t as InitTool, port);
+      console.log(`  ${t.padEnd(12)} ${path}`);
+    }
   }
-
-  const mcpJsonPath = join(process.cwd(), '.mcp.json');
-  let existing: any = {};
-  if (existsSync(mcpJsonPath)) {
-    try { existing = JSON.parse(readFileSync(mcpJsonPath, 'utf8')); } catch { /* ignore */ }
-  }
-  if (!existing.mcpServers) existing.mcpServers = {};
-
-  existing.mcpServers['hive'] = {
-    url: `http://localhost:${port}/mcp`,
-  };
-  delete existing.mcpServers['hive-channel'];
-
-  writeFileSync(mcpJsonPath, JSON.stringify(existing, null, 2) + '\n');
-  console.log(`🐝 Configured`);
-  console.log(`   Server: http://localhost:${port}/mcp`);
-  console.log(`   Mode: HTTP MCP (for Antigravity, Cursor, VS Code, etc.)`);
-  console.log(`\n   Agent registers via hive.start when first used.`);
+  console.log(`\n  Agent registers via hive.start when first used.`);
 }
+
+function relativeTime(iso: string | null | undefined): string {
+  if (!iso) return '-';
+  const then = new Date(iso).getTime();
+  if (Number.isNaN(then)) return iso;
+  const diff = Math.max(0, Date.now() - then);
+  const s = Math.floor(diff / 1000);
+  if (s < 5) return 'now';
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+
+function visualWidth(s: string): number {
+  let w = 0;
+  for (const c of s) {
+    const cp = c.codePointAt(0)!;
+    const wide =
+      (cp >= 0x1100 && cp <= 0x115F) || (cp >= 0x2E80 && cp <= 0x303E) ||
+      (cp >= 0x3041 && cp <= 0x33FF) || (cp >= 0x3400 && cp <= 0x4DBF) ||
+      (cp >= 0x4E00 && cp <= 0x9FFF) || (cp >= 0xA000 && cp <= 0xA4CF) ||
+      (cp >= 0xAC00 && cp <= 0xD7A3) || (cp >= 0xF900 && cp <= 0xFAFF) ||
+      (cp >= 0xFE30 && cp <= 0xFE4F) || (cp >= 0xFF00 && cp <= 0xFF60) ||
+      (cp >= 0xFFE0 && cp <= 0xFFE6) || (cp >= 0x20000 && cp <= 0x3FFFD);
+    w += wide ? 2 : 1;
+  }
+  return w;
+}
+
+function padCell(s: string, width: number): string {
+  return s + ' '.repeat(Math.max(0, width - visualWidth(s)));
+}
+
+function renderTable(headers: string[], rows: string[][], indent = ''): string {
+  const widths = headers.map((h, i) =>
+    Math.max(visualWidth(h), ...rows.map(r => visualWidth(r[i] ?? '')))
+  );
+  const fmt = (cells: string[]) =>
+    indent + cells.map((c, i) => padCell(c ?? '', widths[i])).join('  ').trimEnd();
+  const sep = indent + widths.map(w => '─'.repeat(w)).join('  ');
+  return [fmt(headers), sep, ...rows.map(fmt)].join('\n');
+}
+
+function agentRows(db: ReturnType<typeof initDB>, agents: any[]): string[][] {
+  const teamStmt = db.prepare(`
+    SELECT t.name, tm.nickname FROM teams t
+    JOIN team_members tm ON tm.team_id = t.id
+    WHERE tm.agent_id = ? AND t.closed_at IS NULL
+    ORDER BY t.name
+  `);
+  return agents.map(a => {
+    const memberTeams = teamStmt.all(a.id) as any[];
+    const teamLabels = memberTeams.map(t => t.nickname ? `${t.name}:${t.nickname}` : t.name).join(', ') || '-';
+    return [
+      a.id.slice(0, 12),
+      a.display_name,
+      a.tool || '-',
+      a.status,
+      a.roles || '-',
+      teamLabels,
+      relativeTime(a.last_seen),
+    ];
+  });
+}
+
+const AGENT_HEADERS = ['ID', 'NAME', 'TOOL', 'STATUS', 'ROLES', 'TEAMS', 'LAST SEEN'];
 
 async function cmdStatus() {
   const { port, dbPath } = parseFlags(1);
   const url = `http://localhost:${port}/mcp`;
+  const nodeName = getNodeConfig().name || hostname().split('.')[0];
 
-  // Check server
   try {
-    const res = await fetch(url, { method: 'GET' });
+    await fetch(url, { method: 'GET' });
     console.log(`🐝 Server: http://localhost:${port}/mcp (online)`);
   } catch {
     console.log(`❌ Server: http://localhost:${port}/mcp (offline)`);
     process.exit(1);
   }
+  console.log(`   Node: ${nodeName}`);
 
-  // Check DB
   try {
     const db = initDB(dbPath);
-    const agents = db.prepare('SELECT id, display_name, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
-    const teams = db.prepare("SELECT id, name FROM teams WHERE closed_at IS NULL").all() as any[];
+    const agents = db.prepare("SELECT id, display_name, tool, roles, status, last_seen FROM agents WHERE origin_peer = '' ORDER BY last_seen DESC").all() as any[];
+    const remotes = db.prepare("SELECT id, display_name, tool, roles, status, last_seen, origin_peer FROM agents WHERE origin_peer != '' ORDER BY last_seen DESC").all() as any[];
+    const teams = db.prepare("SELECT id, name FROM teams WHERE closed_at IS NULL ORDER BY name").all() as any[];
     const tasks = db.prepare("SELECT count(*) as cnt FROM tasks WHERE status NOT IN ('completed','failed','canceled')").get() as { cnt: number };
+    const peers = listPeers();
 
-    console.log(`\n📊 Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
-    console.log(`   Teams: ${teams.length}  Active tasks: ${tasks.cnt}`);
+    console.log(`📊 Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
+    console.log(`   ${agents.length} local agents · ${remotes.length} remote · ${teams.length} teams · ${tasks.cnt} active tasks · ${peers.length} peers`);
 
-    console.log(`\n👥 Agents (${agents.length}):`);
-    for (const a of agents) {
-      const memberTeams = db.prepare(`
-        SELECT t.name, tm.nickname FROM teams t
-        JOIN team_members tm ON tm.team_id = t.id
-        WHERE tm.agent_id = ? AND t.closed_at IS NULL
-      `).all(a.id) as any[];
-      const teamLabels = memberTeams.map((t: any) => t.nickname ? `${t.name}:${t.nickname}` : t.name).join(', ');
-      console.log(`   ${a.display_name} [${a.id.slice(0, 8)}…] (${a.status}) — ${teamLabels || 'no teams'}`);
+    if (agents.length > 0) {
+      console.log(`\n👥 Agents`);
+      console.log(renderTable(AGENT_HEADERS, agentRows(db, agents), '   '));
     }
 
     if (teams.length > 0) {
-      console.log(`\n🏠 Teams:`);
-      for (const t of teams) {
-        const memberCount = db.prepare('SELECT COUNT(*) as cnt FROM team_members WHERE team_id = ?').get(t.id) as { cnt: number };
-        console.log(`   ${t.name} — ${memberCount.cnt} members`);
+      console.log(`\n🏠 Teams`);
+      const rows = teams.map(t => {
+        const cnt = (db.prepare('SELECT COUNT(*) as cnt FROM team_members WHERE team_id = ?').get(t.id) as { cnt: number }).cnt;
+        return [t.name, String(cnt)];
+      });
+      console.log(renderTable(['NAME', 'MEMBERS'], rows, '   '));
+    }
+
+    if (peers.length > 0) {
+      console.log(`\n🤝 Peers`);
+      const rows = peers.map(p => [
+        p.name, p.node_name || '-', p.status, p.exposed || '-', relativeTime(p.last_seen),
+      ]);
+      console.log(renderTable(['NAME', 'NODE', 'STATUS', 'EXPOSED', 'LAST SEEN'], rows, '   '));
+
+      if (remotes.length > 0) {
+        console.log(`\n🌐 Remote agents (placeholders)`);
+        const rrows = remotes.map(a => [
+          a.id.slice(0, 12), a.display_name, a.origin_peer, a.status, relativeTime(a.last_seen),
+        ]);
+        console.log(renderTable(['ID', 'NAME', 'PEER', 'STATUS', 'LAST SEEN'], rrows, '   '));
       }
     }
-  } catch (err) {
+  } catch {
     console.log(`\n⚠️  Cannot read database`);
   }
 }
@@ -231,14 +417,12 @@ async function cmdAgentRename() {
 async function cmdAgentList() {
   const { dbPath } = parseFlags(1);
   const db = initDB(dbPath);
-  const agents = db.prepare('SELECT display_name, roles, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
+  const agents = db.prepare('SELECT id, display_name, tool, roles, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
   if (agents.length === 0) {
     console.log('No agents registered.');
     return;
   }
-  for (const a of agents) {
-    console.log(`  ${a.display_name} (${a.status}) roles=${a.roles || 'none'} last_seen=${a.last_seen}`);
-  }
+  console.log(renderTable(AGENT_HEADERS, agentRows(db, agents)));
 }
 
 // --- Node config ---
@@ -261,7 +445,7 @@ function setNodeConfig(config: Record<string, any>): void {
 }
 
 function getNodeName(): string {
-  return getNodeConfig().name || require('os').hostname().split('.')[0];
+  return getNodeConfig().name || hostname().split('.')[0];
 }
 
 // --- Peer commands ---
@@ -307,6 +491,20 @@ async function cmdPeerAdd() {
   console.log(`   URL: ${peerUrl}`);
   console.log(`   Secret: ${secret}`);
   console.log(`   Exposed agents: ${exposed || 'none (use --expose to add)'}`);
+
+  // Verify reachability via /federation/ping
+  process.stdout.write(`   Pinging…`);
+  const result = await pingPeer(peerName, peerUrl, secret, 5000);
+  if (result.ok) {
+    if (result.node) setPeerNodeName(peerName, result.node);
+    setPeerStatus(peerName, 'active');
+    touchPeer(peerName);
+    console.log(` ok (node="${result.node}")`);
+  } else {
+    setPeerStatus(peerName, 'inactive');
+    console.log(` failed: ${result.error}`);
+    console.log(`   (peer record kept; will retry on next heartbeat once server is reachable)`);
+  }
   console.log(`\n   Give this secret to the peer so they can connect back.`);
 }
 
@@ -318,11 +516,15 @@ async function cmdPeerList() {
     console.log('No peers configured.');
     return;
   }
-  for (const p of peers) {
-    console.log(`  ${p.name} (${p.status}) — ${p.url}`);
-    console.log(`    exposed: ${p.exposed || 'none'}`);
-    console.log(`    last seen: ${p.last_seen || 'never'}`);
-  }
+  const rows = peers.map(p => [
+    p.name,
+    p.node_name || '-',
+    p.status,
+    p.url,
+    p.exposed || '-',
+    relativeTime(p.last_seen),
+  ]);
+  console.log(renderTable(['NAME', 'NODE', 'STATUS', 'URL', 'EXPOSED', 'LAST SEEN'], rows));
 }
 
 async function cmdPeerRemove() {
@@ -375,6 +577,18 @@ async function cmdPeerExpose() {
   console.log(`✅ Peer "${peerName}" exposed agents: ${current.join(', ') || 'none'}`);
 }
 
+async function cmdFilesClean() {
+  let maxAgeDays = 7;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--days' || args[i] === '-d') && args[i + 1]) {
+      maxAgeDays = parseInt(args[i + 1], 10) || 7; i++;
+    }
+  }
+  const { cleanupOldFiles } = await import('./federation-http.js');
+  const result = cleanupOldFiles(maxAgeDays);
+  console.log(`✅ Removed ${result.removed} federation file(s) older than ${maxAgeDays} day(s); kept ${result.kept}.`);
+}
+
 async function cmdConfigSet() {
   // kitty-hive config set name marvin
   const key = args[2];
@@ -398,7 +612,7 @@ function getDefaultAgentName(): string {
     } catch { /* ignore */ }
   }
   // Fallback to directory name
-  return process.cwd().split('/').pop() || 'agent';
+  return basename(process.cwd()) || 'agent';
 }
 
 function showHelp() {
@@ -406,7 +620,7 @@ function showHelp() {
 
 Usage:
   kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
-  kitty-hive init [--port 4123]                           Configure HTTP MCP for this project
+  kitty-hive init <tool> [--port 4123]                    Write MCP config (claude|cursor|vscode|antigravity|all)
   kitty-hive status [--port 4123]                         Server & agent status
   kitty-hive agent list                                   List agents
   kitty-hive agent rename <old> <new>                     Rename an agent
@@ -416,7 +630,8 @@ Usage:
   kitty-hive peer remove <name>                           Remove a peer
   kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
   kitty-hive config set <key> <value>                     Set config (e.g. name)
-  kitty-hive db clear [--db path]                         Clear the database`);
+  kitty-hive db clear [--db path]                         Clear the database
+  kitty-hive files clean [--days 7]                       Remove old federation transfer files`);
 }
 
 // --- Main ---
@@ -465,6 +680,13 @@ switch (command) {
   case 'db':
     if (args[1] === 'clear') {
       cmdDbClear().catch(err => { console.error('Failed:', err); process.exit(1); });
+    } else {
+      showHelp();
+    }
+    break;
+  case 'files':
+    if (args[1] === 'clean') {
+      cmdFilesClean().catch(err => { console.error('Failed:', err); process.exit(1); });
     } else {
       showHelp();
     }

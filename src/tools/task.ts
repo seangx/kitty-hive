@@ -1,10 +1,11 @@
 import {
   getAgentById, findAgentByRole, resolveAddressee,
-  createTask, getTaskById, updateTaskStatus,
+  createTask, getTaskById, updateTaskStatus, setTaskDelegation,
   appendTaskEvent, getTaskEvents, getPeerByName,
+  ensureRemoteAgentByRemoteId,
 } from '../db.js';
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
-import type { TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
+import type { Task, TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
 
 // --- hive.task ---
 
@@ -36,7 +37,11 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
     }
   }
 
-  const task = createTask(input.title, actorId, assignee?.id, input.source_team_id, input.input);
+  const task = createTask(input.title, actorId, {
+    assigneeId: assignee?.id,
+    sourceTeamId: input.source_team_id,
+    input: input.input,
+  });
 
   // task-start → proposing (assignee should propose workflow)
   validateWorkflowTransition('created' as TaskStatus, 'task-start');
@@ -61,16 +66,34 @@ function parseTarget(to: string): { agent: string; node?: string } {
 export async function handleTaskCreateAsync(actorId: string, input: TaskInput): Promise<TaskOutput> {
   if (!input.to) return handleTaskCreate(actorId, input);
 
-  const { agent: targetName, node } = parseTarget(input.to);
-  if (!node) return handleTaskCreate(actorId, { ...input, to: targetName });
+  const { agent: targetId, node } = parseTarget(input.to);
+  if (!node) return handleTaskCreate(actorId, { ...input, to: targetId });
 
-  // Federated task
+  // --- Federated task ---
   const peer = getPeerByName(node);
   if (!peer) throw new Error(`Peer "${node}" not found`);
 
   const actor = getAgentById(actorId);
-  const fromName = actor?.display_name ?? actorId;
+  if (!actor) throw new Error('Actor not found');
 
+  // Create local placeholder for the remote assignee (will be the assignee on our shadow task).
+  // We don't know the remote display_name yet, so use targetId as a temporary label.
+  const remoteAssigneePlaceholder = ensureRemoteAgentByRemoteId(targetId, node, targetId);
+
+  // Local shadow task — represents the delegated work, status starts at proposing
+  // (our user can later approve/reject; the real workflow lives on the peer).
+  const shadow = createTask(input.title, actorId, {
+    assigneeId: remoteAssigneePlaceholder.id,
+    sourceTeamId: input.source_team_id,
+    input: input.input,
+    delegatedPeer: node,
+  });
+  appendTaskEvent(shadow.id, 'task-start', actorId, {
+    title: input.title, input: input.input, assignee_agent_id: remoteAssigneePlaceholder.id, federated_to: `${targetId}@${node}`,
+  });
+  updateTaskStatus(shadow.id, 'proposing', { assignee_agent_id: remoteAssigneePlaceholder.id });
+
+  // Send to peer
   const res = await fetch(peer.url.replace('/mcp', '/federation/task'), {
     method: 'POST',
     headers: {
@@ -78,7 +101,14 @@ export async function handleTaskCreateAsync(actorId: string, input: TaskInput): 
       'Authorization': `Bearer ${peer.secret}`,
       'X-Hive-Peer': node,
     },
-    body: JSON.stringify({ from: fromName, to: targetName, title: input.title, input: input.input }),
+    body: JSON.stringify({
+      from_agent_id: actor.id,
+      from_display_name: actor.display_name,
+      to: targetId,
+      title: input.title,
+      input: input.input,
+      originator_task_id: shadow.id,
+    }),
   });
 
   if (!res.ok) {
@@ -87,17 +117,21 @@ export async function handleTaskCreateAsync(actorId: string, input: TaskInput): 
   }
 
   const result = await res.json() as { task_id: string; status: string };
+  // Record peer's task id on shadow so we can debug / detect duplicates
+  setTaskDelegation(shadow.id, node, result.task_id);
+
   return {
-    task_id: result.task_id, title: input.title,
-    status: result.status as TaskStatus,
-    assignee: { id: targetName, display_name: `${targetName}@${node}` },
+    task_id: shadow.id,
+    title: input.title,
+    status: 'proposing',
+    assignee: { id: remoteAssigneePlaceholder.id, display_name: `${targetId}@${node}` },
   };
 }
 
 // --- Federated task event ---
 
 export async function sendFederatedTaskEvent(
-  taskId: string, peerNode: string, fromName: string,
+  taskId: string, peerNode: string, fromAgentId: string, fromDisplayName: string,
   type: string, extras: Record<string, any> = {},
 ): Promise<any> {
   const peer = getPeerByName(peerNode);
@@ -110,7 +144,11 @@ export async function sendFederatedTaskEvent(
       'Authorization': `Bearer ${peer.secret}`,
       'X-Hive-Peer': peerNode,
     },
-    body: JSON.stringify({ from: fromName, task_id: taskId, type, ...extras }),
+    body: JSON.stringify({
+      from_agent_id: fromAgentId,
+      from_display_name: fromDisplayName,
+      task_id: taskId, type, ...extras,
+    }),
   });
 
   if (!res.ok) {
@@ -119,6 +157,67 @@ export async function sendFederatedTaskEvent(
   }
 
   return res.json();
+}
+
+// Forward a workflow event to whichever side this task is linked with.
+// On replica (originator_peer set): echo back to originator using originator_task_id.
+// On originator (delegated_peer set): forward to replica using delegated_task_id.
+async function forwardTaskEvent(task: Task, actorId: string, type: string, extras: Record<string, any> = {}): Promise<void> {
+  const actor = getAgentById(actorId);
+  if (!actor) return;
+  // Don't echo events whose actor is itself a remote placeholder (those events arrived via federation).
+  if (actor.origin_peer) return;
+
+  if (task.originator_peer && task.originator_task_id) {
+    try {
+      await sendFederatedTaskEvent(task.originator_task_id, task.originator_peer, actor.id, actor.display_name, type, extras);
+    } catch (err) {
+      console.warn(`[federation] failed to echo event to originator ${task.originator_peer}: ${(err as any).message ?? err}`);
+    }
+  }
+  if (task.delegated_peer && task.delegated_task_id) {
+    try {
+      await sendFederatedTaskEvent(task.delegated_task_id, task.delegated_peer, actor.id, actor.display_name, type, extras);
+    } catch (err) {
+      console.warn(`[federation] failed to forward event to replica ${task.delegated_peer}: ${(err as any).message ?? err}`);
+    }
+  }
+}
+
+// --- Async wrappers (used by MCP tool layer; auto-forward to peer if task is linked) ---
+
+export async function handleWorkflowProposeAsync(taskId: string, agentId: string, workflow: WorkflowStep[]): Promise<void> {
+  handleWorkflowPropose(taskId, agentId, workflow);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-propose', { workflow: JSON.parse(task.workflow_json || '[]') });
+}
+
+export async function handleWorkflowApproveAsync(taskId: string, agentId: string): Promise<WorkflowAction> {
+  const action = handleWorkflowApprove(taskId, agentId);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-approve', {});
+  return action;
+}
+
+export async function handleStepCompleteAsync(taskId: string, agentId: string, stepNum: number, result?: string): Promise<WorkflowAction | null> {
+  const action = handleStepComplete(taskId, agentId, stepNum, result);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'step-complete', { step: stepNum, result });
+  return action;
+}
+
+export async function handleWorkflowRejectAsync(taskId: string, agentId: string, stepNum: number, reason?: string): Promise<WorkflowAction> {
+  const action = handleWorkflowReject(taskId, agentId, stepNum, reason);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-reject', { step: stepNum, reason });
+  return action;
+}
+
+export async function handleTaskClaimAsync(taskId: string, agentId: string): Promise<TaskOutput> {
+  const out = handleTaskClaim(taskId, agentId);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-claim', {});
+  return out;
 }
 
 // --- hive.task.claim ---

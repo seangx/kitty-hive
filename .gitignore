@@ -3,3 +3,5 @@ dist/
 *.db
 *.db-wal
 *.db-shm
+.mcp.json
+handoff.md

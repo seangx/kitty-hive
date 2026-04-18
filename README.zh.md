@@ -36,8 +36,8 @@ claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 # 1. 启动 server
 npx kitty-hive serve
 
-# 2. 在项目目录写入 MCP 配置
-npx kitty-hive init
+# 2. 写入 IDE 的 MCP 配置（任选：cursor | vscode | antigravity）
+npx kitty-hive init cursor
 ```
 
 ## 工作原理
@@ -191,19 +191,35 @@ kitty-hive config set name marvin
 # 用 Cloudflare Tunnel 暴露（不需要公网 IP）
 cloudflared tunnel --url http://localhost:4123
 
-# 添加 peer
-kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose <agent-id>
+# 添加 peer（自动 ping 一次验证可达性 + 密钥）
+kitty-hive peer add alice https://xxx.trycloudflare.com/mcp \
+  --secret <共享密钥> --expose <agent-id>
 
 # 跨节点通讯
 hive.dm({ to: "<id>@alice", content: "hello!" })
 hive.task({ to: "<id>@alice", title: "Review this PR" })
+
+# 收到的远端 DM 直接回复就行：本地 placeholder 记得它属于哪个 peer，自动回路由。
+```
+
+**工作机制：**
+
+- **身份：** 每个远端 agent 在本地生成一个 placeholder，按 `(peer_name, remote_agent_id)` 唯一定位。对方 rename 不会断关联；回复路径靠 placeholder 上的 `origin_peer` 字段反向路由。
+- **任务：** 委派给 `<id>@peer` 时，发起方建一个**影子任务**，replica 端建真任务。propose / approve / step-complete / reject 等事件双向自动转发，两边状态同步。发起方用 `hive-check` 实时看进度。
+- **心跳：** `peer add` 当场 ping；server 每 60s 周期 ping 维护 `peers.status`。`kitty-hive status` 直接显示。
+- **文件：** 传输文件落在 `~/.kitty-hive/files/<id>/`，7 天后自动清理。`kitty-hive files clean [--days N]` 可手动跑。
+
+**本地端到端测试**（启两个临时 hive，跑完整联邦流程）：
+
+```bash
+npm run test:federation
 ```
 
 ## 命令行
 
 ```
 kitty-hive serve [--port 4123] [--db path] [-v|-q]     启动服务
-kitty-hive init [--port 4123]                           写入 HTTP MCP 配置（非 Claude Code）
+kitty-hive init <tool> [--port 4123]                    写入 MCP 配置（claude|cursor|vscode|antigravity|all）
 kitty-hive status [--port 4123]                         服务/agent/team 状态
 kitty-hive agent list                                   列出 agent
 kitty-hive agent rename <old> <new>                     重命名 agent
@@ -214,6 +230,7 @@ kitty-hive peer remove <name>                           删除 peer
 kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 agent
 kitty-hive config set <key> <value>                     设置配置（如 name）
 kitty-hive db clear [--db path]                         清空数据库
+kitty-hive files clean [--days 7]                       清理过期联邦传输文件
 ```
 
 ## 环境变量

@@ -36,8 +36,8 @@ Set `HIVE_AGENT_NAME=<name>` (or `HIVE_AGENT_ID=<id>`) in the env to skip this a
 # 1. Start server
 npx kitty-hive serve
 
-# 2. Configure MCP in your project
-npx kitty-hive init
+# 2. Write MCP config for your IDE (pick one: cursor | vscode | antigravity)
+npx kitty-hive init cursor
 ```
 
 ## How It Works
@@ -191,19 +191,36 @@ kitty-hive config set name marvin
 # Expose via Cloudflare Tunnel (no public IP needed)
 cloudflared tunnel --url http://localhost:4123
 
-# Add a peer
-kitty-hive peer add alice https://xxx.trycloudflare.com/mcp --expose <agent-id>
+# Add a peer (auto-pings to verify reachability + secret)
+kitty-hive peer add alice https://xxx.trycloudflare.com/mcp \
+  --secret <shared-secret> --expose <agent-id>
 
 # Cross-node communication
 hive.dm({ to: "<id>@alice", content: "hello!" })
 hive.task({ to: "<id>@alice", title: "Review this PR" })
+
+# Replies to incoming federated DMs route back automatically:
+# the placeholder agent for the remote sender remembers its origin peer.
+```
+
+**How it works:**
+
+- **Identity:** every remote agent gets a local placeholder keyed by `(peer_name, remote_agent_id)`. Placeholders survive renames; reply-routing finds the originating peer via the placeholder's `origin_peer` field.
+- **Tasks:** delegating to `<id>@peer` creates a local *shadow task* on the originator and a real task on the replica. Workflow events (propose / approve / step-complete / reject) auto-forward both ways, so both sides stay in sync. The originator can `hive-check` to see live progress.
+- **Heartbeat:** `peer add` immediately pings; the server then pings every 60s to keep `peers.status` accurate. `kitty-hive status` shows it.
+- **Files:** transferred files live under `~/.kitty-hive/files/<id>/` and auto-expire after 7 days. `kitty-hive files clean [--days N]` runs the sweeper manually.
+
+**Verify locally** with the included e2e test (boots two hives in temp dirs, runs the full flow):
+
+```bash
+npm run test:federation
 ```
 
 ## CLI
 
 ```
 kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
-kitty-hive init [--port 4123]                           Configure HTTP MCP (non-Claude-Code)
+kitty-hive init <tool> [--port 4123]                    Write MCP config (claude|cursor|vscode|antigravity|all)
 kitty-hive status [--port 4123]                         Server, agent & team status
 kitty-hive agent list                                   List agents
 kitty-hive agent rename <old> <new>                     Rename an agent
@@ -214,6 +231,7 @@ kitty-hive peer remove <name>                           Remove a peer
 kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
 kitty-hive config set <key> <value>                     Set config (e.g. name)
 kitty-hive db clear [--db path]                         Clear the database
+kitty-hive files clean [--days 7]                       Remove old federation transfer files
 ```
 
 ## Environment

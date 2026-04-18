@@ -122,6 +122,25 @@ export function initDB(dbPath?: string): Database.Database {
     );
   `);
 
+  // Idempotent column migrations for federation fields
+  function addColumnIfMissing(table: string, column: string, decl: string) {
+    const cols = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>).map(c => c.name);
+    if (!cols.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${decl}`);
+  }
+  addColumnIfMissing('agents', 'origin_peer', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('agents', 'remote_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('tasks', 'originator_peer', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('tasks', 'originator_task_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('tasks', 'delegated_peer', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('tasks', 'delegated_task_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('peers', 'node_name', "TEXT NOT NULL DEFAULT ''");
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_delegated ON tasks(delegated_peer, delegated_task_id);
+    CREATE INDEX IF NOT EXISTS idx_tasks_originator ON tasks(originator_peer, originator_task_id);
+  `);
+
   return db;
 }
 
@@ -132,17 +151,36 @@ export function getDB(): Database.Database {
 
 // --- Agent queries ---
 
-export function createAgent(displayName: string, tool: string, roles: string, expertise: string): Agent {
+export function createAgent(displayName: string, tool: string, roles: string, expertise: string, originPeer: string = '', remoteId: string = ''): Agent {
   const agent: Agent = {
     id: ulid(), display_name: displayName, token: generateToken(),
     tool, roles, expertise, status: 'active',
     created_at: nowISO(), last_seen: nowISO(),
+    origin_peer: originPeer, remote_id: remoteId,
   };
   getDB().prepare(`
-    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen)
-    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen)
+    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id)
+    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id)
   `).run(agent);
   return agent;
+}
+
+// Find or create a placeholder agent representing a remote peer's agent.
+// Looked up by (origin_peer, remote_id) — stable across rename/restart.
+export function ensureRemoteAgentByRemoteId(remoteId: string, peerName: string, displayName: string): Agent {
+  const existing = getDB().prepare(
+    'SELECT * FROM agents WHERE origin_peer = ? AND remote_id = ?'
+  ).get(peerName, remoteId) as Agent | undefined;
+  if (existing) {
+    if (existing.display_name !== displayName) {
+      getDB().prepare('UPDATE agents SET display_name = ?, last_seen = ? WHERE id = ?').run(displayName, nowISO(), existing.id);
+      existing.display_name = displayName;
+    } else {
+      touchAgent(existing.id);
+    }
+    return existing;
+  }
+  return createAgent(displayName, 'remote', `peer:${peerName}`, '', peerName, remoteId);
 }
 
 export function getAgentByToken(token: string): Agent | undefined {
@@ -351,20 +389,38 @@ export function getDMConversation(agentA: string, agentB: string, since: number 
 
 // --- Task queries ---
 
-export function createTask(title: string, creatorId: string, assigneeId?: string, sourceTeamId?: string, input?: object): Task {
+export interface CreateTaskOptions {
+  assigneeId?: string;
+  sourceTeamId?: string;
+  input?: object;
+  originatorPeer?: string;
+  originatorTaskId?: string;
+  delegatedPeer?: string;
+  delegatedTaskId?: string;
+}
+
+export function createTask(title: string, creatorId: string, opts: CreateTaskOptions = {}): Task {
   const task: Task = {
     id: ulid(), title, creator_agent_id: creatorId,
-    assignee_agent_id: assigneeId ?? null,
+    assignee_agent_id: opts.assigneeId ?? null,
     status: 'created', workflow_json: null, current_step: 0,
-    source_team_id: sourceTeamId ?? null,
-    input_json: JSON.stringify(input ?? {}),
+    source_team_id: opts.sourceTeamId ?? null,
+    input_json: JSON.stringify(opts.input ?? {}),
     created_at: nowISO(), completed_at: null,
+    originator_peer: opts.originatorPeer ?? '',
+    originator_task_id: opts.originatorTaskId ?? '',
+    delegated_peer: opts.delegatedPeer ?? '',
+    delegated_task_id: opts.delegatedTaskId ?? '',
   };
   getDB().prepare(`
-    INSERT INTO tasks (id, title, creator_agent_id, assignee_agent_id, status, workflow_json, current_step, source_team_id, input_json, created_at, completed_at)
-    VALUES (@id, @title, @creator_agent_id, @assignee_agent_id, @status, @workflow_json, @current_step, @source_team_id, @input_json, @created_at, @completed_at)
+    INSERT INTO tasks (id, title, creator_agent_id, assignee_agent_id, status, workflow_json, current_step, source_team_id, input_json, created_at, completed_at, originator_peer, originator_task_id, delegated_peer, delegated_task_id)
+    VALUES (@id, @title, @creator_agent_id, @assignee_agent_id, @status, @workflow_json, @current_step, @source_team_id, @input_json, @created_at, @completed_at, @originator_peer, @originator_task_id, @delegated_peer, @delegated_task_id)
   `).run(task);
   return task;
+}
+
+export function setTaskDelegation(taskId: string, delegatedPeer: string, delegatedTaskId: string): void {
+  getDB().prepare('UPDATE tasks SET delegated_peer = ?, delegated_task_id = ? WHERE id = ?').run(delegatedPeer, delegatedTaskId, taskId);
 }
 
 export function getTaskById(id: string): Task | undefined {
@@ -533,16 +589,17 @@ export interface Peer {
   status: string;
   created_at: string;
   last_seen: string | null;
+  node_name: string;     // peer's self-reported node name (from /federation/ping)
 }
 
 export function addPeer(name: string, url: string, secret: string, exposed: string = ''): Peer {
   const peer: Peer = {
     id: ulid(), name, url, secret, exposed, status: 'active',
-    created_at: nowISO(), last_seen: null,
+    created_at: nowISO(), last_seen: null, node_name: '',
   };
   getDB().prepare(`
-    INSERT INTO peers (id, name, url, secret, exposed, status, created_at, last_seen)
-    VALUES (@id, @name, @url, @secret, @exposed, @status, @created_at, @last_seen)
+    INSERT INTO peers (id, name, url, secret, exposed, status, created_at, last_seen, node_name)
+    VALUES (@id, @name, @url, @secret, @exposed, @status, @created_at, @last_seen, @node_name)
   `).run(peer);
   return peer;
 }
@@ -552,7 +609,8 @@ export function getPeerByName(name: string): Peer | undefined {
 }
 
 export function getPeerBySecret(secret: string): Peer | undefined {
-  return getDB().prepare('SELECT * FROM peers WHERE secret = ? AND status = ?').get(secret, 'active') as Peer | undefined;
+  // Status is informational (reachability); auth is by secret match only.
+  return getDB().prepare('SELECT * FROM peers WHERE secret = ?').get(secret) as Peer | undefined;
 }
 
 export function listPeers(): Peer[] {
@@ -570,6 +628,14 @@ export function updatePeerExposed(name: string, exposed: string): void {
 
 export function touchPeer(name: string): void {
   getDB().prepare('UPDATE peers SET last_seen = ? WHERE name = ?').run(nowISO(), name);
+}
+
+export function setPeerStatus(name: string, status: 'active' | 'inactive'): void {
+  getDB().prepare('UPDATE peers SET status = ? WHERE name = ?').run(status, name);
+}
+
+export function setPeerNodeName(name: string, nodeName: string): void {
+  getDB().prepare('UPDATE peers SET node_name = ? WHERE name = ?').run(nodeName, name);
 }
 
 export function isPeerExposed(peerName: string, agentName: string): boolean {
