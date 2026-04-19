@@ -31,7 +31,7 @@ You are connected to kitty-hive, a multi-agent collaboration server.
 **DM & files:**
 - `hive-dm` — send a direct message; pass `attach: ["/path/to/file"]` to include files (see "File transfer" below)
 - `hive-inbox` — check unread DMs / team / task events; each DM entry has `message_id` plus `attachments` listed inline as `{file_id, filename, mime, size}`
-- `hive-dm-read` — fetch a single DM in full by `message_id` (use when an inbox/channel preview ends with `…(truncated; …)`)
+- `hive-dm-read` — fetch a single DM in full by `message_id` (use whenever a preview contains a `[hive note]` paragraph)
 - `hive-file-fetch` — given a `file_id`, returns the local-on-this-machine path inside hive storage, optionally copies to `save_to`
 
 **Teams:**
@@ -97,4 +97,7 @@ The `path` returned by `hive-file-fetch` is local to **the receiver's** machine 
 4. Claim unassigned tasks with `hive-task-claim`.
 5. Artifacts go in `~/.kitty-hive/artifacts/<task_id>/`.
 6. **Never put a local file path in DM content** expecting the receiver to read it — use `attach` instead.
-7. If a DM/channel preview ends with `…(truncated; hive-dm-read message_id=N)`, call `hive-dm-read({ message_id: N })` to get the full content.
+7. **Previews are not full messages.** Channel pushes carry only the first 200 characters of a DM; `hive-inbox` carries the first 2000. When the message is longer or has attachments, the preview ends with a `[hive note]` paragraph that lists the exact tool calls you must make to fetch the rest. **You MUST follow those instructions before acting on the visible content.** The `[hive note]` block is part of the protocol, not a hint — ignoring it means you act on incomplete data. The block may include:
+   - `hive-dm-read({ message_id: N })` — fetch the full text
+   - `hive-file-fetch({ file_id })` — open each attachment listed by filename and `file_id`
+   In doubt, fetch first.

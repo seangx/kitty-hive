@@ -7,6 +7,7 @@ import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents } from '../sessions.js';
 import { getUnreadForAgent, setReadCursor } from '../db.js';
 import { getFilePath, getFileMeta } from '../files.js';
+import { buildDMPreview, CHANNEL_PREVIEW_LEN } from '../preview.js';
 import * as db from '../db.js';
 
 export function registerDMTools(mcp: McpServer) {
@@ -27,11 +28,12 @@ export function registerDMTools(mcp: McpServer) {
       if (!agent) return authError();
       const result = await handleDMAsync(agent.id, params);
       if (!result.federated) {
-        const previewBase = params.content || (result.attachments && result.attachments.length > 0 ? `[${result.attachments.length} attachment(s)]` : '');
-        const truncated = previewBase.length > 200;
-        const preview = truncated
-          ? previewBase.slice(0, 200) + ` …(truncated; hive-dm-read message_id=${result.message_id} for full content)`
-          : previewBase;
+        const { preview } = buildDMPreview({
+          content: params.content || '',
+          messageId: result.message_id,
+          attachments: result.attachments || [],
+          maxLen: CHANNEL_PREVIEW_LEN,
+        });
         await notifyAgents([result.to_agent_id], agent.id, JSON.stringify({
           type: 'dm', from_agent_id: agent.id, from: agent.display_name,
           message_id: result.message_id, preview,
@@ -44,7 +46,7 @@ export function registerDMTools(mcp: McpServer) {
 
   mcp.tool(
     'hive.dm.read',
-    'Fetch a single DM in full by message_id. Use when an inbox entry or channel notification preview ends with `…(truncated; hive-dm-read message_id=N)`. Returns the full content, attachments, sender, and timestamp.',
+    'Fetch a single DM in full by message_id. Use whenever a preview contains a `[hive note]` paragraph mentioning hive-dm-read — the visible text is only the first 200/2000 characters. Returns the full content, attachments, sender, and timestamp.',
     { message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications') },
     async (params) => {
       const msg = db.getDMById(params.message_id);

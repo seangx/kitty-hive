@@ -4,6 +4,7 @@ import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import type { Agent, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
 import { ulid, generateToken, nowISO } from './utils.js';
+import { buildDMPreview, INBOX_PREVIEW_LEN } from './preview.js';
 
 let db: Database.Database;
 
@@ -556,11 +557,12 @@ export function getUnreadForAgent(agentId: string): UnreadSummary[] {
     const latest = msgs.slice(-5).map(m => {
       let attachments: any[] = [];
       try { attachments = JSON.parse(m.attachments || '[]'); } catch { /* ignore */ }
-      const INBOX_PREVIEW = 2000;
-      const truncated = m.content.length > INBOX_PREVIEW;
-      const preview = truncated
-        ? m.content.slice(0, INBOX_PREVIEW) + ` …(truncated; hive-dm-read message_id=${m.id} for full content)`
-        : m.content;
+      const { preview } = buildDMPreview({
+        content: m.content,
+        messageId: m.id,
+        attachments,
+        maxLen: INBOX_PREVIEW_LEN,
+      });
       return {
         from: sender?.display_name ?? 'unknown',
         type: 'dm',
