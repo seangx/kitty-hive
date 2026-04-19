@@ -27,6 +27,8 @@ npx kitty-hive serve
 claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 ```
 
+> **注意：** 目前**必须**带 `--dangerously-load-development-channels`，别被名字吓到删掉。Claude Code 的 `claude/channel` 能力还在 experimental，不加这个 flag，plugin 能装上但**收不到任何推送**。将来 CC 正式开放 channel 后可以去掉。
+
 首次使用让 agent 调用 `hive-whoami(name=<你的名字>)` 注册。
 也可以在环境变量里设 `HIVE_AGENT_NAME=<name>`（或 `HIVE_AGENT_ID=<id>`），channel 启动自动注册。
 
@@ -36,35 +38,44 @@ claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 # 1. 启动 server
 npx kitty-hive serve
 
-# 2. 写入 IDE 的 MCP 配置（任选：cursor | vscode | antigravity）
+# 2. 写入 IDE 的 MCP 配置（cursor | vscode | antigravity | claude | all）
 npx kitty-hive init cursor
 ```
 
 ## 工作原理
 
+每台机器各自跑一个 `kitty-hive serve` —— **没有中心节点**。本地 agent 通过 MCP 连到自己这台 hive；hive 之间通过 HTTP 对等联邦（完全对称，没有主从）。
+
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Claude Code  │    │  Claude Code  │    │  Antigravity  │
-│  agent: alice │    │  agent: bob   │    │  agent: eve   │
-└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
-        │ channel            │ channel            │ HTTP MCP
-        │ (SSE 推送)         │ (SSE 推送)          │ (手动查询)
-        └────────┬───────────┴────────┬───────────┘
-                 │                    │
-          ┌──────┴────────────────────┴──────┐
-          │     kitty-hive server (:4123)     │
-          │     SQLite · Streamable HTTP      │
-          └──────┬───────────────────┬────────┘
-                 │   federation      │
-          ┌──────┴──────┐    ┌───────┴─────┐
-          │  hive-2     │    │  hive-3     │
-          │  (远端)     │    │  (远端)     │
-          └─────────────┘    └─────────────┘
+╔═════════════════════ 你的机器 ═════════════════════════╗     ╔══════ alice 的机器 ══════════╗
+║                                                        ║     ║                              ║
+║  Claude Code       Cursor          Antigravity         ║     ║   Claude Code                ║
+║  agent: bob-local  agent: reviewer agent: worker       ║     ║   agent: alice               ║
+║       │                │                │              ║     ║        │                     ║
+║       │ channel        │ HTTP MCP       │ HTTP MCP     ║     ║        │ channel             ║
+║       │ (SSE 推送)     │ (拉取)         │ (拉取)       ║     ║        │                     ║
+║       └────────┬───────┴────────┬───────┘              ║     ║        │                     ║
+║                ▼                ▼                      ║     ║        ▼                     ║
+║        ┌────────────────────────────┐                  ║     ║  ┌──────────────────┐        ║
+║        │  kitty-hive serve (:4123)  │ ◀──── peer ───────HTTP─▶│ kitty-hive :4123 │        ║
+║        │  SQLite · Streamable HTTP  │     (Bearer 密钥) ║     ║  │                  │        ║
+║        └────────────────────────────┘                  ║     ║  └──────────────────┘        ║
+╚════════════════════════════════════════════════════════╝     ╚══════════════════════════════╝
+
+                              ▲
+                              │ peer（走 Cloudflare tunnel 或公网 IP）
+                              ▼
+                   ┌──────────────────────┐
+                   │    carol 的机器      │  ……每个 hive 完全对等
+                   │   kitty-hive :4123   │
+                   └──────────────────────┘
 ```
 
-**Claude Code** — 消息以 `<channel>` 块自动出现在对话中。
+**Claude Code** — 消息以 `<channel>` 块自动出现在对话中（SSE 推送）。
 
-**其他 IDE** — 用 `hive.inbox` 主动拉取。
+**其他 IDE（Cursor / VS Code / Antigravity / …）** — agent 主动 `hive-inbox` 拉取。
+
+**跨机器** — peer 是对称的，没有"主 hive"。配置见 [联邦](#联邦)。
 
 ## 身份模型
 
@@ -76,13 +87,14 @@ npx kitty-hive init cursor
 
 ## 工具
 
-Channel plugin 启动时自动从 server 抓取工具列表，把 `hive.team.create` 转成 kebab-case `hive-team-create` 暴露。下表两列同一组工具，channel 用 `hive-`，HTTP 用 `hive.`。
+每个 HTTP 工具 `hive.foo.bar` 都被 channel plugin 镜像成 kebab-case `hive-foo-bar`。下表两列同一组工具，在 Claude Code 里用左列（channel），直接调 HTTP MCP 用右列。
 
 ### 身份
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-whoami` | `hive.whoami` | 查看自己 agent_id / 首次注册 |
+| `hive-whoami` | `hive.whoami` | 查看自己 agent_id。**首次使用：** 传 `name` 注册（channel plugin 会透明地代理到 `hive.start`） |
+| — | `hive.start` | 底层注册 RPC。HTTP/IDE 用户直接调用（channel 用户走 `hive-whoami`） |
 | `hive-rename` | `hive.rename` | 改全局 display_name |
 | `hive-agents` | `hive.agents` | 列出所有 agent |
 
@@ -90,9 +102,10 @@ Channel plugin 启动时自动从 server 抓取工具列表，把 `hive.team.cre
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-dm` | `hive.dm` | 发私信（可带 `attach: [paths]` 传文件/图片） |
-| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件（附件元数据内嵌） |
-| `hive-file-fetch` | `hive.file.fetch` | 按 file_id 取附件；`save_to` 可指定落盘路径 |
+| `hive-dm` | `hive.dm` | 发私信。传 `attach: ["/abs/path"]` 发文件/图片（路径是**你**这台机器的；对方拿到 `file_id` 另取） |
+| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件。每条 DM 带 `message_id` + `attachments` |
+| `hive-dm-read` | `hive.dm.read` | 按 `message_id` 拉单条 DM 全文（preview 结尾 `…(truncated; hive-dm-read message_id=N)` 时用） |
+| `hive-file-fetch` | `hive.file.fetch` | 按 `file_id` 取附件；`save_to` 可复制到指定位置 |
 
 ### 团队
 
@@ -100,7 +113,7 @@ Channel plugin 启动时自动从 server 抓取工具列表，把 `hive.team.cre
 |---------|------|------|
 | `hive-team-create` | `hive.team.create` | 创建团队（可设昵称） |
 | `hive-team-join` | `hive.team.join` | 按名字或 id 加入团队 |
-| `hive-team-list` | `hive.team.list` | 列出所有开放团队 |
+| `hive-team-list` | `hive.team.list` | 列出 hive 上所有团队 |
 | `hive-teams` | `hive.teams` | 列出我所在的团队 |
 | `hive-team-info` | `hive.team.info` | 团队成员 + 最近事件 |
 | `hive-team-events` | `hive.team.events` | 增量拉取事件（`since`） |
@@ -280,7 +293,7 @@ kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
   --secret <共享密钥> --expose <win-agent-id>
 ```
 
-第一次 add 时另一边还没加你的 peer 记录，会显示 `failed: HTTP 401` —— 没事，下一次 60s 心跳两边都会转 `active`。
+这个手动流程里**双方必须粘贴一模一样的 `--secret`**。第一次 add 时另一边还没加你的 peer 记录，会显示 `failed: HTTP 401` —— 没事，下一次 60s 心跳两边都会转 `active`。
 
 </details>
 
@@ -299,10 +312,10 @@ hive-check({ task_id: "<影子任务-id>" })   // 实时同步对面进度
 
 ### 避坑
 
-- `--expose` 填的是**你这边、允许被对方联系的 agent**；不在列表里的对方完全看不到。
-- 两边的 `--secret` 必须一字不差。
-- `--expose` 接受 agent id 或唯一的 display_name；id 更稳。
-- peer status 只有 ping 成功才转 `active`；一直 `inactive`，检查对方 URL 可达 + 密钥一致。
+- `--expose` 填的是**你这边、允许被对方联系的 agent**；不在列表里的对方完全看不到。**方向容易搞反。**
+- 用 agent id 做 `--expose` 最稳；display_name 只在全局唯一时才能用。
+- "节点名"（本机 `config set name` 设的、ping 响应里带的）和 "peer 名"（你本地 peer 记录的标签，初始跟对方节点名一样，但冲突时会自动加后缀）是两回事。跨机器寻址用 agent id + 本地 peer 名：`<agent-id>@<peer-name>`。
+- peer `status` 只有 ping 成功往返才转 `active`。一直 `inactive` 多半是对方 URL 不可达，或者存的 tunnel URL 过期 —— 看下面 **Tunnel URL 自愈** 和 `kitty-hive peer set-url` 手动应急。
 
 ### 工作机制
 
@@ -333,6 +346,7 @@ kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  手动加 peer
 kitty-hive peer list                                    列出 peer
 kitty-hive peer remove <name>                           删除 peer
 kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 agent
+kitty-hive peer set-url <name> <url>                    手动更新 peer 的 URL（自动同步漏掉时应急）
 kitty-hive config set <key> <value>                     设置配置（如 name）
 kitty-hive db clear [--db path]                         清空数据库
 kitty-hive files clean [--days 7]                       清理过期联邦传输文件
@@ -353,7 +367,7 @@ kitty-hive tunnel status [--port 4123]                  查看当前注册的 tu
 | 层级 | 技术 |
 |------|------|
 | 服务端 | Node.js HTTP，有状态 session + 无状态兜底 |
-| 数据库 | SQLite WAL — agents、teams、team_members、team_events、dm_messages、tasks、task_events、read_cursors、peers |
+| 数据库 | SQLite WAL — `agents`、`teams`、`team_members`、`team_events`、`dm_messages`（含 `attachments` JSON）、`tasks`（含联邦字段）、`task_events`、`read_cursors`、`peers`、`pending_invites`、`node_state` |
 | 传输 | MCP Streamable HTTP（POST + GET SSE） |
 | 推送 | Channel plugin → `notifications/claude/channel`。跟踪活跃 SSE，丢包时打 warning |
 | 认证 | Session 绑定 · `as` 参数 · Bearer token · peer secret |

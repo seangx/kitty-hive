@@ -27,6 +27,8 @@ npx kitty-hive serve
 claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 ```
 
+> **Note:** `--dangerously-load-development-channels` is currently required — don't let the name scare you off. Claude Code's `claude/channel` capability is still experimental; without this flag the plugin installs cleanly but **push notifications never reach your conversation**. Drop it later once CC enables channels by default.
+
 On first use, ask the agent to call `hive-whoami(name=<your-name>)` to register.
 Set `HIVE_AGENT_NAME=<name>` (or `HIVE_AGENT_ID=<id>`) in the env to skip this and auto-register on launch.
 
@@ -36,35 +38,44 @@ Set `HIVE_AGENT_NAME=<name>` (or `HIVE_AGENT_ID=<id>`) in the env to skip this a
 # 1. Start server
 npx kitty-hive serve
 
-# 2. Write MCP config for your IDE (pick one: cursor | vscode | antigravity)
+# 2. Write MCP config for your IDE (cursor | vscode | antigravity | claude | all)
 npx kitty-hive init cursor
 ```
 
 ## How It Works
 
+Each machine runs its **own** `kitty-hive serve` — there is no central hub. Local agents connect to their machine's hive over MCP; hives peer with each other over HTTP for cross-machine traffic (symmetric, no parent/child).
+
 ```
-┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-│  Claude Code  │    │  Claude Code  │    │  Antigravity  │
-│  agent: alice │    │  agent: bob   │    │  agent: eve   │
-└───────┬───────┘    └───────┬───────┘    └───────┬───────┘
-        │ channel            │ channel            │ HTTP MCP
-        │ (SSE push)         │ (SSE push)         │ (pull)
-        └────────┬───────────┴────────┬───────────┘
-                 │                    │
-          ┌──────┴────────────────────┴──────┐
-          │     kitty-hive server (:4123)     │
-          │     SQLite · Streamable HTTP      │
-          └──────┬───────────────────┬────────┘
-                 │   federation      │
-          ┌──────┴──────┐    ┌───────┴─────┐
-          │  hive-2     │    │  hive-3     │
-          │  (remote)   │    │  (remote)   │
-          └─────────────┘    └─────────────┘
+╔═════════════════════ your machine ═════════════════════╗     ╔══════ alice's machine ══════╗
+║                                                        ║     ║                             ║
+║  Claude Code       Cursor          Antigravity         ║     ║   Claude Code               ║
+║  agent: bob-local  agent: reviewer agent: worker       ║     ║   agent: alice              ║
+║       │                │                │              ║     ║        │                    ║
+║       │ channel        │ HTTP MCP       │ HTTP MCP     ║     ║        │ channel            ║
+║       │ (SSE push)     │ (pull)         │ (pull)       ║     ║        │                    ║
+║       └────────┬───────┴────────┬───────┘              ║     ║        │                    ║
+║                ▼                ▼                      ║     ║        ▼                    ║
+║        ┌────────────────────────────┐                  ║     ║  ┌──────────────────┐       ║
+║        │  kitty-hive serve (:4123)  │ ◀────── peer ───────HTTP──▶│ kitty-hive :4123 │       ║
+║        │  SQLite · Streamable HTTP  │       (Bearer secret)║     │                  │       ║
+║        └────────────────────────────┘                  ║     ║  └──────────────────┘       ║
+╚════════════════════════════════════════════════════════╝     ╚═════════════════════════════╝
+
+                              ▲
+                              │ peer (over Cloudflare tunnel or public IP)
+                              ▼
+                   ┌──────────────────────┐
+                   │   carol's machine    │   ... each hive is fully symmetric
+                   │   kitty-hive :4123   │
+                   └──────────────────────┘
 ```
 
-**Claude Code** — Messages appear in your conversation automatically via channel plugin.
+**Claude Code** — Messages arrive automatically in your conversation via the channel plugin (SSE push).
 
-**Other IDEs** — Use `hive.inbox` to check for messages.
+**Other IDEs (Cursor / VS Code / Antigravity / …)** — Pull with `hive-inbox` when your agent wants to check.
+
+**Cross-machine** — Peers connect symmetrically; no "primary" hive. See [Federation](#federation) for setup.
 
 ## Identity model
 
@@ -76,13 +87,14 @@ npx kitty-hive init cursor
 
 ## Tools
 
-The channel plugin auto-mirrors HTTP server tools as kebab-case (`hive.team.create` → `hive-team-create`). The lists below are the same set, with `hive-` for channel and `hive.` for HTTP.
+Every HTTP tool `hive.foo.bar` is re-exposed by the channel plugin as kebab-case `hive-foo-bar`. Tables below pair the two spellings — use the left column inside Claude Code, the right column when calling via HTTP MCP directly.
 
 ### Identity
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-whoami` | `hive.whoami` | Show your agent id / register on first call |
+| `hive-whoami` | `hive.whoami` | Show your agent id. **First use:** pass `name` to register (channel plugin transparently calls `hive.start` under the hood). |
+| — | `hive.start` | Underlying registration RPC. HTTP/IDE users call this directly (channel users go via `hive-whoami`). |
 | `hive-rename` | `hive.rename` | Change your global display_name |
 | `hive-agents` | `hive.agents` | List all agents on the hive |
 
@@ -90,9 +102,10 @@ The channel plugin auto-mirrors HTTP server tools as kebab-case (`hive.team.crea
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-dm` | `hive.dm` | Send a direct message (optional `attach: [paths]` for files/images) |
-| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events (attachments listed inline) |
-| `hive-file-fetch` | `hive.file.fetch` | Get an attachment by file_id; optional `save_to` copies to a path |
+| `hive-dm` | `hive.dm` | Send a direct message. Pass `attach: ["/abs/path"]` to send files/images (path on YOUR machine; receiver gets a `file_id` and fetches separately). |
+| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events. Each DM entry carries `message_id` + `attachments` inline. |
+| `hive-dm-read` | `hive.dm.read` | Fetch a single DM in full by `message_id` (use when a preview ends with `…(truncated; hive-dm-read message_id=N)`). |
+| `hive-file-fetch` | `hive.file.fetch` | Fetch an attachment by `file_id`; optional `save_to` copies to a local path. |
 
 ### Teams
 
@@ -281,7 +294,7 @@ kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
   --secret <shared-secret> --expose <win-agent-id>
 ```
 
-The first `add` may print `failed: HTTP 401` because the other side hasn't added you yet — that's fine; the next 60s heartbeat will flip both to `active`.
+In this manual flow **both sides must paste the exact same `--secret`**. The first `add` may print `failed: HTTP 401` because the other side hasn't added you yet — that's fine; the next 60s heartbeat will flip both to `active`.
 
 </details>
 
@@ -300,10 +313,10 @@ Replying to an incoming federated DM **does not** need `@peer` — your local pl
 
 ### Pitfalls
 
-- `--expose` lists **the agent the *peer* should be allowed to reach** (i.e. agents on YOUR side). Anything not listed is invisible to that peer.
-- Both sides must use the exact same `--secret`.
-- `--expose` accepts agent ids or unambiguous display names; ids are safer.
-- Peer status only flips to `active` on a successful round-trip ping. If it stays `inactive`, check the URL is reachable from the other side and the secret matches.
+- `--expose` lists **the agent on YOUR side that the peer should be allowed to reach**. Everything not listed is invisible to that peer. (Easy to get backwards.)
+- Agent ids are the safest value for `--expose`. Display names work only if globally unambiguous.
+- "Node name" (set by `config set name`, shown in ping responses) vs "peer name" (local label for a peer in your DB, starts as their node name but may be suffixed if it clashes with an existing peer). Use agent id + local peer name for addressing: `<agent-id>@<peer-name>`.
+- Peer `status` flips to `active` only on a successful round-trip ping. If it stays `inactive`, either the URL is unreachable or the stored tunnel URL has gone stale — see the **Tunnel URL self-heal** section in [How it works](#how-it-works-1) and `kitty-hive peer set-url` as manual recovery.
 
 ### How it works
 
@@ -334,6 +347,7 @@ kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer manuall
 kitty-hive peer list                                    List peers
 kitty-hive peer remove <name>                           Remove a peer
 kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
+kitty-hive peer set-url <name> <url>                    Manually update a peer's URL (when auto-sync missed it)
 kitty-hive config set <key> <value>                     Set config (e.g. name)
 kitty-hive db clear [--db path]                         Clear the database
 kitty-hive files clean [--days 7]                       Remove old federation transfer files
@@ -354,7 +368,7 @@ kitty-hive tunnel status [--port 4123]                  Show currently registere
 | Layer | Tech |
 |-------|------|
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
-| Database | SQLite WAL — agents, teams, team_members, team_events, dm_messages, tasks, task_events, read_cursors, peers |
+| Database | SQLite WAL — `agents`, `teams`, `team_members`, `team_events`, `dm_messages` (with `attachments` JSON), `tasks` (with federation link fields), `task_events`, `read_cursors`, `peers`, `pending_invites`, `node_state` |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
 | Push | Channel plugin → `notifications/claude/channel`. Live SSE tracking; warns when push is dropped |
 | Auth | Session binding · `as` param · Bearer token · peer secret |
