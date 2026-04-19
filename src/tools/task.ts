@@ -206,6 +206,13 @@ export async function handleStepCompleteAsync(taskId: string, agentId: string, s
   return action;
 }
 
+export async function handleStepApproveAsync(taskId: string, agentId: string): Promise<WorkflowAction> {
+  const action = handleStepApprove(taskId, agentId);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'step-approve', { step: task.current_step });
+  return action;
+}
+
 export async function handleWorkflowRejectAsync(taskId: string, agentId: string, stepNum: number, reason?: string): Promise<WorkflowAction> {
   const action = handleWorkflowReject(taskId, agentId, stepNum, reason);
   const task = getTaskById(taskId);
@@ -291,9 +298,11 @@ export function handleWorkflowPropose(taskId: string, agentId: string, workflow:
 // --- Workflow: approve ---
 
 export interface WorkflowAction {
-  type: 'step-start' | 'task-complete';
+  type: 'step-start' | 'task-complete' | 'awaiting_approval';
   step?: number;
   assignees?: string[];
+  /** When type === 'awaiting_approval', the agent id that must call hive-workflow-step-approve. */
+  approver?: string;
 }
 
 export function handleWorkflowApprove(taskId: string, agentId: string): WorkflowAction {
@@ -340,6 +349,13 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
   updateTaskStatus(taskId, task.status, { workflow_json: JSON.stringify(steps) });
 
   if (shouldAdvanceStep(step)) {
+    // Gated step: pause for the creator's hive-workflow-step-approve.
+    // current_step stays on the gated step so the creator can target it
+    // unambiguously; status flips to awaiting_approval.
+    if (step.gate) {
+      updateTaskStatus(taskId, 'awaiting_approval');
+      return { type: 'awaiting_approval', step: stepNum, approver: task.creator_agent_id };
+    }
     const nextStepNum = stepNum + 1;
     if (nextStepNum > steps.length) {
       validateWorkflowTransition(task.status as TaskStatus, 'task-complete');
@@ -358,6 +374,39 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
   }
 
   return null;
+}
+
+// --- Workflow: step approve (gate release) ---
+
+export function handleStepApprove(taskId: string, agentId: string): WorkflowAction {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (!task.workflow_json) throw new Error('No workflow defined');
+  if (task.creator_agent_id !== agentId) throw new Error('Only the task creator can approve a gated step');
+  if (task.status !== 'awaiting_approval') throw new Error(`Task is not awaiting approval (status: ${task.status})`);
+
+  validateWorkflowTransition(task.status as TaskStatus, 'step-approve');
+
+  const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
+  const completedStepNum = task.current_step;
+  const completedStep = steps.find(s => s.step === completedStepNum);
+  if (!completedStep) throw new Error(`Step ${completedStepNum} not found`);
+
+  appendTaskEvent(taskId, 'step-approve', agentId, { step: completedStepNum });
+
+  const nextStepNum = completedStepNum + 1;
+  if (nextStepNum > steps.length) {
+    // Last step was gated → completion was deferred to here.
+    validateWorkflowTransition(task.status as TaskStatus, 'task-complete');
+    updateTaskStatus(taskId, 'completed', { completed_at: new Date().toISOString() });
+    appendTaskEvent(taskId, 'task-complete', null, {});
+    return { type: 'task-complete' };
+  }
+
+  const nextStep = steps[nextStepNum - 1];
+  updateTaskStatus(taskId, 'in_progress', { current_step: nextStepNum });
+  appendTaskEvent(taskId, 'step-start', null, { step: nextStepNum, assignees: nextStep.assignees });
+  return { type: 'step-start', step: nextStepNum, assignees: nextStep.assignees };
 }
 
 // --- Workflow: reject ---

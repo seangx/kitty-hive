@@ -62,6 +62,7 @@ export type TaskStatus =
   | 'proposing'
   | 'approved'
   | 'in_progress'
+  | 'awaiting_approval'   // gated step finished; waiting for creator's hive-workflow-step-approve
   | 'completed'
   | 'failed'
   | 'canceled';
@@ -88,7 +89,7 @@ export interface Task {
 export const TASK_EVENT_TYPES = [
   'task-start', 'task-claim', 'task-update',
   'task-propose', 'task-approve', 'task-reject',
-  'step-start', 'step-complete',
+  'step-start', 'step-complete', 'step-approve',
   'task-complete', 'task-fail', 'task-cancel',
 ] as const;
 export type TaskEventType = typeof TASK_EVENT_TYPES[number];
@@ -110,5 +111,8 @@ export interface WorkflowStep {
   action: string;
   completion: 'all' | 'any';
   on_reject?: 'revise' | `back:${number}`;
+  /** When true, after this step's assignees all finish the task pauses in
+   *  status `awaiting_approval` until the creator calls hive-workflow-step-approve. */
+  gate?: boolean;
   completed_by: string[];
 }

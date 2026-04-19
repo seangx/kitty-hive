@@ -128,10 +128,11 @@ npx kitty-hive init cursor
 | `hive-task-claim` | `hive.task.claim` | 认领未分配任务 |
 | `hive-tasks` | `hive.tasks` | 任务看板 |
 | `hive-check` | `hive.check` | 查看任务状态 |
-| `hive-workflow-propose` | `hive.workflow.propose` | 提出工作流方案 |
-| `hive-workflow-approve` | `hive.workflow.approve` | 批准（仅创建者） |
-| `hive-workflow-step-complete` | `hive.workflow.step.complete` | 完成步骤 |
-| `hive-workflow-reject` | `hive.workflow.reject` | 拒绝并回退 |
+| `hive-workflow-propose` | `hive.workflow.propose` | 提出工作流方案；每步可设 `gate: true` → 完成后停在 `awaiting_approval` 等创建者放行 |
+| `hive-workflow-approve` | `hive.workflow.approve` | 批准提案（仅创建者） |
+| `hive-workflow-step-complete` | `hive.workflow.step.complete` | 完成步骤（gated 步骤会进入 `awaiting_approval`） |
+| `hive-workflow-step-approve` | `hive.workflow.step.approve` | 放行 gated 步骤的暂停（仅创建者） |
+| `hive-workflow-reject` | `hive.workflow.reject` | 拒绝并回退（在 `in_progress` 和 `awaiting_approval` 都可调用） |
 
 ### 联邦
 

@@ -40,6 +40,12 @@ const WORKFLOW_TRANSITIONS: Record<string, TaskStatus> = {
   'proposing:task-cancel': 'canceled',
   'approved:task-cancel': 'canceled',
   'in_progress:task-cancel': 'canceled',
+  // Gate flow
+  'awaiting_approval:step-approve': 'in_progress',
+  'awaiting_approval:step-start': 'in_progress',
+  'awaiting_approval:task-complete': 'completed',
+  'awaiting_approval:task-reject': 'in_progress',
+  'awaiting_approval:task-cancel': 'canceled',
 };
 
 export function validateWorkflowTransition(current: TaskStatus, event: TaskEventType): TaskStatus {

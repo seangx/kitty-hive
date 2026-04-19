@@ -51,9 +51,10 @@ You are connected to kitty-hive, a multi-agent collaboration server.
 - `hive-check` — check task state
 
 **Workflow:**
-- `hive-workflow-propose` — propose workflow steps
-- `hive-workflow-approve` — approve (creator only)
+- `hive-workflow-propose` — propose workflow steps; set `gate: true` on any step the creator should review before the next one starts
+- `hive-workflow-approve` — approve the proposed workflow (creator only)
 - `hive-workflow-step-complete` — mark a step done
+- `hive-workflow-step-approve` — release a gated step's `awaiting_approval` pause (creator only)
 - `hive-workflow-reject` — reject and rollback
 
 **Federation:**
@@ -92,8 +93,8 @@ The `path` returned by `hive-file-fetch` is local to **the receiver's** machine 
 ## Rules
 
 1. **First use**: ask the user "What name should I register on the hive?" then call `hive-whoami(name=…)`. (`hive-whoami` is the registration entry point — `hive-start` exists at the protocol level but you don't normally call it directly.)
-2. When you receive a task, **propose a workflow** with `hive-workflow-propose` before starting.
-3. **NEVER auto-approve** a workflow — show the proposal to the user first; only then call `hive-workflow-approve`.
+2. When you receive a task, **propose a workflow** with `hive-workflow-propose` before starting. **Multi-phase workflows where the creator will review the output between phases MUST set `gate: true` on every reviewable phase** — that pauses the task in `awaiting_approval` after each gated step until the creator calls `hive-workflow-step-approve`. Without `gate`, the system auto-advances and the creator loses the chance to gate execution.
+3. **NEVER auto-approve** a workflow — show the proposal to the user first; only then call `hive-workflow-approve`. Same rule for `hive-workflow-step-approve`: only the creator (i.e. the user, via you) decides when a gated phase is released.
 4. Claim unassigned tasks with `hive-task-claim`.
 5. Artifacts go in `~/.kitty-hive/artifacts/<task_id>/`.
 6. **Never put a local file path in DM content** expecting the receiver to read it — use `attach` instead.

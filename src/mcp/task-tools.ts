@@ -4,7 +4,7 @@ import {
   handleTaskCreateAsync, handleCheck,
   handleTaskClaimAsync,
   handleWorkflowProposeAsync, handleWorkflowApproveAsync,
-  handleStepCompleteAsync, handleWorkflowRejectAsync,
+  handleStepCompleteAsync, handleStepApproveAsync, handleWorkflowRejectAsync,
 } from '../tools/task.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents, notifyTaskParticipants } from '../sessions.js';
@@ -55,7 +55,7 @@ export function registerTaskTools(mcp: McpServer) {
     'List tasks you created or are assigned to.',
     {
       as: asParam,
-      status: z.string().optional().describe('Filter by status. Valid values: created, proposing, approved, in_progress, completed, failed, canceled.'),
+      status: z.string().optional().describe('Filter by status. Valid values: created, proposing, approved, in_progress, awaiting_approval, completed, failed, canceled.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
@@ -85,7 +85,10 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive.workflow.propose',
-    'Propose a workflow for a task. Creator must approve before steps start.',
+    'Propose a workflow for a task. Creator must approve before steps start. ' +
+    'For multi-phase workflows where the user (creator) will want to review the output between phases, ' +
+    'set `gate: true` on each phase — the task then pauses in status `awaiting_approval` after each gated step ' +
+    'until the creator calls hive-workflow-step-approve. Default (no gate) auto-advances to the next step.',
     {
       as: asParam,
       task_id: z.string().describe('Task id'),
@@ -96,6 +99,7 @@ export function registerTaskTools(mcp: McpServer) {
         action: z.string(),
         completion: z.enum(['all', 'any']).default('all'),
         on_reject: z.string().optional().describe('What happens if THIS step is rejected. "revise" → re-do the same step (default). "back:N" → roll all the way back to step N (e.g. "back:1").'),
+        gate: z.boolean().optional().describe('When true, after this step\'s assignees all finish the task pauses in `awaiting_approval` until the creator calls hive-workflow-step-approve. Use this for phases the creator will review before letting the next step start.'),
       })).describe('Workflow steps'),
     },
     async (params, extra) => {
@@ -128,7 +132,7 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive.workflow.step.complete',
-    'Mark your part of the current step as complete.',
+    'Mark your part of the current step as complete. If the step has `gate: true` and you were the last assignee, the task enters `awaiting_approval` instead of auto-advancing — the creator must call hive-workflow-step-approve to release the gate.',
     {
       as: asParam,
       task_id: z.string().describe('Task id'),
@@ -140,14 +144,49 @@ export function registerTaskTools(mcp: McpServer) {
       if (!agent) return authError();
       const action = await handleStepCompleteAsync(params.task_id, agent.id, params.step, params.result);
       const resultPreview = params.result && params.result.length > 200 ? params.result.slice(0, 200) + ' [summary]' : params.result;
-      const msg = action?.type === 'task-complete' ? 'Task completed!'
-        : action?.type === 'step-start' ? `Step ${action.step} started. Previous result: ${resultPreview || 'none'}`
-        : `Step ${params.step} progress recorded`;
+      let msg: string;
+      if (action?.type === 'task-complete') {
+        msg = 'Task completed!';
+      } else if (action?.type === 'step-start') {
+        msg = `Step ${action.step} started. Previous result: ${resultPreview || 'none'}`;
+      } else if (action?.type === 'awaiting_approval') {
+        const approver = action.approver ? db.getAgentById(action.approver)?.display_name ?? action.approver : 'creator';
+        msg = `[hive note] Step ${action.step} complete — awaiting approval from ${approver}.\n` +
+              `- Continue: hive-workflow-step-approve({ task_id: "${params.task_id}" })\n` +
+              `- Rework:   hive-workflow-reject({ task_id: "${params.task_id}", step: ${action.step}, reason: "..." })\n` +
+              `Do not start the next step until the gate is released.`;
+      } else {
+        msg = `Step ${params.step} progress recorded`;
+      }
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: action?.type || 'step-complete', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: msg,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action: action || 'waiting' }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive.workflow.step.approve',
+    'Release a gated step\'s `awaiting_approval` pause. Creator-only. ' +
+    'Call this after reviewing the output of a step that was proposed with `gate: true`. ' +
+    'Advances to the next step (or completes the task if it was the last step).',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task id'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const action = await handleStepApproveAsync(params.task_id, agent.id);
+      const msg = action.type === 'task-complete'
+        ? 'Task completed (final gated step approved)!'
+        : `Step ${action.step} started (gate released by ${agent.display_name}).`;
+      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: action.type, from_agent_id: agent.id, from: agent.display_name,
+        task_id: params.task_id, preview: msg,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
     },
   );
 

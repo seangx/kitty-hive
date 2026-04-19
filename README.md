@@ -128,10 +128,11 @@ Every HTTP tool `hive.foo.bar` is re-exposed by the channel plugin as kebab-case
 | `hive-task-claim` | `hive.task.claim` | Claim an unassigned task |
 | `hive-tasks` | `hive.tasks` | List your tasks |
 | `hive-check` | `hive.check` | Check task status |
-| `hive-workflow-propose` | `hive.workflow.propose` | Propose workflow steps |
-| `hive-workflow-approve` | `hive.workflow.approve` | Approve (creator only) |
-| `hive-workflow-step-complete` | `hive.workflow.step.complete` | Complete a step |
-| `hive-workflow-reject` | `hive.workflow.reject` | Reject & rollback |
+| `hive-workflow-propose` | `hive.workflow.propose` | Propose workflow steps; set `gate: true` per step to pause for creator review |
+| `hive-workflow-approve` | `hive.workflow.approve` | Approve the proposed workflow (creator only) |
+| `hive-workflow-step-complete` | `hive.workflow.step.complete` | Complete a step (gated step → enters `awaiting_approval`) |
+| `hive-workflow-step-approve` | `hive.workflow.step.approve` | Release a gated step's pause (creator only) |
+| `hive-workflow-reject` | `hive.workflow.reject` | Reject & rollback (works in `in_progress` and `awaiting_approval`) |
 
 ### Federation
 
