@@ -333,26 +333,30 @@ npm run test:federation
 
 ## 命令行
 
+直接 `kitty-hive` 看总览，`kitty-hive <group>`（例如 `kitty-hive peer`）只看该分组的子命令。在 TTY 下，缺失的参数会以交互式 prompt 方式补齐；脚本里把 flag 都传上即可保持非交互。
+
 ```
-kitty-hive serve [--port 4123] [--db path] [-v|-q]     启动服务
-kitty-hive init <tool> [--port 4123]                    写入 MCP 配置（claude|cursor|vscode|antigravity|all）
-kitty-hive status [--port 4123]                         服务/agent/team 状态
-kitty-hive agent list                                   列出 agent
-kitty-hive agent rename <old> <new>                     重命名 agent
-kitty-hive agent remove <name-or-id>                    删除 agent
-kitty-hive peer invite --expose <my-agent> [--url url]      生成 invite token（推荐）
-kitty-hive peer accept <token> --expose <my-agent> [--url url]  接受 invite，自动握手
-kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  手动加 peer
-kitty-hive peer list                                    列出 peer
-kitty-hive peer remove <name>                           删除 peer
-kitty-hive peer expose <name> --add/--remove <agent>    管理 peer 暴露的 agent
-kitty-hive peer set-url <name> <url>                    手动更新 peer 的 URL（自动同步漏掉时应急）
-kitty-hive config set <key> <value>                     设置配置（如 name）
-kitty-hive db clear [--db path]                         清空数据库
-kitty-hive files clean [--days 7]                       清理过期联邦传输文件
-kitty-hive tunnel start [--port 4123]                   启动 cloudflared，自动注册 URL 给 hive
-kitty-hive tunnel status [--port 4123]                  查看当前注册的 tunnel URL
+kitty-hive serve   [--port 4123] [--db path] [-v|-q]                 启动 MCP server
+kitty-hive init    [tool] [--port 4123]                              写入 MCP 配置（无 tool 时弹 select）
+kitty-hive status  [--port 4123]                                     服务/agent/team 状态
+
+kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
+kitty-hive peer    invite [--expose <agent>]
+                   accept [<token>] [--expose <agent>]
+                   add    [<name>] [<url>] [--expose a,b] [--secret s]
+                   list
+                   expose  [<name>] [<id1,id2,...> | --clear]       查看 / 替换 expose 列表
+                                                                    （TTY → 多选；非 TTY → 打印当前）
+                   set-url [<name>] [<url>]                          自动同步漏掉时手动改
+                   remove  [<name>]
+kitty-hive tunnel  start  [--port 4123] [--name name]                启动 cloudflared，自动把 URL 注册给 hive
+                   status [--port 4123]                              查看当前注册的 tunnel URL
+kitty-hive config  set    [key] [value]                              设置配置（如 `name`）
+kitty-hive files   clean  [--days 7]                                 清理过期联邦传输文件
+kitty-hive db      clear  [--db path]                                清空数据库
 ```
+
+`peer expose` / `peer add --expose` 现在只接受真实存在的本地 agent ID —— 拼错或填了远端 placeholder 都会被直接拒掉。
 
 ## 环境变量
 

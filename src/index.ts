@@ -5,11 +5,14 @@ import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByNam
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
+import {
+  askText, askSelect, askMultiselect, askConfirm,
+  pickLocalAgent, pickLocalAgents, pickPeer, isLocalAgent, isInteractive,
+} from './interactive.js';
 import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
 import { join, dirname, basename, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
-import { createInterface } from 'node:readline';
 import { execSync } from 'node:child_process';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -31,17 +34,6 @@ function parseFlags(startIdx: number) {
     }
   }
   return { port, dbPath };
-}
-
-async function ask(question: string, defaultValue?: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout });
-  const suffix = defaultValue ? ` (${defaultValue})` : '';
-  return new Promise(resolve => {
-    rl.question(`${question}${suffix}: `, answer => {
-      rl.close();
-      resolve(answer.trim() || defaultValue || '');
-    });
-  });
 }
 
 // --- Commands ---
@@ -149,13 +141,33 @@ function showInitUsage() {
 }
 
 async function cmdInit() {
-  const tool = args[1];
-  if (!tool || tool.startsWith('-')) {
-    showInitUsage();
-    process.exit(1);
+  const known = (ALL_INIT_TARGETS as readonly string[]);
+  let tool = args[1] && !args[1].startsWith('-') ? args[1] : '';
+
+  let port = 4123;
+  for (let i = 2; i < args.length; i++) {
+    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
+      port = parseInt(args[i + 1], 10) || 4123; i++;
+    }
   }
 
-  const known = (ALL_INIT_TARGETS as readonly string[]);
+  if (!tool) {
+    if (!isInteractive()) {
+      showInitUsage();
+      process.exit(1);
+    }
+    tool = await askSelect<string>({
+      message: 'Which tool should we configure?',
+      options: [
+        { value: 'claude', label: 'Claude Code', hint: '.mcp.json (prefer the plugin if installed)' },
+        { value: 'cursor', label: 'Cursor', hint: '.cursor/mcp.json' },
+        { value: 'vscode', label: 'VS Code Copilot', hint: '.vscode/mcp.json' },
+        { value: 'antigravity', label: 'Antigravity', hint: 'snippet — paste via MCP Store UI' },
+        { value: 'all', label: 'All of the above' },
+      ],
+    });
+  }
+
   let targets: typeof ALL_INIT_TARGETS[number][];
   if (tool === 'all') {
     targets = [...ALL_INIT_TARGETS];
@@ -165,13 +177,6 @@ async function cmdInit() {
     console.log(`Unknown tool: "${tool}"`);
     showInitUsage();
     process.exit(1);
-  }
-
-  let port = 4123;
-  for (let i = 2; i < args.length; i++) {
-    if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) {
-      port = parseInt(args[i + 1], 10) || 4123; i++;
-    }
   }
 
   console.log(`🐝 Configuring hive → http://localhost:${port}/mcp\n`);
@@ -331,8 +336,11 @@ async function cmdDbClear() {
     process.exit(0);
   }
 
-  const confirm = await ask(`Delete ${resolvedPath}? (y/n)`, 'n');
-  if (confirm.toLowerCase() !== 'y') {
+  const ok = await askConfirm({
+    message: `Delete ${resolvedPath}?`,
+    initialValue: false,
+  });
+  if (!ok) {
     console.log('Cancelled.');
     process.exit(0);
   }
@@ -347,27 +355,36 @@ async function cmdDbClear() {
 async function cmdAgentRemove() {
   const { dbPath } = parseFlags(1);
   const target = args[2];
-  if (!target) {
-    console.log('Usage: kitty-hive agent remove <name-or-id>');
-    process.exit(1);
-  }
-
   const db = initDB(dbPath);
-  const matches = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').all(target, target) as any[];
-  if (matches.length === 0) {
-    console.log(`Agent "${target}" not found.`);
-    process.exit(1);
+
+  let agent: { id: string; display_name: string };
+  if (!target) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive agent remove <name-or-id>');
+      process.exit(1);
+    }
+    const id = await pickLocalAgent(db, 'Remove which agent?');
+    agent = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(id) as any;
+  } else {
+    const matches = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').all(target, target) as any[];
+    if (matches.length === 0) {
+      console.log(`Agent "${target}" not found.`);
+      process.exit(1);
+    }
+    if (matches.length > 1) {
+      console.log(`"${target}" matches ${matches.length} agents. Use id to disambiguate.`);
+      for (const m of matches) console.log(`  ${m.id}  ${m.display_name}`);
+      process.exit(1);
+    }
+    agent = matches[0];
   }
-  if (matches.length > 1) {
-    console.log(`"${target}" matches ${matches.length} agents. Use id to disambiguate.`);
-    for (const m of matches) console.log(`  ${m.id}  ${m.display_name}`);
-    process.exit(1);
-  }
-  const agent = matches[0];
   const name = agent.display_name;
 
-  const confirm = await ask(`Remove agent "${name}" and all related data? (y/n)`, 'n');
-  if (confirm.toLowerCase() !== 'y') {
+  const ok = await askConfirm({
+    message: `Remove agent "${name}" (${agent.id}) and all related data?`,
+    initialValue: false,
+  });
+  if (!ok) {
     console.log('Cancelled.');
     process.exit(0);
   }
@@ -397,24 +414,46 @@ async function cmdAgentRemove() {
 async function cmdAgentRename() {
   const { dbPath } = parseFlags(1);
   const oldName = args[2];
-  const newName = args[3];
-  if (!oldName || !newName) {
-    console.log('Usage: kitty-hive agent rename <old-name> <new-name>');
-    process.exit(1);
+  let newName: string | undefined = args[3];
+  const db = initDB(dbPath);
+
+  let agentId: string;
+  let oldDisplay: string;
+  if (!oldName) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive agent rename <old-name-or-id> <new-name>');
+      process.exit(1);
+    }
+    agentId = await pickLocalAgent(db, 'Rename which agent?');
+    oldDisplay = (db.prepare('SELECT display_name FROM agents WHERE id = ?').get(agentId) as any).display_name;
+  } else {
+    const matches = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ? OR id = ?').all(oldName, oldName) as any[];
+    if (matches.length === 0) {
+      console.log(`Agent "${oldName}" not found.`);
+      process.exit(1);
+    }
+    if (matches.length > 1) {
+      console.log(`"${oldName}" matches ${matches.length} agents. Use agent id to disambiguate.`);
+      process.exit(1);
+    }
+    agentId = matches[0].id;
+    oldDisplay = matches[0].display_name;
   }
 
-  const db = initDB(dbPath);
-  const matches = db.prepare('SELECT id FROM agents WHERE display_name = ? OR id = ?').all(oldName, oldName) as Array<{ id: string }>;
-  if (matches.length === 0) {
-    console.log(`Agent "${oldName}" not found.`);
-    process.exit(1);
+  if (!newName) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive agent rename <old-name-or-id> <new-name>');
+      process.exit(1);
+    }
+    newName = await askText({
+      message: `New name for "${oldDisplay}"`,
+      placeholder: oldDisplay,
+      validate: (v) => ((v ?? '').trim().length === 0 ? 'Name cannot be empty' : undefined),
+    });
   }
-  if (matches.length > 1) {
-    console.log(`"${oldName}" matches ${matches.length} agents. Use agent id to disambiguate.`);
-    process.exit(1);
-  }
-  db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, matches[0].id);
-  console.log(`✅ Renamed "${oldName}" → "${newName}".`);
+
+  db.prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, agentId);
+  console.log(`✅ Renamed "${oldDisplay}" → "${newName}".`);
 }
 
 async function cmdAgentList() {
@@ -473,18 +512,56 @@ async function cmdPeerAdd() {
     }
   }
 
-  if (!peerName || !peerUrl) {
-    console.log('Usage: kitty-hive peer add <name> <url> [--expose agent1,agent2] [--secret s]');
-    process.exit(1);
-  }
+  const db = initDB(dbPath);
 
-  initDB(dbPath);
+  if (!peerName || !peerUrl) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer add <name> <url> [--expose agent1,agent2] [--secret s]');
+      process.exit(1);
+    }
+    if (!peerName) {
+      peerName = await askText({
+        message: 'Peer name (a label for this peer on your side)',
+        validate: (v) => {
+          const t = (v ?? '').trim();
+          if (!t) return 'Name cannot be empty';
+          if (getPeerByName(t)) return `Peer "${t}" already exists`;
+          return undefined;
+        },
+      });
+    }
+    if (!peerUrl) {
+      peerUrl = await askText({
+        message: 'Peer URL (e.g. https://xxx.trycloudflare.com/mcp)',
+        validate: (v) => (!/^https?:\/\//.test((v ?? '').trim()) ? 'URL must start with http:// or https://' : undefined),
+      });
+    }
+  }
 
   if (getPeerByName(peerName)) {
     console.log(`Peer "${peerName}" already exists. Remove it first.`);
     process.exit(1);
   }
 
+  // Interactive: pick exposed agents from local list (skips the bug where you
+  // could pass non-existent IDs).
+  if (!exposed && isInteractive()) {
+    const picked = await pickLocalAgents(db, 'Which local agents should this peer be allowed to reach?');
+    exposed = picked.join(',');
+  }
+
+  if (!secret && isInteractive()) {
+    const provideSecret = await askConfirm({
+      message: 'Use an existing secret? (No = generate one for you)',
+      initialValue: false,
+    });
+    if (provideSecret) {
+      secret = await askText({
+        message: 'Paste shared secret',
+        validate: (v) => ((v ?? '').trim().length < 8 ? 'Secret looks too short' : undefined),
+      });
+    }
+  }
   if (!secret) {
     secret = 'sk_' + generateToken().slice(0, 32);
   }
@@ -493,7 +570,7 @@ async function cmdPeerAdd() {
   console.log(`🤝 Peer added: ${peerName}`);
   console.log(`   URL: ${peerUrl}`);
   console.log(`   Secret: ${secret}`);
-  console.log(`   Exposed agents: ${exposed || 'none (use --expose to add)'}`);
+  console.log(`   Exposed agents: ${exposed || 'none (use `peer expose` later)'}`);
 
   // Verify reachability via /federation/ping
   process.stdout.write(`   Pinging…`);
@@ -532,16 +609,30 @@ async function cmdPeerList() {
 
 async function cmdPeerRemove() {
   const { dbPath } = parseFlags(1);
-  const name = args[2];
-  if (!name) {
-    console.log('Usage: kitty-hive peer remove <name>');
-    process.exit(1);
-  }
+  let name = args[2];
   initDB(dbPath);
+
+  if (!name) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer remove <name>');
+      process.exit(1);
+    }
+    name = await pickPeer('Remove which peer?');
+    const ok = await askConfirm({
+      message: `Remove peer "${name}"?`,
+      initialValue: false,
+    });
+    if (!ok) {
+      console.log('Cancelled.');
+      process.exit(0);
+    }
+  }
+
   if (removePeer(name)) {
     console.log(`✅ Peer "${name}" removed.`);
   } else {
     console.log(`Peer "${name}" not found.`);
+    process.exit(1);
   }
 }
 
@@ -575,12 +666,16 @@ async function ensureNodeName(): Promise<string> {
   const explicit = getNodeConfig().name;
   if (explicit) return explicit;
   const defaultName = hostname().split('.')[0];
-  if (!process.stdin.isTTY) {
+  if (!isInteractive()) {
     // Non-interactive (e.g. systemd) — silently use hostname
     return defaultName;
   }
   console.log(`\n📛 No node name set. Peers will see you under this name.`);
-  const answer = (await ask(`   Node name`, defaultName)).trim() || defaultName;
+  const answer = (await askText({
+    message: 'Node name',
+    placeholder: defaultName,
+    initialValue: defaultName,
+  })).trim() || defaultName;
   setNodeConfig({ name: answer });
   console.log(`   → saved (kitty-hive config set name ${answer})\n`);
   return answer;
@@ -705,16 +800,24 @@ async function cmdPeerInvite() {
     else if (args[i] === '--url' && args[i + 1]) { url = args[i + 1]; i++; }
     else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
   }
+
+  const db = initDB(dbPath);
+  cleanupExpiredInvites();
+
   if (!exposed) {
-    console.log('Usage: kitty-hive peer invite --expose <my-agent-id>');
-    console.log('  --expose  YOUR local agent that the peer should be allowed to reach');
-    console.log('');
-    console.log('  Cross-machine? Run `kitty-hive tunnel start` first; the URL will be picked up');
-    console.log('  automatically. (Advanced: --url <https://.../mcp> overrides.)');
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer invite --expose <my-agent-id>');
+      console.log('  --expose  YOUR local agent that the peer should be allowed to reach');
+      console.log('');
+      console.log('  Cross-machine? Run `kitty-hive tunnel start` first; the URL will be picked up');
+      console.log('  automatically. (Advanced: --url <https://.../mcp> overrides.)');
+      process.exit(1);
+    }
+    exposed = await pickLocalAgent(db, 'Which local agent should the invitee be allowed to reach?');
+  } else if (!isLocalAgent(db, exposed)) {
+    console.log(`❌ Agent "${exposed}" is not a local agent (must be one registered on this hive).`);
     process.exit(1);
   }
-  initDB(dbPath);
-  cleanupExpiredInvites();
 
   // Resolve URL: explicit --url > tunnel URL stored by `kitty-hive tunnel start`.
   // Refuse if neither — invites are only meaningful across machines.
@@ -757,21 +860,36 @@ async function cmdPeerAccept() {
     else if ((args[i] === '--port' || args[i] === '-p') && args[i + 1]) { port = parseInt(args[i + 1], 10) || 4123; i++; }
     else if (!args[i].startsWith('-') && !token) token = args[i];
   }
-  if (!token || !myExposed) {
-    console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id>');
-    console.log('  --expose  YOUR local agent that the inviter should be allowed to reach');
-    console.log('');
-    console.log('  Cross-machine? Run `kitty-hive tunnel start` first; the URL will be picked up');
-    console.log('  automatically. (Advanced: --url <https://.../mcp> overrides.)');
-    console.log('  (The token already contains the inviter\'s URL, secret, and exposed agent.)');
-    process.exit(1);
+
+  const db = initDB(dbPath);
+
+  if (!token) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id>');
+      console.log('  (Token must be provided as a positional argument or interactively.)');
+      process.exit(1);
+    }
+    token = await askText({
+      message: 'Paste invite token (starts with hive://)',
+      validate: (v) => (!(v ?? '').trim().startsWith('hive://') ? 'Token must start with hive://' : undefined),
+    });
   }
 
   let invite: InvitePayload;
   try { invite = decodeInvite(token); }
   catch (err) { console.log(`Invalid invite: ${(err as any).message}`); process.exit(1); }
 
-  initDB(dbPath);
+  if (!myExposed) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer accept <token> --expose <my-agent-id>');
+      console.log('  --expose  YOUR local agent that the inviter should be allowed to reach');
+      process.exit(1);
+    }
+    myExposed = await pickLocalAgent(db, 'Which local agent should the inviter be allowed to reach?');
+  } else if (!isLocalAgent(db, myExposed)) {
+    console.log(`❌ Agent "${myExposed}" is not a local agent on this hive.`);
+    process.exit(1);
+  }
   console.log(`✓ Decoded invite from "${invite.n}"`);
   console.log(`  Their URL: ${invite.u}`);
   console.log(`  Their exposed agent: ${invite.e}\n`);
@@ -845,19 +963,35 @@ async function cmdPeerAccept() {
 
 async function cmdPeerSetUrl() {
   const { dbPath } = parseFlags(1);
-  const peerName = args[2];
+  let peerName = args[2];
   let newUrl = args[3];
-  if (!peerName || !newUrl) {
-    console.log('Usage: kitty-hive peer set-url <peer-name> <new-url>');
-    console.log('  Use this when a peer\'s tunnel URL changes and the auto-sync didn\'t reach you');
-    console.log('  (e.g. you were both offline at the same time).');
-    process.exit(1);
-  }
   initDB(dbPath);
+
+  if (!peerName) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer set-url <peer-name> <new-url>');
+      console.log('  Use this when a peer\'s tunnel URL changes and the auto-sync didn\'t reach you');
+      process.exit(1);
+    }
+    peerName = await pickPeer('Which peer\'s URL needs updating?');
+  }
   const peer = getPeerByName(peerName);
   if (!peer) {
     console.log(`Peer "${peerName}" not found.`);
     process.exit(1);
+  }
+
+  if (!newUrl) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer set-url <peer-name> <new-url>');
+      process.exit(1);
+    }
+    newUrl = await askText({
+      message: `New URL for "${peerName}"`,
+      placeholder: peer.url,
+      initialValue: peer.url,
+      validate: (v) => (!/^https?:\/\//i.test((v ?? '').trim()) ? 'URL must start with http:// or https://' : undefined),
+    });
   }
   if (!/^https?:\/\//i.test(newUrl)) {
     console.log(`URL must start with http:// or https:// — got "${newUrl}"`);
@@ -887,12 +1021,36 @@ async function cmdPeerSetUrl() {
 
 async function cmdPeerExpose() {
   const { dbPath } = parseFlags(1);
-  const peerName = args[2];
-  if (!peerName) {
-    console.log('Usage: kitty-hive peer expose <peer> --add/--remove <agent>');
-    process.exit(1);
+  // Usage:
+  //   peer expose <name>                  TTY → multiselect; non-TTY → show current
+  //   peer expose <name> id1,id2,id3      Replace exposure list (script-friendly)
+  //   peer expose <name> --clear          Empty the exposure list
+  let peerName = '';
+  let replacement: string | null = null;
+  let clear = false;
+
+  let positional = 0;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--clear') { clear = true; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-')) {
+      if (positional === 0) peerName = args[i];
+      else if (positional === 1) replacement = args[i];
+      positional++;
+    }
   }
-  initDB(dbPath);
+
+  const db = initDB(dbPath);
+
+  if (!peerName) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive peer expose <peer> [<id1,id2,...>]');
+      console.log('         kitty-hive peer expose <peer> --clear');
+      console.log('  No second argument: show current exposure (or interactive picker in a TTY).');
+      process.exit(1);
+    }
+    peerName = await pickPeer('Manage exposed agents for which peer?');
+  }
   const peer = getPeerByName(peerName);
   if (!peer) {
     console.log(`Peer "${peerName}" not found.`);
@@ -901,23 +1059,48 @@ async function cmdPeerExpose() {
 
   const current = peer.exposed ? peer.exposed.split(',').map(s => s.trim()).filter(Boolean) : [];
 
-  for (let i = 3; i < args.length; i++) {
-    if (args[i] === '--add' && args[i + 1]) {
-      const agents = args[i + 1].split(',').map(s => s.trim());
-      for (const a of agents) if (!current.includes(a)) current.push(a);
-      i++;
-    } else if (args[i] === '--remove' && args[i + 1]) {
-      const agents = args[i + 1].split(',').map(s => s.trim());
-      for (const a of agents) {
-        const idx = current.indexOf(a);
-        if (idx >= 0) current.splice(idx, 1);
-      }
-      i++;
+  // --- View path: no second arg, no --clear, non-TTY ---
+  if (replacement === null && !clear && !isInteractive()) {
+    if (current.length === 0) {
+      console.log(`Peer "${peerName}" exposes no local agents.`);
+      return;
     }
+    const named = current.map(id => {
+      const row = db.prepare('SELECT display_name FROM agents WHERE id = ?').get(id) as { display_name?: string } | undefined;
+      return row?.display_name ? `  ${row.display_name}  (${id})` : `  ${id}  (unknown — agent may have been removed)`;
+    });
+    console.log(`Peer "${peerName}" exposes ${current.length} local agent(s):`);
+    console.log(named.join('\n'));
+    return;
   }
 
-  updatePeerExposed(peerName, current.join(','));
-  console.log(`✅ Peer "${peerName}" exposed agents: ${current.join(', ') || 'none'}`);
+  // --- Edit paths ---
+  let next: string[];
+
+  if (clear) {
+    next = [];
+  } else if (replacement !== null) {
+    // Positional replacement — replace the whole list.
+    const parsed = replacement.split(',').map(s => s.trim()).filter(Boolean);
+    next = [];
+    for (const a of parsed) {
+      if (!isLocalAgent(db, a)) {
+        console.log(`❌ "${a}" is not a local agent on this hive — skipping. (Remote placeholder agents can't be exposed.)`);
+        continue;
+      }
+      if (!next.includes(a)) next.push(a);
+    }
+  } else {
+    // No args + TTY → interactive multiselect (current pre-checked).
+    next = await pickLocalAgents(
+      db,
+      `Local agents to expose to "${peerName}" (Space to toggle, Enter to confirm)`,
+      current,
+    );
+  }
+
+  updatePeerExposed(peerName, next.join(','));
+  console.log(`✅ Peer "${peerName}" exposed agents: ${next.join(', ') || 'none'}`);
 }
 
 async function cmdFilesClean() {
@@ -932,15 +1115,39 @@ async function cmdFilesClean() {
   console.log(`✅ Removed ${result.removed} federation file(s) older than ${maxAgeDays} day(s); kept ${result.kept}.`);
 }
 
+const CONFIG_KEYS = ['name'] as const;
+
 async function cmdConfigSet() {
   // kitty-hive config set name marvin
-  const key = args[2];
-  const value = args[3];
-  if (!key || !value) {
-    console.log('Usage: kitty-hive config set <key> <value>');
-    console.log('  e.g. kitty-hive config set name marvin');
-    process.exit(1);
+  let key = args[2];
+  let value = args[3];
+
+  if (!key) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive config set <key> <value>');
+      console.log(`  Known keys: ${CONFIG_KEYS.join(', ')}`);
+      process.exit(1);
+    }
+    key = await askSelect<string>({
+      message: 'Which config key?',
+      options: CONFIG_KEYS.map(k => ({ value: k, label: k })),
+    });
   }
+
+  if (!value) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive config set <key> <value>');
+      process.exit(1);
+    }
+    const current = (getNodeConfig() as any)[key] || '';
+    value = await askText({
+      message: `Value for "${key}"`,
+      placeholder: current || (key === 'name' ? hostname().split('.')[0] : ''),
+      initialValue: current,
+      validate: (v) => ((v ?? '').trim().length === 0 ? 'Value cannot be empty' : undefined),
+    });
+  }
+
   setNodeConfig({ [key]: value });
   console.log(`✅ ${key} = ${value}`);
 }
@@ -958,103 +1165,175 @@ function getDefaultAgentName(): string {
   return basename(process.cwd()) || 'agent';
 }
 
-function showHelp() {
+// --- Help (per-group + root) ---
+
+function showRootHelp() {
   console.log(`🐝 kitty-hive — multi-agent collaboration server
 
 Usage:
-  kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
-  kitty-hive init <tool> [--port 4123]                    Write MCP config (claude|cursor|vscode|antigravity|all)
-  kitty-hive status [--port 4123]                         Server & agent status
-  kitty-hive agent list                                   List agents
-  kitty-hive agent rename <old> <new>                     Rename an agent
-  kitty-hive agent remove <name>                          Remove an agent
-  kitty-hive peer invite --expose <my-agent>              Create invite token (recommended)
-  kitty-hive peer accept <token> --expose <my-agent>      Accept an invite token (auto-handshake)
-  kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer (manual)
-  kitty-hive peer list                                    List peers
-  kitty-hive peer remove <name>                           Remove a peer
-  kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
-  kitty-hive peer set-url <name> <url>                    Manually update a peer's URL (when auto-sync missed it)
-  kitty-hive config set <key> <value>                     Set config (e.g. name)
-  kitty-hive db clear [--db path]                         Clear the database
-  kitty-hive files clean [--days 7]                       Remove old federation transfer files
-  kitty-hive tunnel start [--port 4123] [--name name]     Run cloudflared & register URL with the hive
-  kitty-hive tunnel status [--port 4123]                  Show currently registered tunnel URL`);
+  kitty-hive <command> [args]
+
+Top-level commands:
+  serve [--port 4123] [--db path] [-v|-q]    Start the MCP server
+  init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|antigravity|all)
+  status [--port 4123]                       Server & agent status
+
+Command groups:
+  agent      Manage local agents       (list, rename, remove)
+  peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
+  tunnel     Cloudflare tunnel control (start, status)
+  config     Node config               (set)
+  files      Federation files          (clean)
+  db         Database maintenance      (clear)
+
+Run \`kitty-hive <group>\` to see that group's subcommands.
+Most commands prompt for missing arguments interactively.`);
+}
+
+function showAgentHelp() {
+  console.log(`🐝 kitty-hive agent — local agent management
+
+Usage:
+  kitty-hive agent <subcommand> [args]
+
+Subcommands:
+  list                       List all agents (local + remote placeholders)
+  rename [old] [new]         Rename an agent (interactive when args omitted)
+  remove [name-or-id]        Remove an agent and all related data (interactive when omitted)`);
+}
+
+function showPeerHelp() {
+  console.log(`🐝 kitty-hive peer — federation peer management
+
+Usage:
+  kitty-hive peer <subcommand> [args]
+
+Subcommands:
+  invite   [--expose <agent>]                          Create invite token (recommended for cross-machine)
+  accept   [<token>] [--expose <agent>]                Accept an invite token (auto-handshake)
+  add      [<name>] [<url>] [--expose a,b] [--secret s]  Add a peer manually
+  list                                                 List configured peers
+  expose   [<name>] [<id1,id2,...> | --clear]          View/manage exposed agents (TTY → multiselect; non-TTY → show)
+  set-url  [<name>] [<url>]                            Update a peer's URL when auto-sync missed it
+  remove   [<name>]                                    Remove a peer
+
+All subcommands prompt for missing arguments interactively.
+Cross-machine setups need \`kitty-hive tunnel start\` running.`);
+}
+
+function showTunnelHelp() {
+  console.log(`🐝 kitty-hive tunnel — Cloudflare tunnel control
+
+Usage:
+  kitty-hive tunnel <subcommand> [args]
+
+Subcommands:
+  start  [--port 4123] [--name name]   Run cloudflared & register the public URL with the hive
+  status [--port 4123]                 Show the URL currently registered with the hive`);
+}
+
+function showConfigHelp() {
+  console.log(`🐝 kitty-hive config — node configuration
+
+Usage:
+  kitty-hive config <subcommand> [args]
+
+Subcommands:
+  set [key] [value]    Set a config value (interactive when args omitted)
+
+Known keys:
+  name    Node name (the label peers see for this machine)`);
+}
+
+function showFilesHelp() {
+  console.log(`🐝 kitty-hive files — federation transfer file management
+
+Usage:
+  kitty-hive files <subcommand> [args]
+
+Subcommands:
+  clean [--days 7]    Remove federation transfer files older than N days`);
+}
+
+function showDbHelp() {
+  console.log(`🐝 kitty-hive db — database maintenance
+
+Usage:
+  kitty-hive db <subcommand> [args]
+
+Subcommands:
+  clear [--db path]    Delete the SQLite database (asks confirmation)`);
 }
 
 // --- Main ---
 
+function run(fn: () => Promise<void>) {
+  fn().catch(err => { console.error('Failed:', err); process.exit(1); });
+}
+
 switch (command) {
   case 'serve':
-    cmdServe().catch(err => { console.error('Failed:', err); process.exit(1); });
+    run(cmdServe);
     break;
   case 'init':
-    cmdInit().catch(err => { console.error('Failed:', err); process.exit(1); });
+    run(cmdInit);
     break;
   case 'status':
-    cmdStatus().catch(err => { console.error('Failed:', err); process.exit(1); });
+    run(cmdStatus);
     break;
   case 'agent':
-    if (args[1] === 'remove') {
-      cmdAgentRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'rename') {
-      cmdAgentRename().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'list') {
-      cmdAgentList().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'remove': run(cmdAgentRemove); break;
+      case 'rename': run(cmdAgentRename); break;
+      case 'list':   run(cmdAgentList);   break;
+      default:       showAgentHelp();     break;
     }
     break;
   case 'peer':
-    if (args[1] === 'add') {
-      cmdPeerAdd().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'list') {
-      cmdPeerList().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'remove') {
-      cmdPeerRemove().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'expose') {
-      cmdPeerExpose().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'set-url') {
-      cmdPeerSetUrl().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'invite') {
-      cmdPeerInvite().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'accept') {
-      cmdPeerAccept().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'add':     run(cmdPeerAdd);    break;
+      case 'list':    run(cmdPeerList);   break;
+      case 'remove':  run(cmdPeerRemove); break;
+      case 'expose':  run(cmdPeerExpose); break;
+      case 'set-url': run(cmdPeerSetUrl); break;
+      case 'invite':  run(cmdPeerInvite); break;
+      case 'accept':  run(cmdPeerAccept); break;
+      default:        showPeerHelp();     break;
     }
     break;
   case 'config':
-    if (args[1] === 'set') {
-      cmdConfigSet().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'set': run(cmdConfigSet); break;
+      default:    showConfigHelp();  break;
     }
     break;
   case 'db':
-    if (args[1] === 'clear') {
-      cmdDbClear().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'clear': run(cmdDbClear); break;
+      default:      showDbHelp();    break;
     }
     break;
   case 'files':
-    if (args[1] === 'clean') {
-      cmdFilesClean().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'clean': run(cmdFilesClean); break;
+      default:      showFilesHelp();    break;
     }
     break;
   case 'tunnel':
-    if (args[1] === 'start') {
-      cmdTunnelStart().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else if (args[1] === 'status') {
-      cmdTunnelStatus().catch(err => { console.error('Failed:', err); process.exit(1); });
-    } else {
-      showHelp();
+    switch (args[1]) {
+      case 'start':  run(cmdTunnelStart);  break;
+      case 'status': run(cmdTunnelStatus); break;
+      default:       showTunnelHelp();     break;
     }
     break;
-  default:
-    showHelp();
+  case 'help':
+  case '--help':
+  case '-h':
+  case undefined:
+    showRootHelp();
     break;
+  default:
+    console.log(`Unknown command: "${command}"\n`);
+    showRootHelp();
+    process.exit(1);
 }

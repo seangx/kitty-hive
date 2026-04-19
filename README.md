@@ -334,26 +334,30 @@ npm run test:federation
 
 ## CLI
 
+Run `kitty-hive` for the top-level overview, or `kitty-hive <group>` (e.g. `kitty-hive peer`) to see that group's subcommands. Most commands prompt for missing arguments interactively when run from a TTY; pass all flags to stay scriptable.
+
 ```
-kitty-hive serve [--port 4123] [--db path] [-v|-q]     Start the server
-kitty-hive init <tool> [--port 4123]                    Write MCP config (claude|cursor|vscode|antigravity|all)
-kitty-hive status [--port 4123]                         Server, agent & team status
-kitty-hive agent list                                   List agents
-kitty-hive agent rename <old> <new>                     Rename an agent
-kitty-hive agent remove <name-or-id>                    Remove an agent
-kitty-hive peer invite --expose <my-agent> [--url url]      Create an invite token (recommended)
-kitty-hive peer accept <token> --expose <my-agent> [--url url]  Accept an invite token (auto-handshake)
-kitty-hive peer add <name> <url> [--expose a,b] [--secret s]  Add a peer manually
-kitty-hive peer list                                    List peers
-kitty-hive peer remove <name>                           Remove a peer
-kitty-hive peer expose <name> --add/--remove <agent>    Manage exposed agents
-kitty-hive peer set-url <name> <url>                    Manually update a peer's URL (when auto-sync missed it)
-kitty-hive config set <key> <value>                     Set config (e.g. name)
-kitty-hive db clear [--db path]                         Clear the database
-kitty-hive files clean [--days 7]                       Remove old federation transfer files
-kitty-hive tunnel start [--port 4123]                   Run cloudflared & register URL with the hive
-kitty-hive tunnel status [--port 4123]                  Show currently registered tunnel URL
+kitty-hive serve   [--port 4123] [--db path] [-v|-q]                 Start the MCP server
+kitty-hive init    [tool] [--port 4123]                              Write MCP config (interactive picker if no tool)
+kitty-hive status  [--port 4123]                                     Server, agent & team status
+
+kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
+kitty-hive peer    invite [--expose <agent>]
+                   accept [<token>] [--expose <agent>]
+                   add    [<name>] [<url>] [--expose a,b] [--secret s]
+                   list
+                   expose  [<name>] [<id1,id2,...> | --clear]       View / replace exposed agents
+                                                                    (TTY → multiselect; non-TTY → show current)
+                   set-url [<name>] [<url>]                          Manual URL fix (auto-sync fallback)
+                   remove  [<name>]
+kitty-hive tunnel  start  [--port 4123] [--name name]                Run cloudflared & register URL
+                   status [--port 4123]                              Show registered tunnel URL
+kitty-hive config  set    [key] [value]                              Set config (e.g. `name`)
+kitty-hive files   clean  [--days 7]                                 Remove old federation transfer files
+kitty-hive db      clear  [--db path]                                Clear the database
 ```
+
+`peer expose` / `peer add --expose` only accept agents that actually exist on this hive — typos and remote placeholder IDs are rejected up front.
 
 ## Environment
 
