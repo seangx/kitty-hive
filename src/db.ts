@@ -80,7 +80,7 @@ export function initDB(dbPath?: string): Database.Database {
       creator_agent_id  TEXT NOT NULL REFERENCES agents(id),
       assignee_agent_id TEXT REFERENCES agents(id),
       status            TEXT NOT NULL DEFAULT 'created'
-                        CHECK(status IN ('created','proposing','approved','in_progress','completed','failed','canceled')),
+                        CHECK(status IN ('created','proposing','approved','in_progress','awaiting_approval','completed','failed','canceled')),
       workflow_json     TEXT,
       current_step      INTEGER DEFAULT 0,
       source_team_id    TEXT REFERENCES teams(id),
@@ -153,6 +153,11 @@ export function initDB(dbPath?: string): Database.Database {
   // attachments stored as JSON array of {file_id, filename, mime, size}
   addColumnIfMissing('dm_messages', 'attachments', "TEXT NOT NULL DEFAULT '[]'");
 
+  // Migrate tasks.status CHECK constraint when an older DB lacks
+  // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
+  // until v0.5.9). SQLite has no ALTER COLUMN, so we recreate the table.
+  migrateTasksStatusCheck(db);
+
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
     CREATE INDEX IF NOT EXISTS idx_tasks_delegated ON tasks(delegated_peer, delegated_task_id);
@@ -165,6 +170,57 @@ export function initDB(dbPath?: string): Database.Database {
 export function getDB(): Database.Database {
   if (!db) throw new Error('Database not initialized. Call initDB() first.');
   return db;
+}
+
+// SQLite doesn't support altering a CHECK constraint in place — when we add a
+// new TaskStatus value we have to recreate the table. This is gated on the
+// stored CREATE TABLE SQL so it only runs on databases that pre-date v0.5.9.
+function migrateTasksStatusCheck(db: Database.Database): void {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='tasks'"
+  ).get() as { sql?: string } | undefined;
+  if (!row?.sql) return;
+  if (row.sql.includes("'awaiting_approval'")) return; // already migrated
+
+  db.pragma('foreign_keys = OFF');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE tasks_new (
+        id                    TEXT PRIMARY KEY,
+        title                 TEXT NOT NULL,
+        creator_agent_id      TEXT NOT NULL REFERENCES agents(id),
+        assignee_agent_id     TEXT REFERENCES agents(id),
+        status                TEXT NOT NULL DEFAULT 'created'
+                              CHECK(status IN ('created','proposing','approved','in_progress','awaiting_approval','completed','failed','canceled')),
+        workflow_json         TEXT,
+        current_step          INTEGER DEFAULT 0,
+        source_team_id        TEXT REFERENCES teams(id),
+        input_json            TEXT DEFAULT '{}',
+        created_at            TEXT NOT NULL,
+        completed_at          TEXT,
+        originator_peer       TEXT NOT NULL DEFAULT '',
+        originator_task_id    TEXT NOT NULL DEFAULT '',
+        delegated_peer        TEXT NOT NULL DEFAULT '',
+        delegated_task_id     TEXT NOT NULL DEFAULT ''
+      );
+      INSERT INTO tasks_new
+        SELECT id, title, creator_agent_id, assignee_agent_id, status,
+               workflow_json, current_step, source_team_id, input_json,
+               created_at, completed_at,
+               originator_peer, originator_task_id, delegated_peer, delegated_task_id
+        FROM tasks;
+      DROP TABLE tasks;
+      ALTER TABLE tasks_new RENAME TO tasks;
+      CREATE INDEX IF NOT EXISTS idx_tasks_creator   ON tasks(creator_agent_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_assignee  ON tasks(assignee_agent_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_status    ON tasks(status);
+      CREATE INDEX IF NOT EXISTS idx_tasks_delegated ON tasks(delegated_peer, delegated_task_id);
+      CREATE INDEX IF NOT EXISTS idx_tasks_originator ON tasks(originator_peer, originator_task_id);
+    `);
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+  console.log('[db] migrated tasks.status CHECK constraint to include awaiting_approval');
 }
 
 // --- Agent queries ---
