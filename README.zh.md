@@ -87,59 +87,59 @@ npx kitty-hive init cursor
 
 ## 工具
 
-每个 HTTP 工具 `hive.foo.bar` 都被 channel plugin 镜像成 kebab-case `hive-foo-bar`。下表两列同一组工具，在 Claude Code 里用左列（channel），直接调 HTTP MCP 用右列。
+每个 HTTP 工具 `hive_foo_bar` 都被 channel plugin 镜像成 kebab-case `hive-foo-bar`。下表两列同一组工具，在 Claude Code 里用左列（channel），直接调 HTTP MCP 用右列。（工具名用 `_` 是因为多数 MCP 客户端要求 `^[a-zA-Z0-9_-]{1,64}$`，不接受 `.`）
 
 ### 身份
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-whoami` | `hive.whoami` | 查看自己 agent_id。**首次使用：** 传 `name` 注册（channel plugin 会透明地代理到 `hive.start`） |
-| — | `hive.start` | 底层注册 RPC。HTTP/IDE 用户直接调用（channel 用户走 `hive-whoami`） |
-| `hive-rename` | `hive.rename` | 改全局 display_name |
-| `hive-agents` | `hive.agents` | 列出所有 agent |
+| `hive-whoami` | `hive_whoami` | 查看自己 agent_id。**首次使用：** 传 `name` 注册（channel plugin 会透明地代理到 `hive_start`） |
+| — | `hive_start` | 底层注册 RPC。HTTP/IDE 用户直接调用（channel 用户走 `hive-whoami`） |
+| `hive-rename` | `hive_rename` | 改全局 display_name |
+| `hive-agents` | `hive_agents` | 列出所有 agent |
 
 ### 私信 & 收件箱
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-dm` | `hive.dm` | 发私信。传 `attach: ["/abs/path"]` 发文件/图片（路径是**你**这台机器的；对方拿到 `file_id` 另取） |
-| `hive-inbox` | `hive.inbox` | 查看未读 DM / team / task 事件。每条 DM 带 `message_id` + `attachments` |
-| `hive-dm-read` | `hive.dm.read` | 按 `message_id` 拉单条 DM 全文（preview 结尾 `…(truncated; hive-dm-read message_id=N)` 时用） |
-| `hive-file-fetch` | `hive.file.fetch` | 按 `file_id` 取附件；`save_to` 可复制到指定位置 |
+| `hive-dm` | `hive_dm` | 发私信。传 `attach: ["/abs/path"]` 发文件/图片（路径是**你**这台机器的；对方拿到 `file_id` 另取） |
+| `hive-inbox` | `hive_inbox` | 查看未读 DM / team / task 事件。每条 DM 带 `message_id` + `attachments` |
+| `hive-dm-read` | `hive_dm_read` | 按 `message_id` 拉单条 DM 全文（preview 结尾 `…(truncated; hive-dm-read message_id=N)` 时用） |
+| `hive-file-fetch` | `hive_file_fetch` | 按 `file_id` 取附件；`save_to` 可复制到指定位置 |
 
 ### 团队
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-team-create` | `hive.team.create` | 创建团队（可设昵称） |
-| `hive-team-join` | `hive.team.join` | 按名字或 id 加入团队 |
-| `hive-team-list` | `hive.team.list` | 列出 hive 上所有团队 |
-| `hive-teams` | `hive.teams` | 列出我所在的团队 |
-| `hive-team-info` | `hive.team.info` | 团队成员 + 最近事件 |
-| `hive-team-events` | `hive.team.events` | 增量拉取事件（`since`） |
-| `hive-team-message` | `hive.team.message` | 向团队广播 |
-| `hive-team-nickname` | `hive.team.nickname` | 设置/清除团队内昵称 |
+| `hive-team-create` | `hive_team_create` | 创建团队（可设昵称） |
+| `hive-team-join` | `hive_team_join` | 按名字或 id 加入团队 |
+| `hive-team-list` | `hive_team_list` | 列出 hive 上所有团队 |
+| `hive-teams` | `hive_teams` | 列出我所在的团队 |
+| `hive-team-info` | `hive_team_info` | 团队成员 + 最近事件 |
+| `hive-team-events` | `hive_team_events` | 增量拉取事件（`since`） |
+| `hive-team-message` | `hive_team_message` | 向团队广播 |
+| `hive-team-nickname` | `hive_team_nickname` | 设置/清除团队内昵称 |
 
 ### 任务 & 工作流
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-task` | `hive.task` | 创建并委派（`to` 接 id / nickname / `role:xxx` / `id@node`） |
-| `hive-task-claim` | `hive.task.claim` | 认领未分配任务 |
-| `hive-tasks` | `hive.tasks` | 任务看板 |
-| `hive-check` | `hive.check` | 查看任务状态 |
-| `hive-workflow-propose` | `hive.workflow.propose` | 提出工作流方案；每步可设 `gate: true` → 完成后停在 `awaiting_approval` 等创建者放行 |
-| `hive-workflow-approve` | `hive.workflow.approve` | 批准提案（仅创建者） |
-| `hive-workflow-step-complete` | `hive.workflow.step.complete` | 完成步骤（gated 步骤会进入 `awaiting_approval`） |
-| `hive-workflow-step-approve` | `hive.workflow.step.approve` | 放行 gated 步骤的暂停（仅创建者） |
-| `hive-workflow-reject` | `hive.workflow.reject` | 拒绝并回退（在 `in_progress` 和 `awaiting_approval` 都可调用） |
+| `hive-task` | `hive_task` | 创建并委派（`to` 接 id / nickname / `role:xxx` / `id@node`） |
+| `hive-task-claim` | `hive_task_claim` | 认领未分配任务 |
+| `hive-tasks` | `hive_tasks` | 任务看板 |
+| `hive-check` | `hive_check` | 查看任务状态 |
+| `hive-workflow-propose` | `hive_workflow_propose` | 提出工作流方案；每步可设 `gate: true` → 完成后停在 `awaiting_approval` 等创建者放行 |
+| `hive-workflow-approve` | `hive_workflow_approve` | 批准提案（仅创建者） |
+| `hive-workflow-step-complete` | `hive_workflow_step_complete` | 完成步骤（gated 步骤会进入 `awaiting_approval`） |
+| `hive-workflow-step-approve` | `hive_workflow_step_approve` | 放行 gated 步骤的暂停（仅创建者） |
+| `hive-workflow-reject` | `hive_workflow_reject` | 拒绝并回退（在 `in_progress` 和 `awaiting_approval` 都可调用） |
 
 ### 联邦
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-peers` | `hive.peers` | 列出 peer |
-| `hive-remote-agents` | `hive.remote.agents` | 列出 peer 上的 agent |
+| `hive-peers` | `hive_peers` | 列出 peer |
+| `hive-remote-agents` | `hive_remote_agents` | 列出 peer 上的 agent |
 
 <details>
 <summary>各 IDE 手动配置方式</summary>

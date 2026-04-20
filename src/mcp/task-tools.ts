@@ -12,7 +12,7 @@ import * as db from '../db.js';
 
 export function registerTaskTools(mcp: McpServer) {
   mcp.tool(
-    'hive.task',
+    'hive_task',
     'Create a task and (optionally) delegate. Omit `to` to create an unassigned task that anyone can claim.',
     {
       as: asParam,
@@ -35,7 +35,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.task.claim',
+    'hive_task_claim',
     'Claim an unassigned task (status "created", no assignee).',
     { as: asParam, task_id: z.string().describe('Task id') },
     async (params, extra) => {
@@ -51,7 +51,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.tasks',
+    'hive_tasks',
     'List tasks you created or are assigned to.',
     {
       as: asParam,
@@ -74,7 +74,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.check',
+    'hive_check',
     'Check the current state of a task by id.',
     { task_id: z.string().describe('Task id') },
     async (params) => {
@@ -84,7 +84,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.workflow.propose',
+    'hive_workflow_propose',
     'Propose a workflow for a task. Creator must approve before steps start. ' +
     'For multi-phase workflows where the user (creator) will want to review the output between phases, ' +
     'set `gate: true` on each phase — the task then pauses in status `awaiting_approval` after each gated step ' +
@@ -115,7 +115,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.workflow.approve',
+    'hive_workflow_approve',
     'Approve a proposed workflow (creator only). Starts step 1.',
     { as: asParam, task_id: z.string().describe('Task id') },
     async (params, extra) => {
@@ -131,7 +131,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.workflow.step.complete',
+    'hive_workflow_step_complete',
     'Mark your part of the current step as complete. If the step has `gate: true` and you were the last assignee, the task enters `awaiting_approval` instead of auto-advancing — the creator must call hive-workflow-step-approve to release the gate.',
     {
       as: asParam,
@@ -167,7 +167,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.workflow.step.approve',
+    'hive_workflow_step_approve',
     'Release a gated step\'s `awaiting_approval` pause. Creator-only. ' +
     'Call this after reviewing the output of a step that was proposed with `gate: true`. ' +
     'Advances to the next step (or completes the task if it was the last step).',
@@ -191,7 +191,7 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.workflow.reject',
+    'hive_workflow_reject',
     'Reject the current step. Sends task back to a previous step.',
     {
       as: asParam,

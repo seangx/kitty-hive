@@ -7,7 +7,7 @@ import {
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
 import type { Task, TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
 
-// --- hive.task ---
+// --- hive_task ---
 
 interface TaskInput {
   to?: string;
@@ -227,7 +227,7 @@ export async function handleTaskClaimAsync(taskId: string, agentId: string): Pro
   return out;
 }
 
-// --- hive.task.claim ---
+// --- hive_task_claim ---
 
 export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
   const task = getTaskById(taskId);
@@ -249,7 +249,7 @@ export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
   };
 }
 
-// --- hive.check ---
+// --- hive_check ---
 
 interface CheckOutput {
   task_id: string;

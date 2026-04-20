@@ -6,7 +6,7 @@ import {
 } from '../db.js';
 import type { Team, TeamEvent } from '../models.js';
 
-// --- hive.team.create ---
+// --- hive_team_create ---
 
 export function handleTeamCreate(actorId: string, input: { name: string; nickname?: string }): { team_id: string; name: string } {
   const existing = getTeamByName(input.name);
@@ -18,7 +18,7 @@ export function handleTeamCreate(actorId: string, input: { name: string; nicknam
   return { team_id: team.id, name: team.name };
 }
 
-// --- hive.team.join ---
+// --- hive_team_join ---
 
 export function handleTeamJoin(actorId: string, input: { team_id?: string; name?: string; nickname?: string }): { team_id: string; name: string } {
   let team: Team | undefined;
@@ -38,7 +38,7 @@ export function handleTeamJoin(actorId: string, input: { team_id?: string; name?
   return { team_id: team.id, name: team.name };
 }
 
-// --- hive.team.list ---
+// --- hive_team_list ---
 
 interface TeamSummary {
   team_id: string;
@@ -60,7 +60,7 @@ export function handleTeamList(): { teams: TeamSummary[] } {
   };
 }
 
-// --- hive.team.info ---
+// --- hive_team_info ---
 
 interface InfoOutput {
   team: Team;
@@ -89,7 +89,7 @@ export function handleTeamInfo(actorId: string, input: { team_id: string }): Inf
   };
 }
 
-// --- hive.team.events ---
+// --- hive_team_events ---
 
 export function handleTeamEvents(actorId: string, input: { team_id: string; since?: number; limit?: number }): { events: TeamEvent[]; has_more: boolean } {
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
@@ -100,7 +100,7 @@ export function handleTeamEvents(actorId: string, input: { team_id: string; sinc
   return { events, has_more: hasMore };
 }
 
-// --- hive.team.message ---
+// --- hive_team_message ---
 
 export function handleTeamMessage(actorId: string, input: { team_id: string; content: string }): { team_id: string; event_id: number; seq: number } {
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
@@ -108,7 +108,7 @@ export function handleTeamMessage(actorId: string, input: { team_id: string; con
   return { team_id: input.team_id, event_id: event.id, seq: event.seq };
 }
 
-// --- hive.team.nickname ---
+// --- hive_team_nickname ---
 
 export function handleTeamNickname(actorId: string, input: { team_id: string; nickname: string | null }): { team_id: string; nickname: string | null; old_nickname: string | null } {
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
@@ -124,7 +124,7 @@ export function handleTeamNickname(actorId: string, input: { team_id: string; ni
   return { team_id: input.team_id, nickname: input.nickname, old_nickname: member.nickname };
 }
 
-// --- hive.team.list (mine) ---
+// --- hive_team_list (mine) ---
 
 export function handleMyTeams(actorId: string): { teams: Array<{ team_id: string; name: string; nickname: string | null; member_count: number }> } {
   const teams = getAgentTeams(actorId, true);

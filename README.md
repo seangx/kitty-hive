@@ -87,59 +87,59 @@ Each machine runs its **own** `kitty-hive serve` — there is no central hub. Lo
 
 ## Tools
 
-Every HTTP tool `hive.foo.bar` is re-exposed by the channel plugin as kebab-case `hive-foo-bar`. Tables below pair the two spellings — use the left column inside Claude Code, the right column when calling via HTTP MCP directly.
+Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case `hive-foo-bar`. Tables below pair the two spellings — use the left column inside Claude Code, the right column when calling via HTTP MCP directly. (Tool names use `_` because most MCP clients enforce `^[a-zA-Z0-9_-]{1,64}$` and reject `.`)
 
 ### Identity
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-whoami` | `hive.whoami` | Show your agent id. **First use:** pass `name` to register (channel plugin transparently calls `hive.start` under the hood). |
-| — | `hive.start` | Underlying registration RPC. HTTP/IDE users call this directly (channel users go via `hive-whoami`). |
-| `hive-rename` | `hive.rename` | Change your global display_name |
-| `hive-agents` | `hive.agents` | List all agents on the hive |
+| `hive-whoami` | `hive_whoami` | Show your agent id. **First use:** pass `name` to register (channel plugin transparently calls `hive_start` under the hood). |
+| — | `hive_start` | Underlying registration RPC. HTTP/IDE users call this directly (channel users go via `hive-whoami`). |
+| `hive-rename` | `hive_rename` | Change your global display_name |
+| `hive-agents` | `hive_agents` | List all agents on the hive |
 
 ### DM & Inbox
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-dm` | `hive.dm` | Send a direct message. Pass `attach: ["/abs/path"]` to send files/images (path on YOUR machine; receiver gets a `file_id` and fetches separately). |
-| `hive-inbox` | `hive.inbox` | Check unread DMs / team / task events. Each DM entry carries `message_id` + `attachments` inline. |
-| `hive-dm-read` | `hive.dm.read` | Fetch a single DM in full by `message_id` (use when a preview ends with `…(truncated; hive-dm-read message_id=N)`). |
-| `hive-file-fetch` | `hive.file.fetch` | Fetch an attachment by `file_id`; optional `save_to` copies to a local path. |
+| `hive-dm` | `hive_dm` | Send a direct message. Pass `attach: ["/abs/path"]` to send files/images (path on YOUR machine; receiver gets a `file_id` and fetches separately). |
+| `hive-inbox` | `hive_inbox` | Check unread DMs / team / task events. Each DM entry carries `message_id` + `attachments` inline. |
+| `hive-dm-read` | `hive_dm_read` | Fetch a single DM in full by `message_id` (use when a preview ends with `…(truncated; hive-dm-read message_id=N)`). |
+| `hive-file-fetch` | `hive_file_fetch` | Fetch an attachment by `file_id`; optional `save_to` copies to a local path. |
 
 ### Teams
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-team-create` | `hive.team.create` | Create a team (optional nickname) |
-| `hive-team-join` | `hive.team.join` | Join a team by name or id |
-| `hive-team-list` | `hive.team.list` | List all open teams |
-| `hive-teams` | `hive.teams` | List teams you are in |
-| `hive-team-info` | `hive.team.info` | Members + recent events |
-| `hive-team-events` | `hive.team.events` | Fetch events with `since` |
-| `hive-team-message` | `hive.team.message` | Broadcast to team |
-| `hive-team-nickname` | `hive.team.nickname` | Set/clear nickname in a team |
+| `hive-team-create` | `hive_team_create` | Create a team (optional nickname) |
+| `hive-team-join` | `hive_team_join` | Join a team by name or id |
+| `hive-team-list` | `hive_team_list` | List all open teams |
+| `hive-teams` | `hive_teams` | List teams you are in |
+| `hive-team-info` | `hive_team_info` | Members + recent events |
+| `hive-team-events` | `hive_team_events` | Fetch events with `since` |
+| `hive-team-message` | `hive_team_message` | Broadcast to team |
+| `hive-team-nickname` | `hive_team_nickname` | Set/clear nickname in a team |
 
 ### Tasks & Workflow
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-task` | `hive.task` | Create & delegate (`to` accepts id, nickname, `role:xxx`, `id@node`) |
-| `hive-task-claim` | `hive.task.claim` | Claim an unassigned task |
-| `hive-tasks` | `hive.tasks` | List your tasks |
-| `hive-check` | `hive.check` | Check task status |
-| `hive-workflow-propose` | `hive.workflow.propose` | Propose workflow steps; set `gate: true` per step to pause for creator review |
-| `hive-workflow-approve` | `hive.workflow.approve` | Approve the proposed workflow (creator only) |
-| `hive-workflow-step-complete` | `hive.workflow.step.complete` | Complete a step (gated step → enters `awaiting_approval`) |
-| `hive-workflow-step-approve` | `hive.workflow.step.approve` | Release a gated step's pause (creator only) |
-| `hive-workflow-reject` | `hive.workflow.reject` | Reject & rollback (works in `in_progress` and `awaiting_approval`) |
+| `hive-task` | `hive_task` | Create & delegate (`to` accepts id, nickname, `role:xxx`, `id@node`) |
+| `hive-task-claim` | `hive_task_claim` | Claim an unassigned task |
+| `hive-tasks` | `hive_tasks` | List your tasks |
+| `hive-check` | `hive_check` | Check task status |
+| `hive-workflow-propose` | `hive_workflow_propose` | Propose workflow steps; set `gate: true` per step to pause for creator review |
+| `hive-workflow-approve` | `hive_workflow_approve` | Approve the proposed workflow (creator only) |
+| `hive-workflow-step-complete` | `hive_workflow_step_complete` | Complete a step (gated step → enters `awaiting_approval`) |
+| `hive-workflow-step-approve` | `hive_workflow_step_approve` | Release a gated step's pause (creator only) |
+| `hive-workflow-reject` | `hive_workflow_reject` | Reject & rollback (works in `in_progress` and `awaiting_approval`) |
 
 ### Federation
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-peers` | `hive.peers` | List federation peers |
-| `hive-remote-agents` | `hive.remote.agents` | List agents on a peer |
+| `hive-peers` | `hive_peers` | List federation peers |
+| `hive-remote-agents` | `hive_remote_agents` | List agents on a peer |
 
 <details>
 <summary>Manual MCP configuration for each IDE</summary>

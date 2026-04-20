@@ -9,7 +9,7 @@ import { notifyTeamMembers } from '../sessions.js';
 
 export function registerTeamTools(mcp: McpServer) {
   mcp.tool(
-    'hive.team.create',
+    'hive_team_create',
     'Create a new team. Optionally set your nickname in this team.',
     {
       as: asParam,
@@ -25,7 +25,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.join',
+    'hive_team_join',
     'Join an existing team by name or id.',
     {
       as: asParam,
@@ -47,7 +47,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.list',
+    'hive_team_list',
     'List all teams on this hive (with their members).',
     {},
     async () => {
@@ -57,7 +57,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.info',
+    'hive_team_info',
     'Get detailed info about a team you are in (members with nicknames + recent events).',
     {
       as: asParam,
@@ -72,7 +72,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.events',
+    'hive_team_events',
     'Fetch events from a team. Use "since" for incremental polling.',
     {
       as: asParam,
@@ -89,7 +89,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.message',
+    'hive_team_message',
     'Post a message to a team (broadcasts to all members).',
     {
       as: asParam,
@@ -110,7 +110,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.team.nickname',
+    'hive_team_nickname',
     'Set or change your nickname within a team. Pass null to clear.',
     {
       as: asParam,
@@ -126,7 +126,7 @@ export function registerTeamTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.teams',
+    'hive_teams',
     'List teams you are a member of (with your nickname in each).',
     { as: asParam },
     async (params, extra) => {

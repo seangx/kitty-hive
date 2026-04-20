@@ -7,7 +7,7 @@ import { bindSession } from '../sessions.js';
 
 export function registerAgentTools(mcp: McpServer) {
   mcp.tool(
-    'hive.start',
+    'hive_start',
     'Register or reconnect as an agent. Returns your agent_id (used for cross-team addressing). The MCP session is automatically bound to the returned agent so push notifications target the right session. (Channel-plugin users: prefer hive-whoami for first-time registration; this is the underlying server tool.)',
     {
       id: z.string().optional().describe('Agent id to reconnect to (exact match). Errors if not found.'),
@@ -21,14 +21,14 @@ export function registerAgentTools(mcp: McpServer) {
       if (extra.sessionId) {
         bindSession(extra.sessionId, result.agent_id);
       } else {
-        console.warn(`[hive.start] WARNING: no sessionId in extra (stateless?). agent=${result.agent_id} will NOT receive push.`);
+        console.warn(`[hive_start] WARNING: no sessionId in extra (stateless?). agent=${result.agent_id} will NOT receive push.`);
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
 
   mcp.tool(
-    'hive.whoami',
+    'hive_whoami',
     'Show the agent currently bound to this session (or via `as`).',
     { as: asParam },
     async (params, extra) => {
@@ -51,7 +51,7 @@ export function registerAgentTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.rename',
+    'hive_rename',
     'Change your global display_name (display only — addressing uses id).',
     {
       as: asParam,
@@ -67,7 +67,7 @@ export function registerAgentTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.agents',
+    'hive_agents',
     'List all known agents on this hive. Use this to find agent ids for cross-team DM/task.',
     {
       active_only: z.boolean().optional().describe('Only show active agents (default false)'),

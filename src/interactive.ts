@@ -61,7 +61,7 @@ function listLocalAgents(db: any): AgentRow[] {
 export async function pickLocalAgent(db: any, message: string): Promise<string> {
   const agents = listLocalAgents(db);
   if (agents.length === 0) {
-    console.log('No local agents registered yet. (Agents register on first hive.start.)');
+    console.log('No local agents registered yet. (Agents register on first hive_start.)');
     process.exit(1);
   }
   if (agents.length === 1) return agents[0].id;
@@ -82,7 +82,7 @@ export async function pickLocalAgents(
 ): Promise<string[]> {
   const agents = listLocalAgents(db);
   if (agents.length === 0) {
-    console.log('No local agents to expose. Register one first via hive.start.');
+    console.log('No local agents to expose. Register one first via hive_start.');
     return [];
   }
   return askMultiselect<string>({

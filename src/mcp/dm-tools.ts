@@ -12,10 +12,10 @@ import * as db from '../db.js';
 
 export function registerDMTools(mcp: McpServer) {
   mcp.tool(
-    'hive.dm',
+    'hive_dm',
     'Send a direct message to another agent. `to` accepts agent id, team-nickname (within your teams), display_name (only if unambiguous), or "id@node" for federation. ' +
     'IMPORTANT: any file path you mention in `content` is local-to-YOUR-machine ONLY — the receiver cannot read it (they may be on a different OS). ' +
-    'To actually share a file, pass `attach: [absolute path on YOUR disk]`; hive copies the bytes into storage (replicating across federation if needed) and the receiver gets a `file_id` they fetch via `hive.file.fetch`. ' +
+    'To actually share a file, pass `attach: [absolute path on YOUR disk]`; hive copies the bytes into storage (replicating across federation if needed) and the receiver gets a `file_id` they fetch via `hive_file_fetch`. ' +
     'Use `attach` for screenshots, PDFs, CSVs, logs, pasted-image temp files, anything binary.',
     {
       as: asParam,
@@ -45,7 +45,7 @@ export function registerDMTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.dm.read',
+    'hive_dm_read',
     'Fetch a single DM in full by message_id. Use whenever a preview contains a `[hive note]` paragraph mentioning hive-dm-read — the visible text is only the first 200/2000 characters. Returns the full content, attachments, sender, and timestamp.',
     { message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications') },
     async (params) => {
@@ -72,7 +72,7 @@ export function registerDMTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.file.fetch',
+    'hive_file_fetch',
     'Fetch an attachment by file_id (from a DM you received). Returns a `path` on the hive node serving you (your local hive when running locally; the receiver\'s hive in federated setups — already replicated). Pass `save_to` to copy it to a path of your choice (a trailing "/" treats it as a directory and keeps the original filename).',
     {
       file_id: z.string().describe('Attachment file_id (from hive-inbox latest entry attachments, or from a channel notification)'),
@@ -96,7 +96,7 @@ export function registerDMTools(mcp: McpServer) {
   );
 
   mcp.tool(
-    'hive.inbox',
+    'hive_inbox',
     'Check unread DMs, team events, and task events. Marks returned items as read.',
     { as: asParam },
     async (params, extra) => {

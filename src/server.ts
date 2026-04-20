@@ -77,7 +77,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
       const sid = req.headers['mcp-session-id'] as string | undefined;
       const method = body?.method || (Array.isArray(body) ? `batch[${body.length}]` : 'unknown');
       const tool = body?.params?.name || '';
-      const isHeartbeat = tool === 'hive.inbox' || method === 'notifications/initialized';
+      const isHeartbeat = tool === 'hive_inbox' || method === 'notifications/initialized';
       if (!isHeartbeat) {
         log('info', `[rpc] method=${method} sid=${sid || 'none'} tool=${tool || '-'}`);
       }

@@ -43,7 +43,7 @@ async function hivePost(method: string, params: any = {}, _retried = false): Pro
     console.error(`[hive-channel] server returned 404 (stale session); re-initializing...`)
     sessionId = null
     await initHiveSession()
-    if (agentId) await hiveCallTool('hive.start', { id: agentId, tool: 'claude', roles: 'channel' }, true)
+    if (agentId) await hiveCallTool('hive_start', { id: agentId, tool: 'claude', roles: 'channel' }, true)
     return hivePost(method, params, true)
   }
 
@@ -92,7 +92,7 @@ async function registerAgent(opts: { id?: string; name?: string }) {
   const args: any = { tool: 'claude', roles: 'channel' }
   if (opts.id) args.id = opts.id
   if (opts.name) args.name = opts.name
-  const result = await hiveCallTool('hive.start', args)
+  const result = await hiveCallTool('hive_start', args)
   agentId = result.agent_id
   agentName = result.display_name
   if (!sseStarted) {
@@ -157,7 +157,7 @@ const mcp = new Server(
 )
 
 // --- Dynamic tool proxy ---
-// Channel discovers hive.* tools from the HTTP server at startup, then exposes
+// Channel discovers hive_* tools from the HTTP server at startup, then exposes
 // them as kebab-case `hive-*` tools. Calls are forwarded with `as: agentId`
 // injected. Only `hive-whoami` is implemented locally (manages session state).
 
@@ -170,11 +170,11 @@ interface MCPTool {
 let cachedHiveTools: MCPTool[] = []
 
 function hiveToKebab(name: string): string {
-  return name.replace(/\./g, '-')
+  return name.replace(/_/g, '-')
 }
 
 function kebabToHive(name: string): string {
-  return name.replace(/-/g, '.')
+  return name.replace(/-/g, '_')
 }
 
 function stripAsParam(schema: any): any {
@@ -190,7 +190,7 @@ function stripAsParam(schema: any): any {
 async function refreshHiveTools(): Promise<void> {
   try {
     const result = await hivePost('tools/list', {})
-    cachedHiveTools = (result.tools || []).filter((t: MCPTool) => t.name.startsWith('hive.'))
+    cachedHiveTools = (result.tools || []).filter((t: MCPTool) => t.name.startsWith('hive_'))
   } catch (err) {
     console.error('[hive-channel] failed to fetch tool list:', err)
   }
@@ -209,8 +209,8 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => {
   if (cachedHiveTools.length === 0) await refreshHiveTools()
   const tools: MCPTool[] = [WHOAMI_TOOL]
   for (const t of cachedHiveTools) {
-    // hive.whoami is served locally (manages registration state)
-    if (t.name === 'hive.whoami') continue
+    // hive_whoami is served locally (manages registration state)
+    if (t.name === 'hive_whoami') continue
     tools.push({
       name: hiveToKebab(t.name),
       description: t.description,
@@ -249,7 +249,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
   }
 
-  // Proxy all other hive-* tools to hive.* with `as: agentId` injected
+  // Proxy all other hive-* tools to hive_* with `as: agentId` injected
   if (!name.startsWith('hive-')) throw new Error(`Unknown tool: ${name}`)
   const hiveName = kebabToHive(name)
   const result = await hiveCallTool(hiveName, { as: agentId, ...args })
@@ -285,7 +285,7 @@ async function listenSSE() {
         console.error(`[hive-channel] SSE connect failed: ${res.status}, re-registering...`)
         try {
           await initHiveSession()
-          if (agentId) await hiveCallTool('hive.start', { id: agentId, tool: 'claude', roles: 'channel' })
+          if (agentId) await hiveCallTool('hive_start', { id: agentId, tool: 'claude', roles: 'channel' })
         } catch (e) {
           console.error(`[hive-channel] re-register failed:`, e)
         }

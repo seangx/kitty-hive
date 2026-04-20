@@ -20,19 +20,19 @@ export function createMcpServer(): McpServer {
       'kitty-hive is a multi-agent collaboration server.',
       '',
       '## Identity',
-      '- agent_id (ULID) is your stable cross-team handle. Get it from hive.start.',
+      '- agent_id (ULID) is your stable cross-team handle. Get it from hive_start.',
       '- display_name is for display only, not unique.',
-      '- Inside a team, members can have unique nicknames (set with hive.team.nickname).',
+      '- Inside a team, members can have unique nicknames (set with hive_team_nickname).',
       '',
       '## Addressing',
       '- DM and task `to`: prefer agent_id. team-nickname or display_name also accepted if unambiguous.',
       '- Federation: use "id@node" or "nickname@node".',
       '',
       '## Workflow rules',
-      '- When you receive a task, propose a workflow (hive.workflow.propose) before starting.',
-      '- The creator approves (hive.workflow.approve). NEVER auto-approve — show the proposal to the user.',
-      '- Mark each step with hive.workflow.step.complete.',
-      '- Claim unassigned tasks with hive.task.claim.',
+      '- When you receive a task, propose a workflow (hive_workflow_propose) before starting.',
+      '- The creator approves (hive_workflow_approve). NEVER auto-approve — show the proposal to the user.',
+      '- Mark each step with hive_workflow_step_complete.',
+      '- Claim unassigned tasks with hive_task_claim.',
       '',
       '## Artifacts',
       'Use ~/.kitty-hive/artifacts/<task_id>/ for cross-agent file exchange.',
@@ -54,7 +54,7 @@ export function createMcpServer(): McpServer {
       const sessionId = extra?.sessionId;
       const agentId = sessionId ? sessionAgents.get(sessionId) : undefined;
       if (!agentId) {
-        return { contents: [{ uri: uri.href, text: '{"error":"Not authenticated. Call hive.start first."}' }] };
+        return { contents: [{ uri: uri.href, text: '{"error":"Not authenticated. Call hive_start first."}' }] };
       }
       const unread = getUnreadForAgent(agentId);
       return {

@@ -193,7 +193,7 @@ async function cmdInit() {
       console.log(`  ${t.padEnd(12)} ${path}`);
     }
   }
-  console.log(`\n  Agent registers via hive.start when first used.`);
+  console.log(`\n  Agent registers via hive_start when first used.`);
 }
 
 function relativeTime(iso: string | null | undefined): string {
