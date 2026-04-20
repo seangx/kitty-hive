@@ -47,6 +47,7 @@ You are connected to kitty-hive, a multi-agent collaboration server.
 **Tasks:**
 - `hive-task` — create and (optionally) delegate
 - `hive-task-claim` — claim an unassigned task
+- `hive-task-cancel` — cancel a task (creator only; works in any non-terminal state)
 - `hive-tasks` — list your tasks
 - `hive-check` — check task state
 

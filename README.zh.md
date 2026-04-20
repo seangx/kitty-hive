@@ -126,6 +126,7 @@ npx kitty-hive init cursor
 |---------|------|------|
 | `hive-task` | `hive_task` | 创建并委派（`to` 接 id / nickname / `role:xxx` / `id@node`） |
 | `hive-task-claim` | `hive_task_claim` | 认领未分配任务 |
+| `hive-task-cancel` | `hive_task_cancel` | 取消任务（仅创建者；任何非终态都可用） |
 | `hive-tasks` | `hive_tasks` | 任务看板 |
 | `hive-check` | `hive_check` | 查看任务状态 |
 | `hive-workflow-propose` | `hive_workflow_propose` | 提出工作流方案；每步可设 `gate: true` → 完成后停在 `awaiting_approval` 等创建者放行 |

@@ -126,6 +126,7 @@ Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case
 |---------|------|-------------|
 | `hive-task` | `hive_task` | Create & delegate (`to` accepts id, nickname, `role:xxx`, `id@node`) |
 | `hive-task-claim` | `hive_task_claim` | Claim an unassigned task |
+| `hive-task-cancel` | `hive_task_cancel` | Cancel a task (creator only; any non-terminal state) |
 | `hive-tasks` | `hive_tasks` | List your tasks |
 | `hive-check` | `hive_check` | Check task status |
 | `hive-workflow-propose` | `hive_workflow_propose` | Propose workflow steps; set `gate: true` per step to pause for creator review |

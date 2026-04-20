@@ -10,7 +10,7 @@ import { handleDM } from './tools/dm.js';
 import { storeFileFromBuffer } from './files.js';
 import {
   handleTaskCreate, handleWorkflowPropose, handleWorkflowApprove,
-  handleStepComplete, handleStepApprove, handleWorkflowReject, handleTaskClaim,
+  handleStepComplete, handleStepApprove, handleWorkflowReject, handleTaskClaim, handleTaskCancel,
 } from './tools/task.js';
 import { notifyAgents, notifyTaskParticipants } from './sessions.js';
 
@@ -331,6 +331,10 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
           break;
         case 'task-reject':
           action = handleWorkflowReject(task_id, remoteAgent.id, step, reason);
+          break;
+        case 'task-cancel':
+          handleTaskCancel(task_id, remoteAgent.id, reason);
+          action = { type: 'task-cancel' };
           break;
         default:
           res.writeHead(400, { 'Content-Type': 'application/json' });

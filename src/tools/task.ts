@@ -227,6 +227,13 @@ export async function handleTaskClaimAsync(taskId: string, agentId: string): Pro
   return out;
 }
 
+export async function handleTaskCancelAsync(taskId: string, agentId: string, reason?: string): Promise<{ task_id: string; status: 'canceled' }> {
+  handleTaskCancel(taskId, agentId, reason);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-cancel', { reason });
+  return { task_id: taskId, status: 'canceled' };
+}
+
 // --- hive_task_claim ---
 
 export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
@@ -435,4 +442,29 @@ export function handleWorkflowReject(taskId: string, agentId: string, stepNum: n
   appendTaskEvent(taskId, 'step-start', null, { step: targetStep, assignees: target?.assignees || [] });
 
   return { type: 'step-start', step: targetStep, assignees: target?.assignees || [] };
+}
+
+// --- Task: cancel ---
+
+const TERMINAL_STATUSES = new Set<TaskStatus>(['completed', 'failed', 'canceled']);
+
+export function handleTaskCancel(taskId: string, agentId: string, reason?: string): void {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.creator_agent_id !== agentId) {
+    throw new Error('Only the task creator can cancel a task');
+  }
+  if (TERMINAL_STATUSES.has(task.status as TaskStatus)) {
+    throw new Error(`Task already in terminal state: ${task.status}`);
+  }
+
+  // Use the workflow FSM if a workflow exists, otherwise the simple task FSM.
+  if (task.workflow_json) {
+    validateWorkflowTransition(task.status as TaskStatus, 'task-cancel');
+  } else {
+    validateTransition(task.status as TaskStatus, 'task-cancel');
+  }
+
+  updateTaskStatus(taskId, 'canceled', { completed_at: new Date().toISOString() });
+  appendTaskEvent(taskId, 'task-cancel', agentId, { reason });
 }

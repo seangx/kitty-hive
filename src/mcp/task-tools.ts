@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   handleTaskCreateAsync, handleCheck,
-  handleTaskClaimAsync,
+  handleTaskClaimAsync, handleTaskCancelAsync,
   handleWorkflowProposeAsync, handleWorkflowApproveAsync,
   handleStepCompleteAsync, handleStepApproveAsync, handleWorkflowRejectAsync,
 } from '../tools/task.js';
@@ -45,6 +45,27 @@ export function registerTaskTools(mcp: McpServer) {
       await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
         type: 'task-claimed', from_agent_id: agent.id, from: agent.display_name,
         task_id: params.task_id, preview: `${agent.display_name} claimed: ${result.title}`,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_task_cancel',
+    'Cancel a task. Creator-only. Works in any non-terminal state (created, proposing, approved, in_progress, awaiting_approval). Notifies the assignee so they stop work.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task id'),
+      reason: z.string().optional().describe('Optional cancellation reason (will be visible in task events).'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = await handleTaskCancelAsync(params.task_id, agent.id, params.reason);
+      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
+        type: 'task-cancel', from_agent_id: agent.id, from: agent.display_name,
+        task_id: params.task_id,
+        preview: `Task canceled by ${agent.display_name}${params.reason ? `: ${params.reason}` : ''}`,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },

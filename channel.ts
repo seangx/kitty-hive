@@ -128,7 +128,7 @@ const mcp = new Server(
       '- Identity: hive-whoami, hive-rename, hive-agents (list all agents on the hive)',
       '- DM & files: hive-dm (pass attach: ["/local/path"] to send files), hive-inbox, hive-dm-read (full content when preview has a [hive note] block), hive-file-fetch (get attachment by file_id)',
       '- Teams: hive-team-create, hive-team-join, hive-team-list, hive-teams (mine), hive-team-info, hive-team-events, hive-team-message, hive-team-nickname',
-      '- Tasks: hive-task, hive-task-claim, hive-tasks, hive-check',
+      '- Tasks: hive-task, hive-task-claim, hive-task-cancel (creator only), hive-tasks, hive-check',
       '- Workflow: hive-workflow-propose (set gate:true per step for review pauses), hive-workflow-approve, hive-workflow-step-complete, hive-workflow-step-approve (release gate, creator only), hive-workflow-reject',
       '- Federation: hive-peers, hive-remote-agents (then DM/task with id@<peer-name>)',
       '',
