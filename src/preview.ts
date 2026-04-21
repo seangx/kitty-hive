@@ -76,3 +76,65 @@ export function buildDMPreview(opts: BuildPreviewOpts): { preview: string; trunc
 
   return { preview: lines.join('\n'), truncated };
 }
+
+// --- Channel push payloads ---
+//
+// Push notifications carry NO body — only a stable event_id + enough context
+// for the receiver to fetch the full record themselves. This eliminates the
+// "receiver acts on truncated preview" class of bugs (v0.5.5 tried to fix
+// this by appending a `[hive note]` to the preview; v0.6.0 goes further and
+// drops the preview entirely).
+
+export interface PushPayloadInput {
+  /** Event type: 'dm' | 'team-message' | 'join' | 'leave' | 'rename' |
+   *  'task-assigned' | 'task-claimed' | 'task-propose' | 'step-start' |
+   *  'step-complete' | 'awaiting_approval' | 'step-approve' |
+   *  'task-reject' | 'task-cancel' | 'task-complete' */
+  type: string;
+  /** Sender display_name, e.g. for UI labels. */
+  from: string;
+  from_agent_id: string;
+  /** Globally-unique event id. Used for dedup AND as the payload's stable
+   *  identity. Format conventions:
+   *    - DM:   `dm:<message_id>`
+   *    - Task: `task-ev:<task_events.id>`
+   *    - Team: `team-ev:<team_events.id>`
+   *    - Synth (no DB row, e.g. task-assigned):  `task:<task_id>:<type>:<ts>` */
+  event_id: string;
+  message_id?: number;
+  task_id?: string;
+  team_id?: string;
+  attachments_count?: number;
+  /** Optional rejection/cancel reason (exposed so the receiver can see why
+   *  without a round-trip; it's already a short field by convention). */
+  reason?: string;
+}
+
+export function buildPushMessage(p: PushPayloadInput): string {
+  const fromLabel = p.from ? ` from ${p.from}` : '';
+  let preview: string;
+  if (p.type === 'dm') {
+    const att = p.attachments_count
+      ? ` (${p.attachments_count} attachment${p.attachments_count > 1 ? 's' : ''})`
+      : '';
+    preview = `[hive] DM${fromLabel}${att} — call hive-dm-read({ message_id: ${p.message_id} }) for full content.`;
+  } else if (p.task_id) {
+    const reasonLabel = p.reason ? ` — reason: ${p.reason}` : '';
+    preview = `[hive] ${p.type}${fromLabel} on task ${p.task_id}${reasonLabel} — call hive-check({ task_id: "${p.task_id}" }) for full state.`;
+  } else if (p.team_id) {
+    preview = `[hive] ${p.type}${fromLabel} in team ${p.team_id} — call hive-team-events({ team_id: "${p.team_id}" }) for details.`;
+  } else {
+    preview = `[hive] ${p.type}${fromLabel}`;
+  }
+  return JSON.stringify({
+    type: p.type,
+    from: p.from,
+    from_agent_id: p.from_agent_id,
+    event_id: p.event_id,
+    message_id: p.message_id,
+    task_id: p.task_id,
+    team_id: p.team_id,
+    reason: p.reason,
+    preview,
+  });
+}

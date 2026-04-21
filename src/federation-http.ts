@@ -13,6 +13,7 @@ import {
   handleStepComplete, handleStepApprove, handleWorkflowReject, handleTaskClaim, handleTaskCancel,
 } from './tools/task.js';
 import { notifyAgents, notifyTaskParticipants } from './sessions.js';
+import { buildPushMessage } from './preview.js';
 
 function authenticatePeer(req: IncomingMessage): db.Peer | null {
   const authHeader = req.headers.authorization;
@@ -191,15 +192,13 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
     const attachments: FileAttachment[] = Array.isArray(body.attachments) ? body.attachments : [];
     const msg = db.appendDM(remoteAgent.id, target.id, content, attachments);
 
-    const previewBase = content || (attachments.length > 0 ? `[${attachments.length} attachment(s)]` : '');
-    const truncated = previewBase.length > 200;
-    await notifyAgents([target.id], remoteAgent.id, JSON.stringify({
-      type: 'dm', from_agent_id: remoteAgent.id, from: remoteAgent.display_name,
+    await notifyAgents([target.id], remoteAgent.id, buildPushMessage({
+      type: 'dm',
+      from: remoteAgent.display_name,
+      from_agent_id: remoteAgent.id,
+      event_id: `dm:${msg.id}`,
       message_id: msg.id,
-      preview: truncated
-        ? previewBase.slice(0, 200) + ` …(truncated; hive-dm-read message_id=${msg.id} for full content)`
-        : previewBase,
-      attachments,
+      attachments_count: attachments.length,
     }));
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -285,9 +284,12 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
     });
     db.updateTaskStatus(task.id, 'proposing');
 
-    await notifyTaskParticipants(task.id, remoteCreator.id, JSON.stringify({
-      type: 'task-assigned', from_agent_id: remoteCreator.id, from: remoteCreator.display_name,
-      task_id: task.id, preview: title,
+    await notifyTaskParticipants(task.id, remoteCreator.id, buildPushMessage({
+      type: 'task-assigned',
+      from: remoteCreator.display_name,
+      from_agent_id: remoteCreator.id,
+      event_id: `task:${task.id}:task-assigned:${Date.now()}`,
+      task_id: task.id,
     }));
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -341,9 +343,13 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
           res.end(JSON.stringify({ error: `Unknown event type: ${type}` }));
           return;
       }
-      await notifyTaskParticipants(task_id, remoteAgent.id, JSON.stringify({
-        type, from_agent_id: remoteAgent.id, from: remoteAgent.display_name,
-        task_id, preview: `${type} from ${remoteAgent.display_name}`,
+      await notifyTaskParticipants(task_id, remoteAgent.id, buildPushMessage({
+        type,
+        from: remoteAgent.display_name,
+        from_agent_id: remoteAgent.id,
+        event_id: `task:${task_id}:${type}:${Date.now()}`,
+        task_id,
+        reason,
       }));
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, action }));

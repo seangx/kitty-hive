@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
@@ -1152,6 +1152,190 @@ async function cmdConfigSet() {
   console.log(`✅ ${key} = ${value}`);
 }
 
+// --- log (history viewers) ---
+
+function resolveAgentByIdOrName(target: string): { id: string; display_name: string } | null {
+  const byId = getAgentById(target);
+  if (byId) return { id: byId.id, display_name: byId.display_name };
+  const byName = listAllAgents().filter(a => a.display_name === target);
+  if (byName.length === 1) return { id: byName[0].id, display_name: byName[0].display_name };
+  if (byName.length > 1) {
+    console.log(`"${target}" matches ${byName.length} agents — use id to disambiguate:`);
+    for (const a of byName) console.log(`  ${a.id}  ${a.display_name}`);
+    process.exit(1);
+  }
+  return null;
+}
+
+function parseLogLimit(from = 2): number {
+  for (let i = from; i < args.length; i++) {
+    if ((args[i] === '--limit' || args[i] === '-n') && args[i + 1]) {
+      const n = parseInt(args[i + 1], 10);
+      if (n > 0) return n;
+    }
+  }
+  return 50;
+}
+
+async function cmdLogDM() {
+  const { dbPath } = parseFlags(2);
+  const db = initDB(dbPath);
+  let target = args[2] && !args[2].startsWith('-') ? args[2] : '';
+  const limit = parseLogLimit(2);
+
+  let agent: { id: string; display_name: string } | null = null;
+  if (target) {
+    agent = resolveAgentByIdOrName(target);
+    if (!agent) {
+      console.log(`Agent "${target}" not found.`);
+      process.exit(1);
+    }
+  } else {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive log dm <agent-id-or-name> [--limit 50]');
+      process.exit(1);
+    }
+    const all = listAllAgents().filter(a => a.origin_peer === '' || a.origin_peer);
+    if (all.length === 0) {
+      console.log('No agents registered.');
+      return;
+    }
+    const id = await askSelect<string>({
+      message: 'Show DM log involving which agent?',
+      options: all.map(a => ({
+        value: a.id,
+        label: a.display_name,
+        hint: a.origin_peer ? `${a.id} @${a.origin_peer}` : a.id,
+      })),
+    });
+    agent = resolveAgentByIdOrName(id);
+  }
+  if (!agent) { console.log('Not found.'); process.exit(1); }
+
+  const msgs = getDMLog(agent.id, limit);
+  if (msgs.length === 0) {
+    console.log(`No DMs involving ${agent.display_name} (${agent.id}).`);
+    return;
+  }
+  console.log(`Last ${msgs.length} DMs involving ${agent.display_name} (${agent.id}):\n`);
+  for (const m of msgs) {
+    const from = getAgentById(m.from_agent_id);
+    const to = getAgentById(m.to_agent_id);
+    const fromLabel = from?.display_name ?? m.from_agent_id.slice(-12);
+    const toLabel = to?.display_name ?? m.to_agent_id.slice(-12);
+    const ts = m.ts.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    let att = '';
+    try {
+      const a = JSON.parse(m.attachments || '[]');
+      if (a.length > 0) att = `  [${a.length} attachment${a.length > 1 ? 's' : ''}]`;
+    } catch { /* ignore */ }
+    const body = m.content.length > 400 ? m.content.slice(0, 400) + ' …' : m.content;
+    console.log(`${ts}  #${m.id}  ${fromLabel} → ${toLabel}${att}`);
+    for (const line of body.split('\n')) console.log(`    ${line}`);
+    console.log('');
+  }
+}
+
+async function cmdLogTeam() {
+  const { dbPath } = parseFlags(2);
+  const db = initDB(dbPath);
+  let target = args[2] && !args[2].startsWith('-') ? args[2] : '';
+  const limit = parseLogLimit(2);
+
+  if (!target) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive log team <team-name-or-id> [--limit 50]');
+      process.exit(1);
+    }
+    const teams = db.prepare("SELECT id, name FROM teams ORDER BY created_at DESC").all() as any[];
+    if (teams.length === 0) {
+      console.log('No teams exist.');
+      return;
+    }
+    target = await askSelect<string>({
+      message: 'Show event log for which team?',
+      options: teams.map(t => ({ value: t.id, label: t.name, hint: t.id })),
+    });
+  }
+  const team = getTeamByName(target) || getTeamById(target);
+  if (!team) {
+    console.log(`Team "${target}" not found.`);
+    process.exit(1);
+  }
+  const events = getTeamEvents(team.id, 0, limit);
+  if (events.length === 0) {
+    console.log(`No events in team "${team.name}".`);
+    return;
+  }
+  console.log(`Last ${events.length} events in team ${team.name} (${team.id}):\n`);
+  for (const e of events) {
+    const actor = e.actor_agent_id ? (getAgentById(e.actor_agent_id)?.display_name ?? e.actor_agent_id.slice(-12)) : 'system';
+    const ts = e.ts.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    console.log(`${ts}  seq=${e.seq}  ${e.type}  by ${actor}`);
+    try {
+      const p = JSON.parse(e.payload_json);
+      if (p && Object.keys(p).length > 0) {
+        const body = JSON.stringify(p);
+        const trimmed = body.length > 400 ? body.slice(0, 400) + ' …' : body;
+        console.log(`    ${trimmed}`);
+      }
+    } catch { /* ignore */ }
+    console.log('');
+  }
+}
+
+async function cmdLogTask() {
+  const { dbPath } = parseFlags(2);
+  initDB(dbPath);
+  let target = args[2] && !args[2].startsWith('-') ? args[2] : '';
+  const limit = parseLogLimit(2);
+
+  if (!target) {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive log task <task-id> [--limit 100]');
+      process.exit(1);
+    }
+    target = await askText({
+      message: 'Task id',
+      validate: (v) => ((v ?? '').trim().length === 0 ? 'Task id required' : undefined),
+    });
+  }
+  const task = getTaskById(target);
+  if (!task) {
+    console.log(`Task "${target}" not found.`);
+    process.exit(1);
+  }
+  const creator = getAgentById(task.creator_agent_id)?.display_name ?? task.creator_agent_id.slice(-12);
+  const assignee = task.assignee_agent_id ? (getAgentById(task.assignee_agent_id)?.display_name ?? task.assignee_agent_id.slice(-12)) : 'unassigned';
+  console.log(`Task ${task.id}`);
+  console.log(`  title:    ${task.title}`);
+  console.log(`  status:   ${task.status}${task.workflow_json ? ` (step ${task.current_step})` : ''}`);
+  console.log(`  creator:  ${creator}`);
+  console.log(`  assignee: ${assignee}`);
+  console.log('');
+
+  const events = getTaskEvents(task.id, 0, limit);
+  if (events.length === 0) {
+    console.log('(no events yet)');
+    return;
+  }
+  console.log(`Last ${events.length} events:\n`);
+  for (const e of events) {
+    const actor = e.actor_agent_id ? (getAgentById(e.actor_agent_id)?.display_name ?? e.actor_agent_id.slice(-12)) : 'system';
+    const ts = e.ts.replace('T', ' ').replace(/\.\d+Z$/, 'Z');
+    console.log(`${ts}  seq=${e.seq}  ${e.type}  by ${actor}`);
+    try {
+      const p = JSON.parse(e.payload_json);
+      if (p && Object.keys(p).length > 0) {
+        const body = JSON.stringify(p);
+        const trimmed = body.length > 400 ? body.slice(0, 400) + ' …' : body;
+        console.log(`    ${trimmed}`);
+      }
+    } catch { /* ignore */ }
+    console.log('');
+  }
+}
+
 function getDefaultAgentName(): string {
   // Try package.json name
   const pkgPath = join(process.cwd(), 'package.json');
@@ -1181,6 +1365,7 @@ Top-level commands:
 Command groups:
   agent      Manage local agents       (list, rename, remove)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
+  log        Inspect message history   (dm, team, task)
   tunnel     Cloudflare tunnel control (start, status)
   config     Node config               (set)
   files      Federation files          (clean)
@@ -1219,6 +1404,20 @@ Subcommands:
 
 All subcommands prompt for missing arguments interactively.
 Cross-machine setups need \`kitty-hive tunnel start\` running.`);
+}
+
+function showLogHelp() {
+  console.log(`🐝 kitty-hive log — browse message history (local DB, read-only)
+
+Usage:
+  kitty-hive log <subcommand> [args]
+
+Subcommands:
+  dm   [<agent-id-or-name>] [--limit 50]    All DMs involving this agent (either direction, chronological)
+  team [<team-name-or-id>]  [--limit 50]    Team event log (join/leave/message/rename)
+  task [<task-id>]          [--limit 100]   Task event log (propose/approve/step-*/reject/cancel)
+
+Interactive picker opens when the target is omitted in a TTY.`);
 }
 
 function showTunnelHelp() {
@@ -1324,6 +1523,14 @@ switch (command) {
       case 'start':  run(cmdTunnelStart);  break;
       case 'status': run(cmdTunnelStatus); break;
       default:       showTunnelHelp();     break;
+    }
+    break;
+  case 'log':
+    switch (args[1]) {
+      case 'dm':   run(cmdLogDM);   break;
+      case 'team': run(cmdLogTeam); break;
+      case 'task': run(cmdLogTask); break;
+      default:     showLogHelp();   break;
     }
     break;
   case 'help':

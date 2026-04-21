@@ -356,7 +356,12 @@ kitty-hive tunnel  start  [--port 4123] [--name name]                启动 clou
 kitty-hive config  set    [key] [value]                              设置配置（如 `name`）
 kitty-hive files   clean  [--days 7]                                 清理过期联邦传输文件
 kitty-hive db      clear  [--db path]                                清空数据库
+kitty-hive log     dm    [<agent>] [--limit 50]                      查看涉及某 agent 的 DM 历史
+                   team  [<team>]  [--limit 50]                      查看团队事件日志
+                   task  [<task>]  [--limit 100]                     查看任务事件日志
 ```
+
+**Channel 推送从 v0.6.0 起只带 id、不再带摘要**。推送里只有事件类型、发送者、和拉取详情需要的 id——收到就必须调 `hive-dm-read` / `hive-check` / `hive-team-events` 取正文。这样既根除了"对着截断摘要直接办事"的老 bug，也让去重变得简单：channel 按 `event_id` 去重，跟内容无关。
 
 `peer expose` / `peer add --expose` 现在只接受真实存在的本地 agent ID —— 拼错或填了远端 placeholder 都会被直接拒掉。
 

@@ -357,7 +357,12 @@ kitty-hive tunnel  start  [--port 4123] [--name name]                Run cloudfl
 kitty-hive config  set    [key] [value]                              Set config (e.g. `name`)
 kitty-hive files   clean  [--days 7]                                 Remove old federation transfer files
 kitty-hive db      clear  [--db path]                                Clear the database
+kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM history involving an agent
+                   team  [<team>]  [--limit 50]                      Show team event log
+                   task  [<task>]  [--limit 100]                     Show task event log
 ```
+
+**Push notifications are id-only (v0.6.0+).** Channel pushes no longer contain a body preview — just the event type, sender, and identifiers. Receivers must call `hive-dm-read` / `hive-check` / `hive-team-events` to fetch full content. This eliminates the "receiver acts on truncated preview" bug class and also makes dedup rock-solid (channel dedups by `event_id`, not content).
 
 `peer expose` / `peer add --expose` only accept agents that actually exist on this hive — typos and remote placeholder IDs are rejected up front.
 

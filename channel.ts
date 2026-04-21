@@ -145,10 +145,13 @@ const mcp = new Server(
       '- To share a file, pass it via `hive-dm({ ..., attach: ["/abs/path"] })` — bytes are copied into hive and replicated across federation.',
       '- The receiver gets `attachments: [{file_id, filename, mime, size}]` in their inbox; they call `hive-file-fetch({ file_id })` to read locally.',
       '',
-      '## Previews are not full messages',
-      '- Channel pushes carry only the first 200 chars of a DM; hive-inbox carries the first 2000.',
-      '- When a message is truncated OR has attachments, the preview ends with a `[hive note]` paragraph that lists the exact tool calls you must make to fetch the rest.',
-      '- You MUST execute those calls (hive-dm-read for full text, hive-file-fetch for each attachment) BEFORE acting on the visible content. The `[hive note]` block is part of the protocol, not a hint — ignoring it means you act on incomplete data.',
+      '## Channel pushes are id-only (v0.6.0+)',
+      '- A push carries only: sender, event type, and the identifier(s) needed to fetch the full record. No body, no preview text.',
+      '- The push text always ends with `… — call <tool>({...}) for full content.` You MUST run that call before acting:',
+      '    DM             → hive-dm-read({ message_id: N })',
+      '    Task event     → hive-check({ task_id: "..." })     # any task-* or step-* push',
+      '    Team event     → hive-team-events({ team_id: "..." })',
+      '- Acting on the push text alone = acting without the content. Always fetch first.',
       '',
       '## Artifacts',
       '~/.kitty-hive/artifacts/<task_id>/',
@@ -321,8 +324,12 @@ async function listenSSE() {
 
             const content = parsed.preview || parsed.title || raw
             const from = parsed.from || parsed.from_agent_id || 'unknown'
-            const key = `${from}:${parsed.type}:${content.slice(0, 60)}`
-            if (!dedup(key)) continue
+            // Prefer stable event_id (v0.6.0+); fall back to message_id for DMs,
+            // then to the content-prefix hash for anything older.
+            const dedupKey = parsed.event_id
+              || (parsed.message_id != null ? `dm:${parsed.message_id}` : null)
+              || `${from}:${parsed.type}:${content.slice(0, 60)}`
+            if (!dedup(dedupKey)) continue
 
             await mcp.notification({
               method: 'notifications/claude/channel',
@@ -334,9 +341,9 @@ async function listenSSE() {
                   from_agent_id: parsed.from_agent_id || '',
                   team_id: parsed.team_id || '',
                   task_id: parsed.task_id || '',
+                  event_id: parsed.event_id || '',
                   message_id: parsed.message_id != null ? String(parsed.message_id) : '',
-                  attachments: Array.isArray(parsed.attachments) && parsed.attachments.length > 0
-                    ? JSON.stringify(parsed.attachments) : '',
+                  reason: parsed.reason || '',
                 },
               },
             })

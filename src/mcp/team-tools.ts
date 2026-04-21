@@ -6,6 +6,11 @@ import {
 } from '../tools/team.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyTeamMembers } from '../sessions.js';
+import { buildPushMessage } from '../preview.js';
+
+function teamEventId(teamId: string, type: string): string {
+  return `team:${teamId}:${type}:${Date.now()}`;
+}
 
 export function registerTeamTools(mcp: McpServer) {
   mcp.tool(
@@ -38,9 +43,12 @@ export function registerTeamTools(mcp: McpServer) {
       if (!agent) return authError();
       const result = handleTeamJoin(agent.id, { team_id: params.team_id, name: params.name, nickname: params.nickname });
       const shownName = params.nickname ?? agent.display_name;
-      await notifyTeamMembers(result.team_id, agent.id, JSON.stringify({
-        type: 'join', from_agent_id: agent.id, from: shownName,
-        team_id: result.team_id, preview: `${shownName} joined`,
+      await notifyTeamMembers(result.team_id, agent.id, buildPushMessage({
+        type: 'join',
+        from: shownName,
+        from_agent_id: agent.id,
+        event_id: teamEventId(result.team_id, 'join'),
+        team_id: result.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -100,10 +108,12 @@ export function registerTeamTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = handleTeamMessage(agent.id, { team_id: params.team_id, content: params.content });
-      const preview = params.content.length > 200 ? params.content.slice(0, 200) + ' [summary]' : params.content;
-      await notifyTeamMembers(params.team_id, agent.id, JSON.stringify({
-        type: 'team-message', from_agent_id: agent.id, from: agent.display_name,
-        team_id: params.team_id, preview,
+      await notifyTeamMembers(params.team_id, agent.id, buildPushMessage({
+        type: 'team-message',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: teamEventId(params.team_id, 'team-message'),
+        team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },

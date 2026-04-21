@@ -8,7 +8,12 @@ import {
 } from '../tools/task.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents, notifyTaskParticipants } from '../sessions.js';
+import { buildPushMessage } from '../preview.js';
 import * as db from '../db.js';
+
+function eventId(taskId: string, type: string): string {
+  return `task:${taskId}:${type}:${Date.now()}`;
+}
 
 export function registerTaskTools(mcp: McpServer) {
   mcp.tool(
@@ -25,9 +30,12 @@ export function registerTaskTools(mcp: McpServer) {
       if (!agent) return authError();
       const result = await handleTaskCreateAsync(agent.id, { to: params.to, title: params.title, input: params.input as object });
       if (result.assignee) {
-        await notifyAgents([result.assignee.id], agent.id, JSON.stringify({
-          type: 'task-assigned', from_agent_id: agent.id, from: agent.display_name,
-          task_id: result.task_id, title: params.title,
+        await notifyAgents([result.assignee.id], agent.id, buildPushMessage({
+          type: 'task-assigned',
+          from: agent.display_name,
+          from_agent_id: agent.id,
+          event_id: eventId(result.task_id, 'task-assigned'),
+          task_id: result.task_id,
         }));
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -42,9 +50,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = await handleTaskClaimAsync(params.task_id, agent.id);
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: 'task-claimed', from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: `${agent.display_name} claimed: ${result.title}`,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'task-claimed',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'task-claimed'),
+        task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -62,10 +73,13 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = await handleTaskCancelAsync(params.task_id, agent.id, params.reason);
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: 'task-cancel', from_agent_id: agent.id, from: agent.display_name,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'task-cancel',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'task-cancel'),
         task_id: params.task_id,
-        preview: `Task canceled by ${agent.display_name}${params.reason ? `: ${params.reason}` : ''}`,
+        reason: params.reason,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
@@ -127,9 +141,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       await handleWorkflowProposeAsync(params.task_id, agent.id, params.workflow as any);
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: 'task-propose', from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: `Workflow proposed: ${params.workflow.length} steps`,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'task-propose',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'task-propose'),
+        task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'proposing', steps: params.workflow.length }) }] };
     },
@@ -143,9 +160,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleWorkflowApproveAsync(params.task_id, agent.id);
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: 'step-start', from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: `Step 1 started, assignees: ${action.assignees?.join(', ')}`,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'step-start',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'step-start'),
+        task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'approved', action }) }] };
     },
@@ -164,24 +184,13 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleStepCompleteAsync(params.task_id, agent.id, params.step, params.result);
-      const resultPreview = params.result && params.result.length > 200 ? params.result.slice(0, 200) + ' [summary]' : params.result;
-      let msg: string;
-      if (action?.type === 'task-complete') {
-        msg = 'Task completed!';
-      } else if (action?.type === 'step-start') {
-        msg = `Step ${action.step} started. Previous result: ${resultPreview || 'none'}`;
-      } else if (action?.type === 'awaiting_approval') {
-        const approver = action.approver ? db.getAgentById(action.approver)?.display_name ?? action.approver : 'creator';
-        msg = `[hive note] Step ${action.step} complete — awaiting approval from ${approver}.\n` +
-              `- Continue: hive-workflow-step-approve({ task_id: "${params.task_id}" })\n` +
-              `- Rework:   hive-workflow-reject({ task_id: "${params.task_id}", step: ${action.step}, reason: "..." })\n` +
-              `Do not start the next step until the gate is released.`;
-      } else {
-        msg = `Step ${params.step} progress recorded`;
-      }
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: action?.type || 'step-complete', from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: msg,
+      const pushType = action?.type || 'step-complete';
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: pushType,
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, pushType),
+        task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action: action || 'waiting' }) }] };
     },
@@ -200,12 +209,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleStepApproveAsync(params.task_id, agent.id);
-      const msg = action.type === 'task-complete'
-        ? 'Task completed (final gated step approved)!'
-        : `Step ${action.step} started (gate released by ${agent.display_name}).`;
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: action.type, from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: msg,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: action.type,
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, action.type),
+        task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
     },
@@ -224,9 +233,13 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleWorkflowRejectAsync(params.task_id, agent.id, params.step, params.reason);
-      await notifyTaskParticipants(params.task_id, agent.id, JSON.stringify({
-        type: 'task-reject', from_agent_id: agent.id, from: agent.display_name,
-        task_id: params.task_id, preview: `Step ${params.step} rejected → back to step ${action.step}`,
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'task-reject',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'task-reject'),
+        task_id: params.task_id,
+        reason: params.reason,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
     },

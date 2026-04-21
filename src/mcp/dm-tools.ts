@@ -7,7 +7,7 @@ import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents } from '../sessions.js';
 import { getUnreadForAgent, setReadCursor } from '../db.js';
 import { getFilePath, getFileMeta } from '../files.js';
-import { buildDMPreview, CHANNEL_PREVIEW_LEN } from '../preview.js';
+import { buildDMPreview, CHANNEL_PREVIEW_LEN, buildPushMessage } from '../preview.js';
 import * as db from '../db.js';
 
 export function registerDMTools(mcp: McpServer) {
@@ -28,16 +28,13 @@ export function registerDMTools(mcp: McpServer) {
       if (!agent) return authError();
       const result = await handleDMAsync(agent.id, params);
       if (!result.federated) {
-        const { preview } = buildDMPreview({
-          content: params.content || '',
-          messageId: result.message_id,
-          attachments: result.attachments || [],
-          maxLen: CHANNEL_PREVIEW_LEN,
-        });
-        await notifyAgents([result.to_agent_id], agent.id, JSON.stringify({
-          type: 'dm', from_agent_id: agent.id, from: agent.display_name,
-          message_id: result.message_id, preview,
-          attachments: result.attachments || [],
+        await notifyAgents([result.to_agent_id], agent.id, buildPushMessage({
+          type: 'dm',
+          from: agent.display_name,
+          from_agent_id: agent.id,
+          event_id: `dm:${result.message_id}`,
+          message_id: result.message_id,
+          attachments_count: (result.attachments || []).length,
         }));
       }
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };

@@ -99,7 +99,9 @@ The `path` returned by `hive-file-fetch` is local to **the receiver's** machine 
 4. Claim unassigned tasks with `hive-task-claim`.
 5. Artifacts go in `~/.kitty-hive/artifacts/<task_id>/`.
 6. **Never put a local file path in DM content** expecting the receiver to read it — use `attach` instead.
-7. **Previews are not full messages.** Channel pushes carry only the first 200 characters of a DM; `hive-inbox` carries the first 2000. When the message is longer or has attachments, the preview ends with a `[hive note]` paragraph that lists the exact tool calls you must make to fetch the rest. **You MUST follow those instructions before acting on the visible content.** The `[hive note]` block is part of the protocol, not a hint — ignoring it means you act on incomplete data. The block may include:
-   - `hive-dm-read({ message_id: N })` — fetch the full text
-   - `hive-file-fetch({ file_id })` — open each attachment listed by filename and `file_id`
-   In doubt, fetch first.
+7. **Channel pushes are id-only by design.** A push never contains the message body — only the sender, the type, and the identifiers needed to fetch the content. The push text is always of the form `[hive] <type> ... — call <tool>({...}) for full content.`  Always run that fetch before acting:
+   - DM → `hive-dm-read({ message_id: N })`
+   - Task event (any type: propose / step-start / step-complete / awaiting_approval / step-approve / reject / cancel) → `hive-check({ task_id })` for current state + recent events
+   - Team event → `hive-team-events({ team_id })` for details
+
+   `hive-inbox` (pull) carries longer previews (up to 2000 chars) but is still a preview — fetch the full record with the relevant tool when you actually need to act on it.

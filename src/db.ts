@@ -466,6 +466,18 @@ export function getDMConversation(agentA: string, agentB: string, since: number 
   `).all(agentA, agentB, agentB, agentA, since, limit) as DMMessage[];
 }
 
+// All DMs involving this agent (either direction), most recent N returned
+// in chronological order.
+export function getDMLog(agentId: string, limit: number = 50): DMMessage[] {
+  return getDB().prepare(`
+    SELECT * FROM (
+      SELECT * FROM dm_messages
+      WHERE from_agent_id = ? OR to_agent_id = ?
+      ORDER BY id DESC LIMIT ?
+    ) ORDER BY id ASC
+  `).all(agentId, agentId, limit) as DMMessage[];
+}
+
 // --- Task queries ---
 
 export interface CreateTaskOptions {
