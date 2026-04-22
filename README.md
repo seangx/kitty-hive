@@ -207,9 +207,9 @@ Suppose you have **mac** (locally) and **win** (a second machine). Both have `ki
 **1. Name each node**
 ```bash
 # mac
-kitty-hive config set name marvin
+npx kitty-hive config set name marvin
 # win
-kitty-hive config set name win-laptop
+npx kitty-hive config set name win-laptop
 ```
 
 **2. Make each side reachable.** Easiest with no public IP — Cloudflare Tunnel.
@@ -220,7 +220,7 @@ You have two options:
 
 Open a separate terminal on each machine:
 ```bash
-kitty-hive tunnel start
+npx kitty-hive tunnel start
 # → 🌀 Starting cloudflared…
 #   ✓ Tunnel URL: https://xxx-yyy-zzz.trycloudflare.com
 #     → registered with hive at http://localhost:4123
@@ -254,7 +254,7 @@ On a LAN/VPN you can skip the tunnel entirely and use `http://<host>:4123/mcp`.
 
 **3. Generate an invite on mac**
 ```bash
-kitty-hive peer invite --expose <mac-agent-id>
+npx kitty-hive peer invite --expose <mac-agent-id>
 # (auto-uses tunnel URL if `tunnel start` is running; otherwise pass --url)
 # → prints a single token like:
 #   hive://eyJ2IjoxLCJuIjoibWFydmluIi...
@@ -262,7 +262,7 @@ kitty-hive peer invite --expose <mac-agent-id>
 
 **4. Accept on win**
 ```bash
-kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
+npx kitty-hive peer accept 'hive://eyJ2IjoxLCJuIjoibWFydmluIi...' \
   --expose <win-agent-id>
 # (auto-uses win's tunnel URL; pass --url to override)
 # Output:
@@ -277,7 +277,7 @@ That's it — both sides are peered. No manual secret copying, no second `peer a
 
 **5. Verify**
 ```bash
-kitty-hive status
+npx kitty-hive status
 # 🤝 Peers table should show STATUS=active and NODE=<remote-node-name>
 ```
 
@@ -288,11 +288,11 @@ If the invitee can't HTTP back to the inviter (firewalled tunnel, etc.), use pla
 
 ```bash
 # mac
-kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
+npx kitty-hive peer add win https://win-tunnel.trycloudflare.com/mcp \
   --secret <shared-secret> --expose <mac-agent-id>
 
 # win
-kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
+npx kitty-hive peer add marvin https://mac-tunnel.trycloudflare.com/mcp \
   --secret <shared-secret> --expose <win-agent-id>
 ```
 
@@ -318,7 +318,7 @@ Replying to an incoming federated DM **does not** need `@peer` — your local pl
 - `--expose` lists **the agent on YOUR side that the peer should be allowed to reach**. Everything not listed is invisible to that peer. (Easy to get backwards.)
 - Agent ids are the safest value for `--expose`. Display names work only if globally unambiguous.
 - "Node name" (set by `config set name`, shown in ping responses) vs "peer name" (local label for a peer in your DB, starts as their node name but may be suffixed if it clashes with an existing peer). Use agent id + local peer name for addressing: `<agent-id>@<peer-name>`.
-- Peer `status` flips to `active` only on a successful round-trip ping. If it stays `inactive`, either the URL is unreachable or the stored tunnel URL has gone stale — see the **Tunnel URL self-heal** section in [How it works](#how-it-works-1) and `kitty-hive peer set-url` as manual recovery.
+- Peer `status` flips to `active` only on a successful round-trip ping. If it stays `inactive`, either the URL is unreachable or the stored tunnel URL has gone stale — see the **Tunnel URL self-heal** section in [How it works](#how-it-works-1) and `npx kitty-hive peer set-url` as manual recovery.
 
 ### How it works
 
@@ -326,7 +326,7 @@ Replying to an incoming federated DM **does not** need `@peer` — your local pl
 - **Tasks:** delegating to `<id>@peer` creates a local *shadow task* on the originator and a real task on the replica. Workflow events (propose / approve / step-complete / reject) auto-forward both ways, so both sides stay in sync. The originator can `hive-check` to see live progress.
 - **Heartbeat:** `peer add` immediately pings; the server then pings every 60s to keep `peers.status` accurate. `kitty-hive status` shows it.
 - **Tunnel URL self-heal:** when `tunnel start` gets a new URL (cloudflared restart), it pushes to the hive via `/admin/tunnel-url`, which broadcasts to all peers via `/federation/update-url`. Heartbeat ping responses also carry `public_url` so peers self-correct on the next ping cycle.
-- **Files:** transferred files live under `~/.kitty-hive/files/<id>/` and auto-expire after 7 days. `kitty-hive files clean [--days N]` runs the sweeper manually.
+- **Files:** transferred files live under `~/.kitty-hive/files/<id>/` and auto-expire after 7 days. `npx kitty-hive files clean [--days N]` runs the sweeper manually.
 
 **Verify locally** with the included e2e test (boots two hives in temp dirs, runs the full flow):
 
@@ -336,30 +336,32 @@ npm run test:federation
 
 ## CLI
 
-Run `kitty-hive` for the top-level overview, or `kitty-hive <group>` (e.g. `kitty-hive peer`) to see that group's subcommands. Most commands prompt for missing arguments interactively when run from a TTY; pass all flags to stay scriptable.
+Run `npx kitty-hive` for the top-level overview, or `npx kitty-hive <group>` (e.g. `npx kitty-hive peer`) to see that group's subcommands. Most commands prompt for missing arguments interactively when run from a TTY; pass all flags to stay scriptable. (Drop the `npx ` prefix if you've installed globally with `npm i -g kitty-hive`.)
 
 ```
-kitty-hive serve   [--port 4123] [--db path] [-v|-q]                 Start the MCP server
-kitty-hive init    [tool] [--port 4123]                              Write MCP config (interactive picker if no tool)
-kitty-hive status  [--port 4123]                                     Server, agent & team status
+npx kitty-hive serve   [--port 4123] [--db path] [-v|-q]                 Start the MCP server
+npx kitty-hive init    [tool] [--port 4123]                              Write MCP config (interactive picker if no tool)
+npx kitty-hive status  [--port 4123]                                     Server, agent & team status
 
-kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
-kitty-hive peer    invite [--expose <agent>]
-                   accept [<token>] [--expose <agent>]
-                   add    [<name>] [<url>] [--expose a,b] [--secret s]
-                   list
-                   expose  [<name>] [<id1,id2,...> | --clear]       View / replace exposed agents
-                                                                    (TTY → multiselect; non-TTY → show current)
-                   set-url [<name>] [<url>]                          Manual URL fix (auto-sync fallback)
-                   remove  [<name>]
-kitty-hive tunnel  start  [--port 4123] [--name name]                Run cloudflared & register URL
-                   status [--port 4123]                              Show registered tunnel URL
-kitty-hive config  set    [key] [value]                              Set config (e.g. `name`)
-kitty-hive files   clean  [--days 7]                                 Remove old federation transfer files
-kitty-hive db      clear  [--db path]                                Clear the database
-kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM history involving an agent
-                   team  [<team>]  [--limit 50]                      Show team event log
-                   task  [<task>]  [--limit 100]                     Show task event log
+npx kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
+                       remove --key <K> [--yes]                          Idempotent remove by external_key
+                       register --key <K> --display-name <N>             Idempotent upsert (stdout = agent_id)
+npx kitty-hive peer    invite [--expose <agent>]
+                       accept [<token>] [--expose <agent>]
+                       add    [<name>] [<url>] [--expose a,b] [--secret s]
+                       list
+                       expose  [<name>] [<id1,id2,...> | --clear]       View / replace exposed agents
+                                                                         (TTY → multiselect; non-TTY → show current)
+                       set-url [<name>] [<url>]                          Manual URL fix (auto-sync fallback)
+                       remove  [<name>]
+npx kitty-hive tunnel  start  [--port 4123] [--name name]                Run cloudflared & register URL
+                       status [--port 4123]                              Show registered tunnel URL
+npx kitty-hive config  set    [key] [value]                              Set config (e.g. `name`)
+npx kitty-hive files   clean  [--days 7]                                 Remove old federation transfer files
+npx kitty-hive db      clear  [--db path]                                Clear the database
+npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM history involving an agent
+                       team  [<team>]  [--limit 50]                      Show team event log
+                       task  [<task>]  [--limit 100]                     Show task event log
 ```
 
 **Push notifications are id-only (v0.6.0+).** Channel pushes no longer contain a body preview — just the event type, sender, and identifiers. Receivers must call `hive-dm-read` / `hive-check` / `hive-team-events` to fetch full content. This eliminates the "receiver acts on truncated preview" bug class and also makes dedup rock-solid (channel dedups by `event_id`, not content).
@@ -382,8 +384,8 @@ kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM his
 Session managers, terminal multiplexers, CI runners, or any tool that spawns long-lived processes can make those processes appear as stable hive agents by:
 
 1. **At spawn**: inject env vars (typically `HIVE_AGENT_KEY=<your-stable-id>` plus `HIVE_AGENT_NAME=<readable-label>`) into the child process. The channel plugin reads them on startup; same key always resolves to the same `agent_id` across restarts.
-2. **At cleanup**: invoke `kitty-hive agent remove --key <your-stable-id>` (idempotent — exits 0 even if no such agent). Optionally `--yes` skips the confirmation prompt.
-3. **Without a hive plugin**: scripts can also call `kitty-hive agent register --key <K> --display-name <N>`; stdout prints the `agent_id` so a caller can pipe it.
+2. **At cleanup**: invoke `npx kitty-hive agent remove --key <your-stable-id> --yes` (idempotent — exits 0 even if no such agent; `--yes` skips the confirmation prompt).
+3. **Without a hive plugin**: scripts can also call `npx kitty-hive agent register --key <K> --display-name <N>`; stdout prints the `agent_id` so a caller can pipe it.
 
 Contract: hive **never** raises errors that orchestrators have to catch — every code path either returns the agent_id or exits 0. UNIQUE conflicts on `external_key` are logged warn server-side and the call still succeeds; the conflicting key just isn't attached.
 
