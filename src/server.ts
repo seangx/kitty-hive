@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { createServer, IncomingMessage, ServerResponse } from 'node:http';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
-import { initDB, cleanupStaleTasks } from './db.js';
+import { initDB, cleanupStaleTasks, cleanupPendingPushes, pendingPushCountByAgent } from './db.js';
 import { log, setLogLevel } from './log.js';
-import { sessions, unbindSession, sessionAgents, activeSSE } from './sessions.js';
+import { sessions, unbindSession, sessionAgents, activeSSE, drainPushesForAgent } from './sessions.js';
 import { createMcpServer } from './mcp/server.js';
 import { handleFederation, cleanupOldFiles, getNodeName } from './federation-http.js';
 import { handleAdmin } from './admin-http.js';
@@ -50,6 +50,15 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         activeSSE.delete(sid);
         log('info', `[sse] stream closed for session=${sid}`);
       });
+      // Drain any pending pushes for the bound agent. Fire-and-forget — we
+      // don't want to block the SSE handshake on it. Drain runs on next tick
+      // so the transport gets a chance to attach first.
+      const boundAgent = sessionAgents.get(sid);
+      if (boundAgent) {
+        setImmediate(() => {
+          drainPushesForAgent(boundAgent).catch(err => log('warn', `[drain] failed for ${boundAgent}: ${err}`));
+        });
+      }
       await sessions[sid].transport.handleRequest(req, res);
       return;
     }
@@ -156,6 +165,21 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
   } catch (err) { log('warn', `[cleanup] file sweep failed: ${(err as any).message ?? err}`); }
   setInterval(() => {
     try { cleanupOldFiles(7); } catch { /* ignore */ }
+  }, 24 * 60 * 60 * 1000);
+
+  // Sweep stale pending pushes at boot, then daily. Surviving pushes will
+  // drain naturally when each agent's SSE comes back online.
+  try {
+    const dropped = cleanupPendingPushes(7);
+    const remaining = pendingPushCountByAgent();
+    if (dropped > 0) log('info', `[cleanup] removed ${dropped} pending pushes older than 7d`);
+    if (remaining.size > 0) {
+      const summary = [...remaining.entries()].map(([a, n]) => `${a}:${n}`).join(' ');
+      log('info', `[push-queue] ${remaining.size} agent(s) have pending pushes: ${summary}`);
+    }
+  } catch (err) { log('warn', `[cleanup] push-queue sweep failed: ${(err as any).message ?? err}`); }
+  setInterval(() => {
+    try { cleanupPendingPushes(7); } catch { /* ignore */ }
   }, 24 * 60 * 60 * 1000);
 
   startHeartbeat(60 * 1000);

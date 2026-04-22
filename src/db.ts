@@ -136,6 +136,17 @@ export function initDB(dbPath?: string): Database.Database {
       value  TEXT NOT NULL,
       ts     TEXT NOT NULL
     );
+
+    -- Persistent push queue: when notifyAgents finds no live SSE for a target
+    -- agent, the payload is enqueued here. When that agent's SSE comes back
+    -- online, drainPushesForAgent flushes everything in id order.
+    CREATE TABLE IF NOT EXISTS pending_pushes (
+      id          INTEGER PRIMARY KEY AUTOINCREMENT,
+      agent_id    TEXT NOT NULL,
+      payload     TEXT NOT NULL,
+      created_at  TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_pending_pushes_agent ON pending_pushes(agent_id, id);
   `);
 
   // Idempotent column migrations for federation fields
@@ -170,6 +181,49 @@ export function initDB(dbPath?: string): Database.Database {
 export function getDB(): Database.Database {
   if (!db) throw new Error('Database not initialized. Call initDB() first.');
   return db;
+}
+
+// --- Persistent push queue ---
+
+export interface PendingPush {
+  id: number;
+  agent_id: string;
+  payload: string;
+  created_at: string;
+}
+
+export function enqueuePendingPush(agentId: string, payload: string): void {
+  getDB().prepare(
+    'INSERT INTO pending_pushes (agent_id, payload, created_at) VALUES (?, ?, ?)'
+  ).run(agentId, payload, nowISO());
+}
+
+export function listPendingPushes(agentId: string): PendingPush[] {
+  return getDB().prepare(
+    'SELECT id, agent_id, payload, created_at FROM pending_pushes WHERE agent_id = ? ORDER BY id ASC'
+  ).all(agentId) as PendingPush[];
+}
+
+export function deletePendingPushes(ids: number[]): void {
+  if (ids.length === 0) return;
+  const placeholders = ids.map(() => '?').join(',');
+  getDB().prepare(`DELETE FROM pending_pushes WHERE id IN (${placeholders})`).run(...ids);
+}
+
+/** Returns the number of rows removed. */
+export function cleanupPendingPushes(maxAgeDays: number = 7): number {
+  const cutoff = new Date(Date.now() - maxAgeDays * 24 * 60 * 60 * 1000).toISOString();
+  const result = getDB().prepare('DELETE FROM pending_pushes WHERE created_at < ?').run(cutoff);
+  return result.changes;
+}
+
+export function pendingPushCountByAgent(): Map<string, number> {
+  const rows = getDB().prepare(
+    'SELECT agent_id, COUNT(*) as cnt FROM pending_pushes GROUP BY agent_id'
+  ).all() as Array<{ agent_id: string; cnt: number }>;
+  const m = new Map<string, number>();
+  for (const r of rows) m.set(r.agent_id, r.cnt);
+  return m;
 }
 
 // SQLite doesn't support altering a CHECK constraint in place — when we add a

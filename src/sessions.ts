@@ -25,6 +25,14 @@ export function bindSession(sessionId: string, agentId: string) {
   if (!set) { set = new Set(); agentSessions.set(agentId, set); }
   set.add(sessionId);
   log('info', `[bind] session=${sessionId} → agent=${agentId} (sessions: ${set.size})`);
+  // If SSE is already active for this session, drain immediately. (When SSE
+  // opens before bind, the SSE handler also schedules a drain; this covers
+  // the opposite ordering.)
+  if (activeSSE.has(sessionId)) {
+    setImmediate(() => {
+      drainPushesForAgent(agentId).catch(err => log('warn', `[drain] failed for ${agentId}: ${err}`));
+    });
+  }
 }
 
 export function unbindSession(sessionId: string) {
@@ -39,30 +47,76 @@ export function unbindSession(sessionId: string) {
 }
 
 export async function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string) {
+  const payload = message ?? 'New event';
   for (const agentId of agentIds) {
     if (agentId === excludeAgentId) continue;
     const sids = agentSessions.get(agentId);
-    if (!sids || sids.size === 0) {
-      log('info', `[notify] agent=${agentId} → no bound sessions, push dropped`);
-      continue;
-    }
-    const live = [...sids].filter(s => activeSSE.has(s));
-    log('info', `[notify] agent=${agentId} bound=${sids.size} live-sse=${live.length}`);
+    const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
     if (live.length === 0) {
-      log('warn', `[notify] agent=${agentId} has bound sessions but no active SSE stream → push dropped`);
+      // No live SSE — persist so a future reconnect / restart can pick it up.
+      db.enqueuePendingPush(agentId, payload);
+      log('info', `[notify] agent=${agentId} → no live SSE, enqueued`);
       continue;
     }
+    log('info', `[notify] agent=${agentId} live-sse=${live.length}`);
+    let anyDelivered = false;
     for (const sid of live) {
       const session = sessions[sid];
       if (!session) { log('warn', `[notify] session ${sid} NOT FOUND`); continue; }
       try {
-        await session.server.sendLoggingMessage({ level: 'info', data: message ?? 'New event' }, sid);
+        await session.server.sendLoggingMessage({ level: 'info', data: payload }, sid);
         session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
         log('info', `[notify] sent to session ${sid} (SSE active) OK`);
+        anyDelivered = true;
       } catch (err) {
         log('warn', `[notify] failed sid=${sid}: ${err}`);
       }
     }
+    // If every live session failed to receive, fall back to persistent queue
+    // so the message isn't lost. (Channel-side dedup by event_id will absorb
+    // any duplicate that manages to slip through later.)
+    if (!anyDelivered) {
+      db.enqueuePendingPush(agentId, payload);
+      log('warn', `[notify] agent=${agentId} all sends failed → enqueued`);
+    }
+  }
+}
+
+/**
+ * Drains every pending push for the given agent through whichever live SSE
+ * sessions are currently bound. Called from the SSE GET handler right after
+ * the stream is registered. Idempotent: rows are removed only after at least
+ * one session confirmed the send.
+ */
+export async function drainPushesForAgent(agentId: string): Promise<void> {
+  const sids = agentSessions.get(agentId);
+  const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
+  if (live.length === 0) return;
+
+  const rows = db.listPendingPushes(agentId);
+  if (rows.length === 0) return;
+
+  log('info', `[drain] agent=${agentId} pending=${rows.length} live-sse=${live.length}`);
+  const delivered: number[] = [];
+  for (const row of rows) {
+    let ok = false;
+    for (const sid of live) {
+      const session = sessions[sid];
+      if (!session) continue;
+      try {
+        await session.server.sendLoggingMessage({ level: 'info', data: row.payload }, sid);
+        session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
+        ok = true;
+      } catch (err) {
+        log('warn', `[drain] failed sid=${sid} push=${row.id}: ${err}`);
+      }
+    }
+    if (ok) delivered.push(row.id);
+    else break; // stop on first failure to preserve order
+  }
+  if (delivered.length > 0) {
+    db.deletePendingPushes(delivered);
+    log('info', `[drain] agent=${agentId} delivered=${delivered.length}/${rows.length}`);
   }
 }
 
