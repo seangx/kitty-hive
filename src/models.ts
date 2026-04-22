@@ -28,7 +28,7 @@ export interface TeamMember {
   joined_at: string;
 }
 
-export const TEAM_EVENT_TYPES = ['join', 'leave', 'message', 'rename'] as const;
+export const TEAM_EVENT_TYPES = ['join', 'leave', 'message', 'rename', 'host-transfer'] as const;
 export type TeamEventType = typeof TEAM_EVENT_TYPES[number];
 
 export interface TeamEvent {

@@ -56,7 +56,7 @@ export function initDB(dbPath?: string): Database.Database {
       id              INTEGER PRIMARY KEY AUTOINCREMENT,
       team_id         TEXT NOT NULL REFERENCES teams(id),
       seq             INTEGER NOT NULL,
-      type            TEXT NOT NULL CHECK(type IN ('join','leave','message','rename')),
+      type            TEXT NOT NULL CHECK(type IN ('join','leave','message','rename','host-transfer')),
       actor_agent_id  TEXT REFERENCES agents(id),
       payload_json    TEXT DEFAULT '{}',
       ts              TEXT NOT NULL
@@ -178,6 +178,7 @@ export function initDB(dbPath?: string): Database.Database {
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
   // until v0.5.9). SQLite has no ALTER COLUMN, so we recreate the table.
   migrateTasksStatusCheck(db);
+  migrateTeamEventsTypeCheck(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
@@ -285,6 +286,39 @@ function migrateTasksStatusCheck(db: Database.Database): void {
   tx();
   db.pragma('foreign_keys = ON');
   console.log('[db] migrated tasks.status CHECK constraint to include awaiting_approval');
+}
+
+// Add 'host-transfer' to team_events.type CHECK constraint (added in v0.6.3).
+// Same idempotent recreate-in-transaction pattern as migrateTasksStatusCheck.
+function migrateTeamEventsTypeCheck(db: Database.Database): void {
+  const row = db.prepare(
+    "SELECT sql FROM sqlite_master WHERE type='table' AND name='team_events'"
+  ).get() as { sql?: string } | undefined;
+  if (!row?.sql) return;
+  if (row.sql.includes("'host-transfer'")) return; // already migrated
+
+  db.pragma('foreign_keys = OFF');
+  const tx = db.transaction(() => {
+    db.exec(`
+      CREATE TABLE team_events_new (
+        id              INTEGER PRIMARY KEY AUTOINCREMENT,
+        team_id         TEXT NOT NULL REFERENCES teams(id),
+        seq             INTEGER NOT NULL,
+        type            TEXT NOT NULL CHECK(type IN ('join','leave','message','rename','host-transfer')),
+        actor_agent_id  TEXT REFERENCES agents(id),
+        payload_json    TEXT DEFAULT '{}',
+        ts              TEXT NOT NULL
+      );
+      INSERT INTO team_events_new
+        SELECT id, team_id, seq, type, actor_agent_id, payload_json, ts FROM team_events;
+      DROP TABLE team_events;
+      ALTER TABLE team_events_new RENAME TO team_events;
+      CREATE INDEX IF NOT EXISTS idx_team_events_team_seq ON team_events(team_id, seq);
+    `);
+  });
+  tx();
+  db.pragma('foreign_keys = ON');
+  console.log('[db] migrated team_events.type CHECK constraint to include host-transfer');
 }
 
 // --- Agent queries ---
@@ -457,6 +491,19 @@ export function listTeams(activeOnly: boolean = true): Team[] {
     ? 'SELECT * FROM teams WHERE closed_at IS NULL ORDER BY created_at DESC'
     : 'SELECT * FROM teams ORDER BY created_at DESC';
   return getDB().prepare(sql).all() as Team[];
+}
+
+export function listTeamsHostedBy(agentId: string): Team[] {
+  return getDB().prepare('SELECT * FROM teams WHERE host_agent_id = ? ORDER BY created_at DESC').all(agentId) as Team[];
+}
+
+export function countTeamMembers(teamId: string): number {
+  const row = getDB().prepare('SELECT COUNT(*) as n FROM team_members WHERE team_id = ?').get(teamId) as { n: number };
+  return row.n;
+}
+
+export function transferTeamHost(teamId: string, newHostAgentId: string): void {
+  getDB().prepare('UPDATE teams SET host_agent_id = ? WHERE id = ?').run(newHostAgentId, teamId);
 }
 
 export function getAgentTeams(agentId: string, activeOnly: boolean = true): Team[] {

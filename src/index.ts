@@ -354,14 +354,20 @@ async function cmdDbClear() {
 
 async function cmdAgentRemove() {
   const { dbPath } = parseFlags(1);
-  // Flags: --key <K> (look up by external_key, idempotent: missing = exit 0),
-  //        --yes  (skip confirmation; required for non-interactive scripts)
+  // Flags: --key <K>            look up by external_key (idempotent: missing = exit 0)
+  //        --yes                skip confirmation (scripts)
+  //        --transfer-to <a>    transfer hosted teams to this agent before deleting
+  //        --cascade            explicitly accept that hosted teams (and all their members' history) will be wiped
   let target = '';
   let externalKey = '';
   let assumeYes = false;
+  let transferTo = '';
+  let cascade = false;
   for (let i = 2; i < args.length; i++) {
     if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
     else if (args[i] === '--yes' || args[i] === '-y') { assumeYes = true; }
+    else if (args[i] === '--transfer-to' && args[i + 1]) { transferTo = args[i + 1]; i++; }
+    else if (args[i] === '--cascade') { cascade = true; }
     else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
     else if (!args[i].startsWith('-') && !target) target = args[i];
   }
@@ -378,20 +384,28 @@ async function cmdAgentRemove() {
     }
     agent = row;
   } else if (target) {
-    const matches = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').all(target, target) as any[];
-    if (matches.length === 0) {
-      console.log(`Agent "${target}" not found.`);
-      process.exit(1);
+    // ID is unique → try ID first; only fall back to display_name match if no ID hit.
+    // This avoids a collision where someone registered an agent whose display_name
+    // is literally another agent's ID.
+    const byId = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(target) as any;
+    if (byId) {
+      agent = byId;
+    } else {
+      const matches = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ?').all(target) as any[];
+      if (matches.length === 0) {
+        console.log(`Agent "${target}" not found.`);
+        process.exit(1);
+      }
+      if (matches.length > 1) {
+        console.log(`"${target}" matches ${matches.length} agents. Use id to disambiguate.`);
+        for (const m of matches) console.log(`  ${m.id}  ${m.display_name}`);
+        process.exit(1);
+      }
+      agent = matches[0];
     }
-    if (matches.length > 1) {
-      console.log(`"${target}" matches ${matches.length} agents. Use id to disambiguate.`);
-      for (const m of matches) console.log(`  ${m.id}  ${m.display_name}`);
-      process.exit(1);
-    }
-    agent = matches[0];
   } else {
     if (!isInteractive()) {
-      console.log('Usage: kitty-hive agent remove <name-or-id>  |  --key <key>  [--yes]');
+      console.log('Usage: kitty-hive agent remove <name-or-id>  |  --key <key>  [--yes] [--transfer-to <agent>] [--cascade]');
       process.exit(1);
     }
     const id = await pickLocalAgent(db, 'Remove which agent?');
@@ -400,15 +414,113 @@ async function cmdAgentRemove() {
   if (!agent) { console.log('Not found.'); process.exit(1); }
   const name = agent.display_name;
 
-  if (!assumeYes) {
-    const ok = await askConfirm({
-      message: `Remove agent "${name}" (${agent.id}) and all related data?`,
-      initialValue: false,
-    });
-    if (!ok) {
-      console.log('Cancelled.');
-      process.exit(0);
+  // --- Hosted-team pre-check ---
+  const dbMod = await import('./db.js');
+  const hostedTeams = dbMod.listTeamsHostedBy(agent.id);
+  type HostedRow = { team: typeof hostedTeams[number]; memberCount: number; otherMemberCount: number };
+  const hostedRows: HostedRow[] = hostedTeams.map(t => {
+    const members = dbMod.getTeamMembers(t.id);
+    return {
+      team: t,
+      memberCount: members.length,
+      otherMemberCount: members.filter(m => m.agent_id !== agent!.id).length,
+    };
+  });
+
+  if (hostedRows.length > 0) {
+    console.log(`\n⚠ Agent "${name}" hosts ${hostedRows.length} team(s):`);
+    for (const r of hostedRows) {
+      console.log(`  • ${r.team.name}  (${r.team.id})  — ${r.memberCount} member(s), ${r.otherMemberCount} other`);
     }
+    console.log('');
+  }
+
+  // Decision is only required when at least one hosted team has *other* members.
+  // A team where the leaving agent is the sole member is safe to cascade-delete silently
+  // (no other history is destroyed), but we still confirm overall removal below.
+  let transferAgent: { id: string; display_name: string } | undefined;
+  const needsHostDecision = hostedRows.some(r => r.otherMemberCount > 0);
+  if (needsHostDecision) {
+    if (transferTo) {
+      const t = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').get(transferTo, transferTo) as any;
+      if (!t) {
+        console.error(`--transfer-to: agent "${transferTo}" not found.`);
+        process.exit(1);
+      }
+      transferAgent = t;
+    } else if (!cascade && !assumeYes && isInteractive()) {
+      // Repeat the team listing inside the prompt itself — the warning lines
+      // printed earlier may be scrolled off-screen by clack's render area.
+      const teamLines = hostedRows.map(r => {
+        const marker = r.otherMemberCount > 0 ? '⚠' : ' ';
+        return `  ${marker} ${r.team.name}  (${r.memberCount} member${r.memberCount === 1 ? '' : 's'}${r.otherMemberCount > 0 ? `, ${r.otherMemberCount} other` : ''})`;
+      }).join('\n');
+      const promptMsg = `Agent "${name}" hosts ${hostedRows.length} team(s):\n${teamLines}\n\nHow should they be handled?`;
+      const choice = await askSelect<'transfer' | 'cascade' | 'abort'>({
+        message: promptMsg,
+        options: [
+          { value: 'transfer', label: 'Transfer host to another local agent', hint: 'keeps team history & members' },
+          { value: 'cascade', label: 'Delete teams (and all their members + history)', hint: 'destructive, irreversible' },
+          { value: 'abort', label: 'Cancel — do nothing' },
+        ],
+        initialValue: 'transfer',
+      });
+      if (choice === 'abort') { console.log('Cancelled.'); process.exit(0); }
+      if (choice === 'transfer') {
+        const id = await pickLocalAgent(db, 'Transfer host to which agent?');
+        if (id === agent.id) { console.error('Cannot transfer to self.'); process.exit(1); }
+        transferAgent = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(id) as any;
+      } else {
+        cascade = true;
+      }
+    } else if (!cascade) {
+      console.error('Hosted teams detected. Pass --transfer-to <agent> to keep them, or --cascade to delete them with their members + history.');
+      process.exit(1);
+    }
+  }
+
+  if (transferAgent && transferAgent.id === agent.id) {
+    console.error('Cannot transfer hosted teams to the agent being removed.');
+    process.exit(1);
+  }
+
+  if (!assumeYes) {
+    const summary = transferAgent
+      ? `Remove agent "${name}" (${agent.id}); transfer ${hostedRows.length} hosted team(s) to "${transferAgent.display_name}".`
+      : hostedRows.length > 0
+        ? `Remove agent "${name}" AND cascade-delete ${hostedRows.length} hosted team(s) with all members + history?`
+        : `Remove agent "${name}" (${agent.id}) and all related data?`;
+    const ok = await askConfirm({ message: summary, initialValue: false });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+
+  // --- Apply transfer first (so we don't cascade-delete those teams below) ---
+  if (transferAgent) {
+    const sessionsMod = await import('./sessions.js');
+    for (const r of hostedRows) {
+      // Make sure new host is a member; if not, add them.
+      if (!dbMod.isTeamMember(r.team.id, transferAgent.id)) {
+        dbMod.addTeamMember(r.team.id, transferAgent.id);
+      }
+      dbMod.transferTeamHost(r.team.id, transferAgent.id);
+      dbMod.appendTeamEvent(r.team.id, 'host-transfer', null, {
+        from_agent_id: agent.id,
+        from_display_name: name,
+        to_agent_id: transferAgent.id,
+        to_display_name: transferAgent.display_name,
+        reason: 'agent-remove',
+      });
+      try {
+        await sessionsMod.notifyTeamMembers(r.team.id, undefined, JSON.stringify({
+          type: 'team-host-transfer',
+          team_id: r.team.id,
+          team_name: r.team.name,
+          from: name,
+          to: transferAgent.display_name,
+        }));
+      } catch { /* push best-effort */ }
+    }
+    console.log(`↪ Transferred ${hostedRows.length} hosted team(s) to "${transferAgent.display_name}".`);
   }
 
   // Delete in dependency order to satisfy foreign keys
@@ -423,7 +535,7 @@ async function cmdAgentRemove() {
   // Team membership + events
   db.prepare('DELETE FROM team_members WHERE agent_id = ?').run(agent.id);
   db.prepare('DELETE FROM team_events WHERE actor_agent_id = ?').run(agent.id);
-  // Teams hosted by this agent (and their content)
+  // Teams hosted by this agent (only those left — transferred ones now have a different host)
   db.prepare(`DELETE FROM team_events WHERE team_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
   db.prepare(`DELETE FROM team_members WHERE team_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
   db.prepare(`DELETE FROM read_cursors WHERE target_id IN (SELECT id FROM teams WHERE host_agent_id = ?)`).run(agent.id);
@@ -494,17 +606,24 @@ async function cmdAgentRename() {
     agentId = await pickLocalAgent(db, 'Rename which agent?');
     oldDisplay = (db.prepare('SELECT display_name FROM agents WHERE id = ?').get(agentId) as any).display_name;
   } else {
-    const matches = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ? OR id = ?').all(oldName, oldName) as any[];
-    if (matches.length === 0) {
-      console.log(`Agent "${oldName}" not found.`);
-      process.exit(1);
+    // ID-first to avoid collision with display_name that equals some agent's ID.
+    const byId = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(oldName) as any;
+    if (byId) {
+      agentId = byId.id;
+      oldDisplay = byId.display_name;
+    } else {
+      const matches = db.prepare('SELECT id, display_name FROM agents WHERE display_name = ?').all(oldName) as any[];
+      if (matches.length === 0) {
+        console.log(`Agent "${oldName}" not found.`);
+        process.exit(1);
+      }
+      if (matches.length > 1) {
+        console.log(`"${oldName}" matches ${matches.length} agents. Use agent id to disambiguate.`);
+        process.exit(1);
+      }
+      agentId = matches[0].id;
+      oldDisplay = matches[0].display_name;
     }
-    if (matches.length > 1) {
-      console.log(`"${oldName}" matches ${matches.length} agents. Use agent id to disambiguate.`);
-      process.exit(1);
-    }
-    agentId = matches[0].id;
-    oldDisplay = matches[0].display_name;
   }
 
   if (!newName) {
@@ -532,6 +651,140 @@ async function cmdAgentList() {
     return;
   }
   console.log(renderTable(AGENT_HEADERS, agentRows(db, agents)));
+}
+
+// --- Team commands (CLI-only; agents use hive-team-* MCP tools instead) ---
+
+async function cmdTeamList() {
+  const { dbPath } = parseFlags(1);
+  initDB(dbPath);
+  const dbMod = await import('./db.js');
+  const teams = dbMod.listTeams(false);
+  if (teams.length === 0) { console.log('No teams.'); return; }
+  for (const t of teams) {
+    const host = t.host_agent_id ? (getAgentById(t.host_agent_id)?.display_name ?? t.host_agent_id.slice(-12)) : '(none)';
+    const memberCount = dbMod.countTeamMembers(t.id);
+    const status = t.closed_at ? 'closed' : 'active';
+    console.log(`${t.id}  ${t.name}  host=${host}  members=${memberCount}  ${status}`);
+  }
+}
+
+async function cmdTeamTransfer() {
+  const { dbPath } = parseFlags(1);
+  let teamArg = '';
+  let toArg = '';
+  let assumeYes = false;
+  let addMember = false;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--to' && args[i + 1]) { toArg = args[i + 1]; i++; }
+    else if (args[i] === '--yes' || args[i] === '-y') { assumeYes = true; }
+    else if (args[i] === '--add-member') { addMember = true; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-') && !teamArg) teamArg = args[i];
+  }
+  const db = initDB(dbPath);
+  const dbMod = await import('./db.js');
+
+  // --- Resolve team ---
+  let team: { id: string; name: string; host_agent_id: string | null } | undefined;
+  if (teamArg) {
+    team = dbMod.getTeamById(teamArg) || dbMod.getTeamByName(teamArg);
+    if (!team) { console.error(`Team "${teamArg}" not found.`); process.exit(1); }
+  } else {
+    if (!isInteractive()) {
+      console.error('Usage: kitty-hive team transfer <team> --to <agent> [--add-member] [--yes]');
+      process.exit(1);
+    }
+    const teams = dbMod.listTeams(false);
+    if (teams.length === 0) { console.log('No teams to transfer.'); process.exit(0); }
+    const teamId = await askSelect<string>({
+      message: 'Transfer which team?',
+      options: teams.map(t => ({
+        value: t.id,
+        label: t.name,
+        hint: `host=${t.host_agent_id ? (getAgentById(t.host_agent_id)?.display_name ?? t.host_agent_id.slice(-12)) : '(none)'} · ${dbMod.countTeamMembers(t.id)} member(s)`,
+      })),
+    });
+    team = teams.find(t => t.id === teamId)!;
+  }
+
+  const currentHostName = team.host_agent_id ? (getAgentById(team.host_agent_id)?.display_name ?? team.host_agent_id.slice(-12)) : '(none)';
+  console.log(`\nTeam: ${team.name}  (${team.id})\nCurrent host: ${currentHostName}\n`);
+
+  // --- Resolve new host ---
+  let newHost: { id: string; display_name: string } | undefined;
+  if (toArg) {
+    // ID-first: ID is unique, only fall back to display_name lookup on no ID hit.
+    const byId = db.prepare("SELECT id, display_name FROM agents WHERE id = ? AND origin_peer = ''").get(toArg) as any;
+    if (byId) {
+      newHost = byId;
+    } else {
+      const matches = db.prepare("SELECT id, display_name FROM agents WHERE display_name = ? AND origin_peer = ''").all(toArg) as any[];
+      if (matches.length === 0) { console.error(`--to: local agent "${toArg}" not found.`); process.exit(1); }
+      if (matches.length > 1) {
+        console.error(`--to "${toArg}" matches ${matches.length} agents. Use id to disambiguate.`);
+        process.exit(1);
+      }
+      newHost = matches[0];
+    }
+  } else {
+    if (!isInteractive()) {
+      console.error('Missing --to <agent>.');
+      process.exit(1);
+    }
+    const id = await pickLocalAgent(db, 'New host?');
+    newHost = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(id) as any;
+  }
+  if (!newHost) { console.error('New host not found.'); process.exit(1); }
+  if (newHost.id === team.host_agent_id) {
+    console.log(`"${newHost.display_name}" is already the host. Nothing to do.`);
+    process.exit(0);
+  }
+
+  // --- Membership check ---
+  if (!dbMod.isTeamMember(team.id, newHost.id)) {
+    if (!addMember && !assumeYes && isInteractive()) {
+      const ok = await askConfirm({
+        message: `"${newHost.display_name}" is not a member of "${team.name}". Add them as a member?`,
+        initialValue: true,
+      });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+      addMember = true;
+    } else if (!addMember) {
+      console.error(`"${newHost.display_name}" is not a member of "${team.name}". Re-run with --add-member to auto-join them, or have them join first.`);
+      process.exit(1);
+    }
+    dbMod.addTeamMember(team.id, newHost.id);
+  }
+
+  if (!assumeYes) {
+    const ok = await askConfirm({
+      message: `Transfer host of "${team.name}" from ${currentHostName} → ${newHost.display_name}?`,
+      initialValue: true,
+    });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+
+  dbMod.transferTeamHost(team.id, newHost.id);
+  dbMod.appendTeamEvent(team.id, 'host-transfer', null, {
+    from_agent_id: team.host_agent_id,
+    from_display_name: currentHostName,
+    to_agent_id: newHost.id,
+    to_display_name: newHost.display_name,
+    reason: 'team-transfer',
+  });
+  try {
+    const sessionsMod = await import('./sessions.js');
+    await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+      type: 'team-host-transfer',
+      team_id: team.id,
+      team_name: team.name,
+      from: currentHostName,
+      to: newHost.display_name,
+    }));
+  } catch { /* push best-effort */ }
+
+  console.log(`✅ Host of "${team.name}" → ${newHost.display_name}.`);
 }
 
 // --- Node config ---
@@ -1430,7 +1683,8 @@ Top-level commands:
   status [--port 4123]                       Server & agent status
 
 Command groups:
-  agent      Manage local agents       (list, rename, remove)
+  agent      Manage local agents       (list, rename, remove, register)
+  team       Inspect/maintain teams    (list, transfer)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
   log        Inspect message history   (dm, team, task)
   tunnel     Cloudflare tunnel control (start, status)
@@ -1452,8 +1706,25 @@ Subcommands:
   list                                                List all agents (local + remote placeholders)
   rename   [old] [new]                                Rename an agent (interactive when args omitted)
   remove   [name-or-id] | --key <K> [--yes]           Remove an agent. --key is idempotent (missing = exit 0).
+                                                      Hosted teams: pass --transfer-to <agent> to keep them,
+                                                      or --cascade to delete them with all members + history.
   register --key <K> --display-name <N> [--roles R]   Idempotent upsert by external_key.
                                                       Stdout = agent_id (one line). Designed for orchestrator scripts.`);
+}
+
+function showTeamHelp() {
+  console.log(`🐝 kitty-hive team — local team maintenance
+
+Usage:
+  kitty-hive team <subcommand> [args]
+
+Subcommands:
+  list                                              List all teams with host + member counts
+  transfer [<team>] --to <agent> [--add-member]     Transfer team host to another local agent.
+                                                    --add-member auto-joins target if not yet a member.
+
+Note: agents normally manage teams via the hive-team-* MCP tools.
+This group is for operator-level maintenance (e.g. before removing a host agent).`);
 }
 
 function showPeerHelp() {
@@ -1556,6 +1827,13 @@ switch (command) {
       case 'rename':   run(cmdAgentRename);   break;
       case 'list':     run(cmdAgentList);     break;
       default:         showAgentHelp();       break;
+    }
+    break;
+  case 'team':
+    switch (args[1]) {
+      case 'list':     run(cmdTeamList);     break;
+      case 'transfer': run(cmdTeamTransfer); break;
+      default:         showTeamHelp();        break;
     }
     break;
   case 'peer':
