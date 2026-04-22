@@ -371,15 +371,36 @@ kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM his
 | Variable | Purpose |
 |----------|---------|
 | `HIVE_URL` | hive HTTP endpoint (default `http://localhost:4123/mcp`) |
-| `HIVE_AGENT_ID` | Auto-register channel as this agent id (highest priority) |
-| `HIVE_AGENT_NAME` | Auto-register channel as this name (reuses latest match) |
+| `HIVE_AGENT_ID` | Auto-register channel as this agent id (highest priority — exact ULID match; created if absent) |
+| `HIVE_AGENT_KEY` | Auto-register via opaque external_key (orchestrator-assigned; idempotent — same key returns same agent) |
+| `HIVE_AGENT_NAME` | Auto-register channel as this display_name (lowest priority; reuses latest match by name) |
+
+**Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
+
+## External orchestrator integration
+
+Session managers, terminal multiplexers (kitty, tmux, …), CI runners, or any tool that spawns long-lived processes can make those processes appear as stable hive agents by:
+
+1. **At spawn**: inject env vars (typically `HIVE_AGENT_KEY=<your-stable-id>` plus `HIVE_AGENT_NAME=<readable-label>`) into the child process. The channel plugin reads them on startup; same key always resolves to the same `agent_id` across restarts.
+2. **At cleanup**: invoke `kitty-hive agent remove --key <your-stable-id>` (idempotent — exits 0 even if no such agent). Optionally `--yes` skips the confirmation prompt.
+3. **Without a hive plugin**: scripts can also call `kitty-hive agent register --key <K> --display-name <N>`; stdout prints the `agent_id` so a caller can pipe it.
+
+Contract: hive **never** raises errors that orchestrators have to catch — every code path either returns the agent_id or exits 0. UNIQUE conflicts on `external_key` are logged warn server-side and the call still succeeds; the conflicting key just isn't attached.
+
+| Scenario | Behavior |
+|---|---|
+| KEY set, agent exists | Reuse, silently refresh `display_name` if a different `HIVE_AGENT_NAME` is given. |
+| KEY set, no match | Create new agent, attach the key. |
+| ID + KEY both set, hit different agents | ID wins. KEY ignored, server logs warn. |
+| Old hive (no `external_key` column) | Channel plugin retries `hive_start` without `key` and falls back to NAME-only registration. Orchestrator code unchanged. |
+| Concurrent same-KEY registers | UNIQUE index serializes; both calls return the same `agent_id`. |
 
 ## Architecture
 
 | Layer | Tech |
 |-------|------|
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
-| Database | SQLite WAL — `agents`, `teams`, `team_members`, `team_events`, `dm_messages` (with `attachments` JSON), `tasks` (with federation link fields), `task_events`, `read_cursors`, `peers`, `pending_invites`, `node_state` |
+| Database | SQLite WAL — `agents` (with `external_key` for orchestrator binding), `teams`, `team_members`, `team_events`, `dm_messages` (with `attachments` JSON), `tasks` (with federation link fields), `task_events`, `read_cursors`, `peers`, `pending_invites` (auth tokens), `pending_pushes` (durable push queue), `node_state` |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
 | Push | Channel plugin → `notifications/claude/channel`. Live SSE tracking; warns when push is dropped |
 | Auth | Session binding · `as` param · Bearer token · peer secret |

@@ -15,6 +15,7 @@ import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprot
 
 const HIVE_URL = process.env.HIVE_URL || 'http://localhost:4123/mcp'
 const HIVE_AGENT_ID = process.env.HIVE_AGENT_ID || ''
+const HIVE_AGENT_KEY = process.env.HIVE_AGENT_KEY || ''
 const HIVE_AGENT_NAME = process.env.HIVE_AGENT_NAME || ''
 
 // --- Hive HTTP client ---
@@ -88,11 +89,26 @@ async function initHiveSession() {
   })
 }
 
-async function registerAgent(opts: { id?: string; name?: string }) {
+async function registerAgent(opts: { id?: string; key?: string; name?: string }) {
   const args: any = { tool: 'claude', roles: 'channel' }
   if (opts.id) args.id = opts.id
+  if (opts.key) args.key = opts.key
   if (opts.name) args.name = opts.name
-  const result = await hiveCallTool('hive_start', args)
+  let result: any
+  try {
+    result = await hiveCallTool('hive_start', args)
+  } catch (err: any) {
+    // Old server (pre-v0.6.2) doesn't know `key` and rejects with schema
+    // validation error. Drop key and retry — clients stay forward-compatible.
+    const msg = String(err?.message || err)
+    if (opts.key && /key|invalid params|unknown|validation|unrecognized/i.test(msg)) {
+      console.error(`[hive-channel] server rejected key param, falling back to name-only: ${msg}`)
+      delete args.key
+      result = await hiveCallTool('hive_start', args)
+    } else {
+      throw err
+    }
+  }
   agentId = result.agent_id
   agentName = result.display_name
   if (!sseStarted) {
@@ -365,8 +381,14 @@ async function connectToHive() {
   while (true) {
     try {
       await initHiveSession()
-      if (HIVE_AGENT_ID || HIVE_AGENT_NAME) {
-        await registerAgent({ id: HIVE_AGENT_ID || undefined, name: HIVE_AGENT_NAME || undefined })
+      if (HIVE_AGENT_ID || HIVE_AGENT_KEY || HIVE_AGENT_NAME) {
+        // Priority order is enforced server-side (id > key > name); we just
+        // forward whatever the orchestrator gave us.
+        await registerAgent({
+          id: HIVE_AGENT_ID || undefined,
+          key: HIVE_AGENT_KEY || undefined,
+          name: HIVE_AGENT_NAME || undefined,
+        })
         console.error(`[hive-channel] connected as "${agentName}" (${agentId})`)
       } else {
         console.error(`[hive-channel] connected (no env identity — register via hive-whoami)`)

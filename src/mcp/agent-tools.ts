@@ -8,10 +8,13 @@ import { bindSession } from '../sessions.js';
 export function registerAgentTools(mcp: McpServer) {
   mcp.tool(
     'hive_start',
-    'Register or reconnect as an agent. Returns your agent_id (used for cross-team addressing). The MCP session is automatically bound to the returned agent so push notifications target the right session. (Channel-plugin users: prefer hive-whoami for first-time registration; this is the underlying server tool.)',
+    'Register or reconnect as an agent. Returns your agent_id (used for cross-team addressing). The MCP session is automatically bound to the returned agent so push notifications target the right session. ' +
+    'Lookup priority: id > key > name. id is hive\'s ULID. key is an opaque external identifier (e.g. a kitty/tmux session uuid) — used by orchestrators that spawn long-lived processes and want a stable agent across restarts. name is fuzzy fallback. ' +
+    '(Channel-plugin users: prefer hive-whoami for first-time registration; this is the underlying server tool.)',
     {
-      id: z.string().optional().describe('Agent id to reconnect to (exact match). Errors if not found.'),
-      name: z.string().optional().describe('Display name (random if omitted). Reuses latest existing agent with this name.'),
+      id: z.string().optional().describe('Agent id to reconnect to (exact ULID match). If not found, the agent is created with this id.'),
+      key: z.string().optional().describe('External orchestrator key. Idempotent: same key always returns the same agent_id. UNIQUE on populated values.'),
+      name: z.string().optional().describe('Display name (random if omitted). When the agent already exists, display_name is silently refreshed to this value.'),
       roles: z.string().optional().describe('Comma-separated roles: ux,frontend,backend'),
       tool: z.string().optional().describe('Agent tool: claude, codex, shell'),
       expertise: z.string().optional().describe('Free-text expertise description'),

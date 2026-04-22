@@ -10,6 +10,7 @@ export interface Agent {
   last_seen: string;
   origin_peer: string;   // empty for local agents; peer name for placeholders
   remote_id: string;     // empty for local agents; original agent_id on the peer
+  external_key: string;  // opaque key from an external orchestrator (kitty session id, tmux pane, CI runner, ...). Empty when unmanaged. Unique when set.
 }
 
 export interface Team {

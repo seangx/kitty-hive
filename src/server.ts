@@ -46,7 +46,15 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
       }
       log('info', `[sse] opening stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
       activeSSE.add(sid);
+      // Keepalive: write an SSE comment every 25s so half-open / zombie TCP
+      // connections fail fast (write errors → 'close' event → cleanup), and
+      // intermediates don't reap the idle stream. Cheap (~3 bytes / 25s).
+      const keepalive = setInterval(() => {
+        if (res.writableEnded || res.destroyed) return;
+        try { res.write(': ka\n\n'); } catch { /* ignore — close handler will fire */ }
+      }, 25_000);
       res.on('close', () => {
+        clearInterval(keepalive);
         activeSSE.delete(sid);
         log('info', `[sse] stream closed for session=${sid}`);
       });

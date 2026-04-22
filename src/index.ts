@@ -354,18 +354,30 @@ async function cmdDbClear() {
 
 async function cmdAgentRemove() {
   const { dbPath } = parseFlags(1);
-  const target = args[2];
+  // Flags: --key <K> (look up by external_key, idempotent: missing = exit 0),
+  //        --yes  (skip confirmation; required for non-interactive scripts)
+  let target = '';
+  let externalKey = '';
+  let assumeYes = false;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
+    else if (args[i] === '--yes' || args[i] === '-y') { assumeYes = true; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-') && !target) target = args[i];
+  }
   const db = initDB(dbPath);
 
-  let agent: { id: string; display_name: string };
-  if (!target) {
-    if (!isInteractive()) {
-      console.log('Usage: kitty-hive agent remove <name-or-id>');
-      process.exit(1);
+  let agent: { id: string; display_name: string } | undefined;
+
+  if (externalKey) {
+    // Idempotent path for orchestrators (kitty/tmux/...). Missing = success.
+    const row = db.prepare('SELECT id, display_name FROM agents WHERE external_key = ?').get(externalKey) as any;
+    if (!row) {
+      console.log(`No agent with external_key="${externalKey}" — nothing to do.`);
+      process.exit(0);
     }
-    const id = await pickLocalAgent(db, 'Remove which agent?');
-    agent = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(id) as any;
-  } else {
+    agent = row;
+  } else if (target) {
     const matches = db.prepare('SELECT id, display_name FROM agents WHERE id = ? OR display_name = ?').all(target, target) as any[];
     if (matches.length === 0) {
       console.log(`Agent "${target}" not found.`);
@@ -377,16 +389,26 @@ async function cmdAgentRemove() {
       process.exit(1);
     }
     agent = matches[0];
+  } else {
+    if (!isInteractive()) {
+      console.log('Usage: kitty-hive agent remove <name-or-id>  |  --key <key>  [--yes]');
+      process.exit(1);
+    }
+    const id = await pickLocalAgent(db, 'Remove which agent?');
+    agent = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(id) as any;
   }
+  if (!agent) { console.log('Not found.'); process.exit(1); }
   const name = agent.display_name;
 
-  const ok = await askConfirm({
-    message: `Remove agent "${name}" (${agent.id}) and all related data?`,
-    initialValue: false,
-  });
-  if (!ok) {
-    console.log('Cancelled.');
-    process.exit(0);
+  if (!assumeYes) {
+    const ok = await askConfirm({
+      message: `Remove agent "${name}" (${agent.id}) and all related data?`,
+      initialValue: false,
+    });
+    if (!ok) {
+      console.log('Cancelled.');
+      process.exit(0);
+    }
   }
 
   // Delete in dependency order to satisfy foreign keys
@@ -409,6 +431,51 @@ async function cmdAgentRemove() {
   db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
 
   console.log(`✅ Removed agent "${name}".`);
+}
+
+async function cmdAgentRegister() {
+  // Idempotent upsert by external_key. Designed for `spawn('kitty-hive',
+  // ['agent', 'register', ...])` from session managers / orchestrators.
+  // On success prints the agent_id (one line, no decoration) to stdout
+  // so callers can pipe it; everything else goes to stderr.
+  const { dbPath } = parseFlags(1);
+  let externalKey = '';
+  let displayName = '';
+  let roles = '';
+  let tool = '';
+  let agentIdOverride = '';
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
+    else if (args[i] === '--display-name' && args[i + 1]) { displayName = args[i + 1]; i++; }
+    else if (args[i] === '--name' && args[i + 1]) { displayName = args[i + 1]; i++; }
+    else if (args[i] === '--roles' && args[i + 1]) { roles = args[i + 1]; i++; }
+    else if (args[i] === '--tool' && args[i + 1]) { tool = args[i + 1]; i++; }
+    else if (args[i] === '--id' && args[i + 1]) { agentIdOverride = args[i + 1]; i++; }
+  }
+  if (!externalKey && !agentIdOverride && !displayName) {
+    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T]');
+    console.error('  All three of --key/--id/--display-name optional, but at least one required.');
+    process.exit(1);
+  }
+
+  initDB(dbPath);
+  const { handleStart } = await import('./tools/start.js');
+  try {
+    const result = handleStart({
+      key: externalKey || undefined,
+      id: agentIdOverride || undefined,
+      name: displayName || undefined,
+      roles: roles || undefined,
+      tool: tool || undefined,
+    });
+    // Stdout: one line, just the agent_id (script-friendly)
+    console.log(result.agent_id);
+    // Stderr: human context
+    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}`);
+  } catch (err: any) {
+    console.error(`Failed: ${err.message ?? err}`);
+    process.exit(1);
+  }
 }
 
 async function cmdAgentRename() {
@@ -1382,9 +1449,11 @@ Usage:
   kitty-hive agent <subcommand> [args]
 
 Subcommands:
-  list                       List all agents (local + remote placeholders)
-  rename [old] [new]         Rename an agent (interactive when args omitted)
-  remove [name-or-id]        Remove an agent and all related data (interactive when omitted)`);
+  list                                                List all agents (local + remote placeholders)
+  rename   [old] [new]                                Rename an agent (interactive when args omitted)
+  remove   [name-or-id] | --key <K> [--yes]           Remove an agent. --key is idempotent (missing = exit 0).
+  register --key <K> --display-name <N> [--roles R]   Idempotent upsert by external_key.
+                                                      Stdout = agent_id (one line). Designed for orchestrator scripts.`);
 }
 
 function showPeerHelp() {
@@ -1482,10 +1551,11 @@ switch (command) {
     break;
   case 'agent':
     switch (args[1]) {
-      case 'remove': run(cmdAgentRemove); break;
-      case 'rename': run(cmdAgentRename); break;
-      case 'list':   run(cmdAgentList);   break;
-      default:       showAgentHelp();     break;
+      case 'register': run(cmdAgentRegister); break;
+      case 'remove':   run(cmdAgentRemove);   break;
+      case 'rename':   run(cmdAgentRename);   break;
+      case 'list':     run(cmdAgentList);     break;
+      default:         showAgentHelp();       break;
     }
     break;
   case 'peer':

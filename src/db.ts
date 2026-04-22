@@ -163,6 +163,16 @@ export function initDB(dbPath?: string): Database.Database {
   addColumnIfMissing('peers', 'node_name', "TEXT NOT NULL DEFAULT ''");
   // attachments stored as JSON array of {file_id, filename, mime, size}
   addColumnIfMissing('dm_messages', 'attachments', "TEXT NOT NULL DEFAULT '[]'");
+  // external_key: opaque identifier from an external orchestrator (kitty
+  // session uuid, tmux pane id, CI runner id, ...) so the orchestrator can
+  // re-find / re-create the same hive agent across restarts. Empty when
+  // unmanaged. Partial UNIQUE index below enforces uniqueness only on
+  // populated keys (multiple legacy '' rows allowed).
+  addColumnIfMissing('agents', 'external_key', "TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_external_key
+      ON agents(external_key) WHERE external_key != '';
+  `);
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
@@ -279,18 +289,59 @@ function migrateTasksStatusCheck(db: Database.Database): void {
 
 // --- Agent queries ---
 
-export function createAgent(displayName: string, tool: string, roles: string, expertise: string, originPeer: string = '', remoteId: string = ''): Agent {
+export interface CreateAgentOpts {
+  id?: string;            // override ULID (used by orchestrators that pass HIVE_AGENT_ID)
+  externalKey?: string;   // opaque key from an external orchestrator
+  originPeer?: string;
+  remoteId?: string;
+}
+
+export function createAgent(
+  displayName: string,
+  tool: string,
+  roles: string,
+  expertise: string,
+  opts: CreateAgentOpts = {},
+): Agent {
   const agent: Agent = {
-    id: ulid(), display_name: displayName, token: generateToken(),
+    id: opts.id || ulid(),
+    display_name: displayName,
+    token: generateToken(),
     tool, roles, expertise, status: 'active',
     created_at: nowISO(), last_seen: nowISO(),
-    origin_peer: originPeer, remote_id: remoteId,
+    origin_peer: opts.originPeer || '',
+    remote_id: opts.remoteId || '',
+    external_key: opts.externalKey || '',
   };
   getDB().prepare(`
-    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id)
-    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id)
+    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key)
+    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key)
   `).run(agent);
   return agent;
+}
+
+export function getAgentByExternalKey(key: string): Agent | undefined {
+  if (!key) return undefined;
+  return getDB().prepare('SELECT * FROM agents WHERE external_key = ?').get(key) as Agent | undefined;
+}
+
+/** Try to set agent.external_key. Silently no-ops on UNIQUE conflict (another
+ *  agent already owns that key). Returns true on success, false on conflict. */
+export function trySetAgentExternalKey(agentId: string, key: string): boolean {
+  if (!key) return false;
+  try {
+    getDB().prepare('UPDATE agents SET external_key = ? WHERE id = ?').run(key, agentId);
+    return true;
+  } catch (err: any) {
+    if (String(err?.message || err).includes('UNIQUE')) return false;
+    throw err;
+  }
+}
+
+export function deleteAgentByExternalKey(key: string): { id: string } | null {
+  const row = getAgentByExternalKey(key);
+  if (!row) return null;
+  return { id: row.id };
 }
 
 // Find or create a placeholder agent representing a remote peer's agent.
@@ -308,7 +359,7 @@ export function ensureRemoteAgentByRemoteId(remoteId: string, peerName: string, 
     }
     return existing;
   }
-  return createAgent(displayName, 'remote', `peer:${peerName}`, '', peerName, remoteId);
+  return createAgent(displayName, 'remote', `peer:${peerName}`, '', { originPeer: peerName, remoteId });
 }
 
 export function getAgentByToken(token: string): Agent | undefined {

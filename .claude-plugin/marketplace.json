@@ -12,7 +12,7 @@
       "name": "kitty-hive",
       "source": "./",
       "description": "Multi-agent collaboration MCP server with real-time push via channels",
-      "version": "0.6.1",
+      "version": "0.6.2",
       "author": {
         "name": "seangx"
       },
