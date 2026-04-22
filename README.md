@@ -379,7 +379,7 @@ kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM his
 
 ## External orchestrator integration
 
-Session managers, terminal multiplexers (kitty, tmux, …), CI runners, or any tool that spawns long-lived processes can make those processes appear as stable hive agents by:
+Session managers, terminal multiplexers, CI runners, or any tool that spawns long-lived processes can make those processes appear as stable hive agents by:
 
 1. **At spawn**: inject env vars (typically `HIVE_AGENT_KEY=<your-stable-id>` plus `HIVE_AGENT_NAME=<readable-label>`) into the child process. The channel plugin reads them on startup; same key always resolves to the same `agent_id` across restarts.
 2. **At cleanup**: invoke `kitty-hive agent remove --key <your-stable-id>` (idempotent — exits 0 even if no such agent). Optionally `--yes` skips the confirmation prompt.
@@ -394,6 +394,10 @@ Contract: hive **never** raises errors that orchestrators have to catch — ever
 | ID + KEY both set, hit different agents | ID wins. KEY ignored, server logs warn. |
 | Old hive (no `external_key` column) | Channel plugin retries `hive_start` without `key` and falls back to NAME-only registration. Orchestrator code unchanged. |
 | Concurrent same-KEY registers | UNIQUE index serializes; both calls return the same `agent_id`. |
+
+### Known integrations
+
+- **[kitty-kitty](https://github.com/seangx/kitty-kitty)** — terminal session manager. Each tmux pane spawned by kitty-kitty is auto-registered as a hive agent (`HIVE_AGENT_KEY = <session uuid>`, `HIVE_AGENT_NAME = <pane title>`); pane teardown cleans the agent up via `agent remove --key`. Reference implementation of the contract above.
 
 ## Architecture
 
