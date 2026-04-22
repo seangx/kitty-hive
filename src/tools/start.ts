@@ -46,29 +46,53 @@ export function handleStart(input: StartInput): StartOutput {
 
   // 1. id wins (exact identity)
   if (input.id) {
-    agent = getAgentById(input.id);
+    const candidate = getAgentById(input.id);
+    // Refuse to bind a local client to a remote peer's mirror row.
+    // origin_peer != '' means this row is a placeholder for an agent that
+    // lives on another node — its identity belongs there, not here.
+    // Without this guard, anyone passing a remote agent_id (e.g. copied
+    // from a whoami output) would silently take over the placeholder,
+    // pollute its tool/roles, and start consuming pushes meant for the
+    // real owner. See agent-id collision incident, 2026-04-22.
+    if (candidate && candidate.origin_peer === '') {
+      agent = candidate;
+    } else if (candidate) {
+      log('warn', `[start] refusing to bind to remote placeholder agent=${candidate.id} origin_peer=${candidate.origin_peer}; falling back to key/name`);
+    }
   }
   // 2. key (external orchestrator handle)
   if (!agent && input.key) {
-    agent = getAgentByExternalKey(input.key);
+    const candidate = getAgentByExternalKey(input.key);
+    if (candidate && candidate.origin_peer === '') agent = candidate;
   }
-  // 3. name (fuzzy, reuse latest match)
+  // 3. name (fuzzy, reuse latest match — local only)
   if (!agent && input.name) {
-    const matches = getAgentsByName(input.name);
+    const matches = getAgentsByName(input.name).filter(a => a.origin_peer === '');
     if (matches.length > 0) {
       agent = matches.sort((a, b) => b.last_seen.localeCompare(a.last_seen))[0];
     }
   }
 
   if (!agent) {
-    // Create — honor caller-supplied id and key when given
+    // Create — honor caller-supplied id only if it isn't already taken by a
+    // remote placeholder (which we'd otherwise PRIMARY-KEY-conflict against).
+    // When the id collides with a remote row, mint a fresh ULID instead so
+    // the caller still gets a usable local agent rather than an error.
+    let createId = input.id;
+    if (createId) {
+      const collision = getAgentById(createId);
+      if (collision && collision.origin_peer !== '') {
+        log('warn', `[start] requested id=${createId} belongs to remote peer=${collision.origin_peer}; creating fresh local agent with new id`);
+        createId = undefined;
+      }
+    }
     const displayName = input.name || randomDisplayName();
     agent = createAgent(
       displayName,
       input.tool ?? '',
       input.roles ?? '',
       input.expertise ?? '',
-      { id: input.id, externalKey: input.key },
+      { id: createId, externalKey: input.key },
     );
   } else {
     touchAgent(agent.id);

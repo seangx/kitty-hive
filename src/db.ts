@@ -426,7 +426,10 @@ export function touchAgent(id: string): void {
 }
 
 export function renameAgent(id: string, newName: string): void {
-  getDB().prepare('UPDATE agents SET display_name = ? WHERE id = ?').run(newName, id);
+  // Refuse to rename remote placeholder rows — those reflect another node's
+  // agent and any local override would be clobbered by federation sync anyway
+  // (and worse, would mislead callers who think they can edit a remote agent).
+  getDB().prepare("UPDATE agents SET display_name = ? WHERE id = ? AND origin_peer = ''").run(newName, id);
 }
 
 // --- Address resolution ---
