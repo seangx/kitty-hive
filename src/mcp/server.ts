@@ -22,7 +22,7 @@ export function createMcpServer(): McpServer {
       '## Identity',
       '- agent_id (ULID) is your stable cross-team handle. Get it from hive_start.',
       '- display_name is for display only, not unique.',
-      '- Inside a team, members can have unique nicknames (set with hive_team_nickname).',
+      '- Inside a team, members can have unique nicknames (set at hive_team_join time).',
       '',
       '## Addressing',
       '- DM and task `to`: prefer agent_id. team-nickname or display_name also accepted if unambiguous.',

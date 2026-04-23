@@ -1,6 +1,6 @@
 import {
   createTeam, getTeamById, getTeamByName, listTeams, getAgentTeams,
-  addTeamMember, isTeamMember, getTeamMembers, getTeamMember, setTeamNickname,
+  addTeamMember, isTeamMember, getTeamMembers, getTeamMember,
   getTeamDisplayName, appendTeamEvent, getTeamEvents, getLatestTeamEvents,
   getAgentById,
 } from '../db.js';
@@ -106,22 +106,6 @@ export function handleTeamMessage(actorId: string, input: { team_id: string; con
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
   const event = appendTeamEvent(input.team_id, 'message', actorId, { content: input.content });
   return { team_id: input.team_id, event_id: event.id, seq: event.seq };
-}
-
-// --- hive_team_nickname ---
-
-export function handleTeamNickname(actorId: string, input: { team_id: string; nickname: string | null }): { team_id: string; nickname: string | null; old_nickname: string | null } {
-  if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
-  const member = getTeamMember(input.team_id, actorId)!;
-  if (input.nickname) {
-    const conflict = getTeamMembers(input.team_id).find(m => m.nickname === input.nickname && m.agent_id !== actorId);
-    if (conflict) throw new Error(`Nickname "${input.nickname}" already taken in this team`);
-  }
-  setTeamNickname(input.team_id, actorId, input.nickname);
-  appendTeamEvent(input.team_id, 'rename', actorId, {
-    old_nickname: member.nickname, new_nickname: input.nickname,
-  });
-  return { team_id: input.team_id, nickname: input.nickname, old_nickname: member.nickname };
 }
 
 // --- hive_team_list (mine) ---

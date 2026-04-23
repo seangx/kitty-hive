@@ -618,10 +618,6 @@ export function getTeamMemberAgentIds(teamId: string): string[] {
   return (getDB().prepare('SELECT agent_id FROM team_members WHERE team_id = ?').all(teamId) as Array<{ agent_id: string }>).map(r => r.agent_id);
 }
 
-export function setTeamNickname(teamId: string, agentId: string, nickname: string | null): void {
-  getDB().prepare('UPDATE team_members SET nickname = ? WHERE team_id = ? AND agent_id = ?').run(nickname, teamId, agentId);
-}
-
 export function getTeamMember(teamId: string, agentId: string): TeamMember | undefined {
   return getDB().prepare('SELECT * FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, agentId) as TeamMember | undefined;
 }

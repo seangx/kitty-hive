@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   handleTeamCreate, handleTeamJoin, handleTeamList, handleTeamInfo,
-  handleTeamEvents, handleTeamMessage, handleTeamNickname, handleMyTeams,
+  handleTeamEvents, handleTeamMessage, handleMyTeams,
 } from '../tools/team.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyTeamMembers } from '../sessions.js';
@@ -115,22 +115,6 @@ export function registerTeamTools(mcp: McpServer) {
         event_id: teamEventId(params.team_id, 'team-message'),
         team_id: params.team_id,
       }));
-      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
-    },
-  );
-
-  mcp.tool(
-    'hive_team_nickname',
-    'Set or change your nickname within a team. Pass null to clear.',
-    {
-      as: asParam,
-      team_id: z.string().describe('Team id'),
-      nickname: z.string().nullable().describe('New nickname (or null to clear)'),
-    },
-    async (params, extra) => {
-      const agent = resolveAgent(extra, params.as);
-      if (!agent) return authError();
-      const result = handleTeamNickname(agent.id, { team_id: params.team_id, nickname: params.nickname });
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
