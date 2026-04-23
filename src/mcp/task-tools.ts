@@ -234,7 +234,16 @@ export function registerTaskTools(mcp: McpServer) {
         event_id: eventId(params.task_id, pushType),
         task_id: params.task_id,
       }));
-      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action: action || 'waiting' }) }] };
+      // Inline self-review hint when roles is empty. The hint disappears once
+      // roles populates — naturally tapering off so we don't nag well-tagged
+      // agents. This piggybacks on a tool-call response (which the agent MUST
+      // read) rather than relying on static instructions text the agent might
+      // skip.
+      const response: any = { task_id: params.task_id, action: action || 'waiting' };
+      if (!agent.roles) {
+        response._self_review = 'Your roles tag list is empty. If this step exercised a capability others might want to route to you via role:xxx (tester / reviewer / frontend / backend / db / ux / docs / ...), call hive_update_role(add=["<domain>"]). Skip silently if no new capability was exercised.';
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(response) }] };
     },
   );
 

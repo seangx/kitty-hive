@@ -220,7 +220,34 @@ async function run() {
   ok(t5.assignee?.id === at.agent_id,
      `role:reviewer matches alphaT via explicit roles field (got ${t5.assignee?.display_name})`);
 
-  console.log('\n=== Test 6: step accepts string (LLM quote-mistake tolerance, v0.6.7) ===');
+  console.log('\n=== Test 6: _self_review hint appears when roles is empty (v0.6.8) ===');
+  // Fresh agent with empty roles → step_complete response should carry the nudge.
+  const fresh = new HiveClient('fresh');
+  await fresh.init();
+  const f = await fresh.callTool('hive_start', { name: 'fresh-noroles', tool: 'claude' });
+  const t6a = await alice.callTool('hive_task', { to: f.agent_id, title: 'self-review hint test' });
+  await fresh.callTool('hive_workflow_propose', {
+    task_id: t6a.task_id,
+    workflow: [{ step: 1, title: 's', assignees: [f.agent_id], action: 'go', completion: 'all' }],
+  });
+  await alice.callTool('hive_workflow_approve', { task_id: t6a.task_id });
+  const completeResp = await fresh.callTool('hive_workflow_step_complete', { task_id: t6a.task_id, step: 1, result: 'ok' });
+  ok(typeof completeResp._self_review === 'string' && /role:xxx|hive_update_role/i.test(completeResp._self_review),
+     'fresh agent (roles="") gets _self_review hint in step_complete response');
+
+  // After populating roles, hint should NOT appear.
+  await fresh.callTool('hive_update_role', { add: ['demoer'] });
+  const t6b = await alice.callTool('hive_task', { to: f.agent_id, title: 'no hint after roles set' });
+  await fresh.callTool('hive_workflow_propose', {
+    task_id: t6b.task_id,
+    workflow: [{ step: 1, title: 's', assignees: [f.agent_id], action: 'go', completion: 'all' }],
+  });
+  await alice.callTool('hive_workflow_approve', { task_id: t6b.task_id });
+  const completeResp2 = await fresh.callTool('hive_workflow_step_complete', { task_id: t6b.task_id, step: 1, result: 'ok' });
+  ok(completeResp2._self_review === undefined,
+     'agent with roles set does NOT get _self_review hint (taper-off)');
+
+  console.log('\n=== Test 7: step accepts string (LLM quote-mistake tolerance, v0.6.7) ===');
   // LLMs sometimes quote numbers in tool calls. z.coerce.number() accepts both.
   const t6 = await alice.callTool('hive_task', { to: bt.agent_id, title: 'coerce test' });
   // Propose a workflow with step as STRING (simulating buggy LLM output)
