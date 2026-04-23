@@ -220,6 +220,33 @@ async function run() {
   ok(t5.assignee?.id === at.agent_id,
      `role:reviewer matches alphaT via explicit roles field (got ${t5.assignee?.display_name})`);
 
+  console.log('\n=== Test 6: step accepts string (LLM quote-mistake tolerance, v0.6.7) ===');
+  // LLMs sometimes quote numbers in tool calls. z.coerce.number() accepts both.
+  const t6 = await alice.callTool('hive_task', { to: bt.agent_id, title: 'coerce test' });
+  // Propose a workflow with step as STRING (simulating buggy LLM output)
+  let acceptedString = false;
+  try {
+    await betaT.callTool('hive_workflow_propose', {
+      task_id: t6.task_id,
+      workflow: [{ step: '1', title: 's', assignees: [bt.agent_id], action: 'go', completion: 'all' }],
+    });
+    acceptedString = true;
+  } catch (err) {
+    console.error('  unexpected reject on step="1":', err.message);
+  }
+  ok(acceptedString, 'workflow_propose accepts step as string "1" (coerced to number)');
+
+  // Approve, then complete with step as STRING
+  await alice.callTool('hive_workflow_approve', { task_id: t6.task_id });
+  let completed = false;
+  try {
+    await betaT.callTool('hive_workflow_step_complete', { task_id: t6.task_id, step: '1', result: 'ok' });
+    completed = true;
+  } catch (err) {
+    console.error('  unexpected reject on step="1" complete:', err.message);
+  }
+  ok(completed, 'workflow_step_complete accepts step as string "1" (coerced to number)');
+
   console.log(`\n=== Done: ${pass} passed, ${fail} failed ===`);
   process.exit(fail > 0 ? 1 : 0);
 }

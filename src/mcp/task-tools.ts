@@ -170,7 +170,7 @@ export function registerTaskTools(mcp: McpServer) {
       as: asParam,
       task_id: z.string().describe('Task id'),
       workflow: z.array(z.object({
-        step: z.number(),
+        step: z.coerce.number(),
         title: z.string(),
         assignees: z.array(z.string()).describe('Agent ids or "role:xxx"'),
         action: z.string().max(400, 'step.action must be ≤400 chars — point to upstream spec (openspec change ref / issue id / doc URL / DM message_id) instead of inlining acceptance criteria. Acceptance details belong in the spec system, not in task workflow.'),
@@ -219,7 +219,7 @@ export function registerTaskTools(mcp: McpServer) {
     {
       as: asParam,
       task_id: z.string().describe('Task id'),
-      step: z.number().describe('Step number'),
+      step: z.coerce.number().describe('Step number'),
       result: z.string().optional().describe('Result description'),
     },
     async (params, extra) => {
@@ -268,7 +268,7 @@ export function registerTaskTools(mcp: McpServer) {
     {
       as: asParam,
       task_id: z.string().describe('Task id'),
-      step: z.number().describe('Step being rejected'),
+      step: z.coerce.number().describe('Step being rejected'),
       reason: z.string().optional().describe('Rejection reason'),
     },
     async (params, extra) => {
