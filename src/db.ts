@@ -179,6 +179,7 @@ export function initDB(dbPath?: string): Database.Database {
   // until v0.5.9). SQLite has no ALTER COLUMN, so we recreate the table.
   migrateTasksStatusCheck(db);
   migrateTeamEventsTypeCheck(db);
+  migrateClearChannelRoles(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
@@ -321,6 +322,17 @@ function migrateTeamEventsTypeCheck(db: Database.Database): void {
   console.log('[db] migrated team_events.type CHECK constraint to include host-transfer');
 }
 
+// One-time data cleanup for v0.6.5: channel.ts pre-v0.6.5 hardcoded
+// `roles='channel'` for every registered agent, polluting the field that
+// `findAgentByRole` uses. Wipe it so the new double-layer (roles → display_name
+// fallback) lookup actually finds people. Idempotent: no-op once cleared.
+function migrateClearChannelRoles(db: Database.Database): void {
+  const before = db.prepare("SELECT COUNT(*) as n FROM agents WHERE roles = 'channel'").get() as { n: number };
+  if (before.n === 0) return;
+  db.prepare("UPDATE agents SET roles = '' WHERE roles = 'channel'").run();
+  console.log(`[db] cleared channel-polluted roles on ${before.n} agent(s)`);
+}
+
 // --- Agent queries ---
 
 export interface CreateAgentOpts {
@@ -415,10 +427,71 @@ export function listAllAgents(activeOnly: boolean = false): Agent[] {
   return getDB().prepare(sql).all() as Agent[];
 }
 
-export function findAgentByRole(role: string): Agent | undefined {
-  return getDB().prepare(
-    "SELECT * FROM agents WHERE roles LIKE ? AND status = 'active' ORDER BY last_seen DESC LIMIT 1"
-  ).get(`%${role}%`) as Agent | undefined;
+/**
+ * Find an active local agent matching a role string.
+ *
+ * Lookup priority (first hit wins):
+ *   1. If `teamId` given, find a team member whose `roles` contains the role
+ *   2. If `teamId` given, find a team member whose `display_name` contains the role
+ *   3. Globally find any local agent whose `roles` contains the role
+ *   4. Globally find any local agent whose `display_name` contains the role
+ *
+ * The display_name fallback (steps 2 + 4) lets the project work on day one without
+ * agents explicitly setting `roles` — `display_name` like "tester" or "web-master"
+ * naturally serves as a role tag. Agents that want precision can set HIVE_AGENT_ROLES
+ * env or call hive_update_role to populate the `roles` field, which then takes
+ * priority over the display_name fallback.
+ */
+export function findAgentByRole(role: string, opts?: { teamId?: string }): Agent | undefined {
+  const r = `%${role}%`;
+  const d = getDB();
+  if (opts?.teamId) {
+    // Team-scoped: prefer team members. Two passes: roles match, then display_name.
+    const teamRolesMatch = d.prepare(`
+      SELECT a.* FROM agents a
+      JOIN team_members m ON m.agent_id = a.id
+      WHERE m.team_id = ? AND a.roles LIKE ? AND a.status = 'active' AND a.origin_peer = ''
+      ORDER BY a.last_seen DESC LIMIT 1
+    `).get(opts.teamId, r) as Agent | undefined;
+    if (teamRolesMatch) return teamRolesMatch;
+    const teamNameMatch = d.prepare(`
+      SELECT a.* FROM agents a
+      JOIN team_members m ON m.agent_id = a.id
+      WHERE m.team_id = ? AND a.display_name LIKE ? AND a.status = 'active' AND a.origin_peer = ''
+      ORDER BY a.last_seen DESC LIMIT 1
+    `).get(opts.teamId, r) as Agent | undefined;
+    if (teamNameMatch) return teamNameMatch;
+  }
+  // Global fallback. Local agents only — remote placeholders aren't claimable.
+  const globalRolesMatch = d.prepare(
+    "SELECT * FROM agents WHERE roles LIKE ? AND status = 'active' AND origin_peer = '' ORDER BY last_seen DESC LIMIT 1"
+  ).get(r) as Agent | undefined;
+  if (globalRolesMatch) return globalRolesMatch;
+  return d.prepare(
+    "SELECT * FROM agents WHERE display_name LIKE ? AND status = 'active' AND origin_peer = '' ORDER BY last_seen DESC LIMIT 1"
+  ).get(r) as Agent | undefined;
+}
+
+/**
+ * Add/remove role tags on an agent. Roles is comma-separated, deduped, trimmed.
+ * Returns old/new roles strings for the caller to surface.
+ */
+export function updateAgentRoles(
+  agentId: string,
+  add: string[] = [],
+  remove: string[] = [],
+): { old: string; new: string } {
+  const d = getDB();
+  const row = d.prepare('SELECT roles FROM agents WHERE id = ?').get(agentId) as { roles: string } | undefined;
+  if (!row) throw new Error(`agent not found: ${agentId}`);
+  const current = new Set(
+    row.roles.split(',').map(r => r.trim()).filter(Boolean)
+  );
+  for (const r of remove.map(s => s.trim()).filter(Boolean)) current.delete(r);
+  for (const r of add.map(s => s.trim()).filter(Boolean)) current.add(r);
+  const next = [...current].sort().join(',');
+  d.prepare('UPDATE agents SET roles = ? WHERE id = ?').run(next, agentId);
+  return { old: row.roles, new: next };
 }
 
 export function touchAgent(id: string): void {
@@ -690,6 +763,18 @@ export function updateTaskStatus(id: string, status: string, extras?: Record<str
 export function getAgentTasks(agentId: string, status?: string): Task[] {
   let sql = 'SELECT * FROM tasks WHERE (creator_agent_id = ? OR assignee_agent_id = ?)';
   const params: any[] = [agentId, agentId];
+  if (status) { sql += ' AND status = ?'; params.push(status); }
+  sql += ' ORDER BY created_at DESC';
+  return getDB().prepare(sql).all(...params) as Task[];
+}
+
+/**
+ * All tasks bound to a team via source_team_id. Caller is responsible for
+ * checking that the requester is a current team member (see hive-tasks handler).
+ */
+export function getTeamTasks(teamId: string, status?: string): Task[] {
+  let sql = 'SELECT * FROM tasks WHERE source_team_id = ?';
+  const params: any[] = [teamId];
   if (status) { sql += ' AND status = ?'; params.push(status); }
   sql += ' ORDER BY created_at DESC';
   return getDB().prepare(sql).all(...params) as Task[];

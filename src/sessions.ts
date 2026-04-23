@@ -137,7 +137,7 @@ export async function notifyTaskParticipants(taskId: string, excludeAgentId?: st
       for (const step of steps) {
         for (const a of step.assignees || []) {
           if (a.startsWith('role:')) {
-            const agent = db.findAgentByRole(a.slice(5));
+            const agent = db.findAgentByRole(a.slice(5), { teamId: task.source_team_id ?? undefined });
             if (agent) participants.add(agent.id);
           } else {
             const byId = db.getAgentById(a);

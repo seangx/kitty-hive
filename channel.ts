@@ -17,6 +17,7 @@ const HIVE_URL = process.env.HIVE_URL || 'http://localhost:4123/mcp'
 const HIVE_AGENT_ID = process.env.HIVE_AGENT_ID || ''
 const HIVE_AGENT_KEY = process.env.HIVE_AGENT_KEY || ''
 const HIVE_AGENT_NAME = process.env.HIVE_AGENT_NAME || ''
+const HIVE_AGENT_ROLES = process.env.HIVE_AGENT_ROLES || ''
 
 // --- Hive HTTP client ---
 
@@ -44,7 +45,7 @@ async function hivePost(method: string, params: any = {}, _retried = false): Pro
     console.error(`[hive-channel] server returned 404 (stale session); re-initializing...`)
     sessionId = null
     await initHiveSession()
-    if (agentId) await hiveCallTool('hive_start', { id: agentId, tool: 'claude', roles: 'channel' }, true)
+    if (agentId) await hiveCallTool('hive_start', reconnectArgs(), true)
     return hivePost(method, params, true)
   }
 
@@ -89,8 +90,21 @@ async function initHiveSession() {
   })
 }
 
+// Build args for hive_start. Only sets `roles` when HIVE_AGENT_ROLES env is
+// provided — pre-v0.6.5 channel.ts hardcoded `roles='channel'`, polluting the
+// field that role-based routing relies on. Now we leave roles empty by default;
+// agents accumulate roles via hive_update_role as they do work, and routing
+// falls back to display_name substring match in the meantime.
+function reconnectArgs(): any {
+  const a: any = { tool: 'claude' }
+  if (agentId) a.id = agentId
+  if (HIVE_AGENT_ROLES) a.roles = HIVE_AGENT_ROLES
+  return a
+}
+
 async function registerAgent(opts: { id?: string; key?: string; name?: string }) {
-  const args: any = { tool: 'claude', roles: 'channel' }
+  const args: any = { tool: 'claude' }
+  if (HIVE_AGENT_ROLES) args.roles = HIVE_AGENT_ROLES
   if (opts.id) args.id = opts.id
   if (opts.key) args.key = opts.key
   if (opts.name) args.name = opts.name
@@ -141,12 +155,30 @@ const mcp = new Server(
       '- id@<peer-name> for cross-machine federation (peer name shown by hive-peers)',
       '',
       '## Tools',
-      '- Identity: hive-whoami, hive-rename, hive-agents (list all agents on the hive)',
+      '- Identity: hive-whoami, hive-rename, hive-update-role (self-maintain role tags), hive-agents (list all agents on the hive)',
       '- DM & files: hive-dm (pass attach: ["/local/path"] to send files), hive-inbox, hive-dm-read (full content when preview has a [hive note] block), hive-file-fetch (get attachment by file_id)',
       '- Teams: hive-team-create, hive-team-join, hive-team-list, hive-teams (mine), hive-team-info, hive-team-events, hive-team-message, hive-team-nickname',
       '- Tasks: hive-task, hive-task-claim, hive-task-cancel (creator only), hive-tasks, hive-check',
       '- Workflow: hive-workflow-propose (set gate:true per step for review pauses), hive-workflow-approve, hive-workflow-step-complete, hive-workflow-step-approve (release gate, creator only), hive-workflow-reject',
       '- Federation: hive-peers, hive-remote-agents (then DM/task with id@<peer-name>)',
+      '',
+      '## Roles',
+      '`roles` is a comma-separated tag list describing the kinds of work you can do. It drives `role:xxx` routing — others find you by capability instead of by name.',
+      '',
+      'Self-maintain it:',
+      '- After completing a kind of work you previously had not done, call hive-update-role(add=[\'<domain>\']). Examples: first e2e test → add \'tester\'; first code review → add \'reviewer\'.',
+      '- If you were wrongly routed via role:X (you are not actually the right fit), call hive-update-role(remove=[\'X\']).',
+      '- Do NOT pre-occupy roles. Only register what you can demonstrably do.',
+      '',
+      'Common roles: tester, reviewer, frontend, backend, db, devops, ux, design, docs. Project-specific tags also fine.',
+      '',
+      'If your `roles` is empty, routing falls back to display_name substring match — so a display_name containing your role (e.g. "tester") still gets you found. Setting roles makes routing more precise.',
+      '',
+      '## Team collaboration',
+      'When a task has source_team_id, or you belong to a team:',
+      '- BEFORE creating a new task: call hive-tasks(team=<team>) to see if a similar task is already in flight. Avoid duplicates.',
+      '- WHEN delegating: prefer role:xxx — routing matches inside the team first.',
+      '- IF unsure who to pick: call hive-team-info(team=<team>) to see members, their roles, and expertise.',
       '',
       '## Workflow rules',
       '- When you receive a task, propose a workflow (hive-workflow-propose) before starting.',
@@ -155,6 +187,7 @@ const mcp = new Server(
       '- Same rule for hive-workflow-step-approve: only the creator (via the user) decides when a gated phase is released.',
       '- Mark each step with hive-workflow-step-complete.',
       '- Claim unassigned tasks with hive-task-claim.',
+      '- step.action MUST be ≤400 chars. POINT to upstream spec (openspec change ref / Linear or issue id / doc URL / prior DM message_id) — do NOT inline acceptance criteria. Spec details belong in the spec system, not in task workflow text.',
       '',
       '## File transfer (paths do not cross machines)',
       '- A local path you mention in DM `content` cannot be opened by the receiver (different OS/machine).',
@@ -304,7 +337,7 @@ async function listenSSE() {
         console.error(`[hive-channel] SSE connect failed: ${res.status}, re-registering...`)
         try {
           await initHiveSession()
-          if (agentId) await hiveCallTool('hive_start', { id: agentId, tool: 'claude', roles: 'channel' })
+          if (agentId) await hiveCallTool('hive_start', reconnectArgs())
         } catch (e) {
           console.error(`[hive-channel] re-register failed:`, e)
         }

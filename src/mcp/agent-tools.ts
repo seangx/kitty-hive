@@ -1,7 +1,7 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { handleStart } from '../tools/start.js';
-import { renameAgent, listAllAgents, getAgentsByName } from '../db.js';
+import { renameAgent, listAllAgents, getAgentsByName, updateAgentRoles, getAgentById } from '../db.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { bindSession } from '../sessions.js';
 
@@ -50,6 +50,33 @@ export function registerAgentTools(mcp: McpServer) {
           }),
         }],
       };
+    },
+  );
+
+  mcp.tool(
+    'hive_update_role',
+    'Add or remove role tags on yourself. Affects role:xxx routing — others can find you via role:tester etc. ' +
+    'Call this AFTER you complete a kind of work you previously hadn\'t done (add=[\'<domain>\']), ' +
+    'or when you notice you were wrongly routed via role:X (remove=[\'X\']). ' +
+    'Do NOT pre-occupy roles — only register what you can demonstrably do.',
+    {
+      as: asParam,
+      add: z.array(z.string()).optional().describe('Role tags to add (e.g. ["tester", "reviewer"]). Comma in a single string is fine too — it will be split.'),
+      remove: z.array(z.string()).optional().describe('Role tags to remove.'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      // Allow either ["tester","reviewer"] or ["tester,reviewer"] for ergonomic CLI use.
+      const split = (arr: string[] | undefined) =>
+        (arr ?? []).flatMap(s => s.split(',')).map(s => s.trim()).filter(Boolean);
+      const result = updateAgentRoles(agent.id, split(params.add), split(params.remove));
+      return { content: [{ type: 'text', text: JSON.stringify({
+        agent_id: agent.id,
+        display_name: agent.display_name,
+        old_roles: result.old,
+        new_roles: result.new,
+      }) }] };
     },
   );
 

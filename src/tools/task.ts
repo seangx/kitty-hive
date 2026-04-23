@@ -28,7 +28,9 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
 
   if (input.to) {
     if (input.to.startsWith('role:')) {
-      const agent = findAgentByRole(input.to.slice(5));
+      // When source_team_id is set, prefer team members for role lookup so
+      // routing is deterministic per project context.
+      const agent = findAgentByRole(input.to.slice(5), { teamId: input.source_team_id });
       if (agent) assignee = { id: agent.id, display_name: agent.display_name };
     } else {
       const resolved = resolveAddressee(actorId, input.to);

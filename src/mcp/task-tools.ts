@@ -10,25 +10,58 @@ import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents, notifyTaskParticipants } from '../sessions.js';
 import { buildPushMessage } from '../preview.js';
 import * as db from '../db.js';
+import type { Task } from '../models.js';
 
 function eventId(taskId: string, type: string): string {
   return `task:${taskId}:${type}:${Date.now()}`;
 }
 
+// --- Task list output projection ---
+// Whitelist of fields that may appear in `hive_tasks` list responses. Adding a
+// field here is a deliberate decision; this guards against accidental leaks of
+// heavy fields (workflow_json / task_events / input_json) into list views,
+// which would balloon token cost. To inspect a single task in detail use
+// hive_check(task_id).
+const TASK_LIST_FIELDS = ['id', 'title', 'status', 'step', 'creator', 'assignee', 'created_at'] as const;
+type TaskListRow = { [K in typeof TASK_LIST_FIELDS[number]]: string };
+
+function projectTaskListRow(t: Task): TaskListRow {
+  // Compute step "N/M" once; M=0 when no workflow.
+  const stepCount = t.workflow_json
+    ? (() => { try { return (JSON.parse(t.workflow_json) as any[]).length; } catch { return 0; } })()
+    : 0;
+  return {
+    id: t.id,
+    title: t.title,
+    status: t.status,
+    step: `${t.current_step ?? 0}/${stepCount}`,
+    creator: db.getAgentById(t.creator_agent_id)?.display_name ?? 'unknown',
+    assignee: t.assignee_agent_id ? (db.getAgentById(t.assignee_agent_id)?.display_name ?? 'unknown') : 'unassigned',
+    created_at: t.created_at,
+  };
+}
+
 export function registerTaskTools(mcp: McpServer) {
   mcp.tool(
     'hive_task',
-    'Create a task and (optionally) delegate. Omit `to` to create an unassigned task that anyone can claim.',
+    'Create a task and (optionally) delegate. Omit `to` to create an unassigned task that anyone can claim. ' +
+    'Pass `source_team_id` to bind the task to a team — team members can then see it via hive_tasks(team=X), and `role:xxx` routing prefers team members. The binding is set once at create and cannot be changed later.',
     {
       as: asParam,
-      to: z.string().optional().describe('Target. Accepts: agent id (always works) · team-nickname (only resolved within teams you both belong to) · display_name (only if globally unambiguous) · "role:xxx" (picks an active agent with that role) · "id@<peer-name>" for federation.'),
+      to: z.string().optional().describe('Target. Accepts: agent id (always works) · team-nickname (only resolved within teams you both belong to) · display_name (only if globally unambiguous) · "role:xxx" (picks an active agent with that role; team members preferred when source_team_id is set) · "id@<peer-name>" for federation.'),
       title: z.string().describe('Task title'),
       input: z.record(z.string(), z.unknown()).optional().describe('Structured task input'),
+      source_team_id: z.string().optional().describe('Team id this task belongs to. Once set, immutable — to change team, create a new task. Enables team-scoped visibility (hive_tasks(team=X)) and team-scoped role:xxx routing.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const result = await handleTaskCreateAsync(agent.id, { to: params.to, title: params.title, input: params.input as object });
+      const result = await handleTaskCreateAsync(agent.id, {
+        to: params.to,
+        title: params.title,
+        input: params.input as object,
+        source_team_id: params.source_team_id,
+      });
       if (result.assignee) {
         await notifyAgents([result.assignee.id], agent.id, buildPushMessage({
           type: 'task-assigned',
@@ -87,23 +120,32 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_tasks',
-    'List tasks you created or are assigned to.',
+    'List tasks. Without `team`: tasks you created or are assigned to. With `team`: all tasks bound to that team via source_team_id (you must be a current team member; non-members get a 403). Use this before creating a task to avoid duplicating in-flight work in the team.',
     {
       as: asParam,
       status: z.string().optional().describe('Filter by status. Valid values: created, proposing, approved, in_progress, awaiting_approval, completed, failed, canceled.'),
+      team: z.string().optional().describe('Team id or name. When set, returns ALL tasks in that team (regardless of creator/assignee). Caller must be a current member of the team.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
-      const tasks = db.getAgentTasks(agent.id, params.status);
-      const board = tasks.map(t => ({
-        task_id: t.id, title: t.title, status: t.status,
-        creator: db.getAgentById(t.creator_agent_id)?.display_name ?? 'unknown',
-        assignee: t.assignee_agent_id ? (db.getAgentById(t.assignee_agent_id)?.display_name ?? 'unknown') : 'unassigned',
-        current_step: t.current_step,
-        has_workflow: !!t.workflow_json,
-        created_at: t.created_at,
-      }));
+
+      let tasks: Task[];
+      if (params.team) {
+        // Resolve team: id first, then name.
+        const team = db.getTeamById(params.team) || db.getTeamByName(params.team);
+        if (!team) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: `team not found: ${params.team}` }) }] };
+        }
+        if (!db.isTeamMember(team.id, agent.id)) {
+          return { content: [{ type: 'text', text: JSON.stringify({ error: `not a member of team "${team.name}"` }) }] };
+        }
+        tasks = db.getTeamTasks(team.id, params.status);
+      } else {
+        tasks = db.getAgentTasks(agent.id, params.status);
+      }
+
+      const board = tasks.map(projectTaskListRow);
       return { content: [{ type: 'text', text: JSON.stringify(board, null, 2) }] };
     },
   );
@@ -131,7 +173,7 @@ export function registerTaskTools(mcp: McpServer) {
         step: z.number(),
         title: z.string(),
         assignees: z.array(z.string()).describe('Agent ids or "role:xxx"'),
-        action: z.string(),
+        action: z.string().max(400, 'step.action must be ≤400 chars — point to upstream spec (openspec change ref / issue id / doc URL / DM message_id) instead of inlining acceptance criteria. Acceptance details belong in the spec system, not in task workflow.'),
         completion: z.enum(['all', 'any']).default('all'),
         on_reject: z.string().optional().describe('What happens if THIS step is rejected. "revise" → re-do the same step (default). "back:N" → roll all the way back to step N (e.g. "back:1").'),
         gate: z.boolean().optional().describe('When true, after this step\'s assignees all finish the task pauses in `awaiting_approval` until the creator calls hive-workflow-step-approve. Use this for phases the creator will review before letting the next step start.'),
