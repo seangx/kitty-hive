@@ -47,7 +47,10 @@ async function cmdServe() {
 
 const INIT_TOOLS = ['claude', 'cursor', 'vscode'] as const;
 type InitTool = typeof INIT_TOOLS[number];
-const ALL_INIT_TARGETS = ['claude', 'cursor', 'vscode', 'antigravity'] as const;
+// codex is config'd via its own CLI (`codex mcp add ... --url ...`) writing
+// to ~/.codex/config.toml — we shell out instead of editing toml ourselves.
+// antigravity has no on-disk path; we print a snippet for the user to paste.
+const ALL_INIT_TARGETS = ['claude', 'cursor', 'vscode', 'antigravity', 'codex'] as const;
 
 function findNpx(): string {
   const probe = process.platform === 'win32' ? 'where npx' : 'command -v npx';
@@ -102,6 +105,39 @@ function writeForTool(tool: InitTool, port: number): string {
   throw new Error(`Unknown tool: ${tool}`);
 }
 
+function findCodex(): string | null {
+  const probe = process.platform === 'win32' ? 'where codex' : 'command -v codex';
+  try {
+    const out = execSync(probe, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+    return out || null;
+  } catch { return null; }
+}
+
+function configureCodex(port: number): { ok: boolean; message: string } {
+  const url = `http://localhost:${port}/mcp`;
+  const codex = findCodex();
+  // Prefer shelling out to `codex mcp add` so the user's existing
+  // ~/.codex/config.toml stays untouched (no risky toml merge from our side).
+  if (codex) {
+    try {
+      execSync(`${codex} mcp add hive --url ${url}`, { stdio: 'pipe' });
+      return { ok: true, message: `${codex} mcp add hive --url ${url}  (registered globally in ~/.codex/config.toml)` };
+    } catch (err: any) {
+      const stderr = String(err?.stderr || err?.message || err);
+      // If hive already exists, codex mcp add errors out — surface that as a no-op success.
+      if (/already exists|duplicate/i.test(stderr)) {
+        return { ok: true, message: `hive already registered in ~/.codex/config.toml — no change` };
+      }
+      return { ok: false, message: `codex mcp add failed: ${stderr.split('\n')[0]}` };
+    }
+  }
+  // Fallback: print the command for the user to run manually.
+  return {
+    ok: false,
+    message: `codex CLI not found in PATH. Install codex, then run:\n      codex mcp add hive --url ${url}`,
+  };
+}
+
 function antigravitySnippet(port: number): string {
   // Antigravity has no public on-disk config path — users edit via
   // "..." → MCP Store → Manage MCP Servers → View raw config.
@@ -136,6 +172,7 @@ function showInitUsage() {
   console.log('  claude        .mcp.json          (Claude Code — prefer the plugin instead)');
   console.log('  cursor        .cursor/mcp.json');
   console.log('  vscode        .vscode/mcp.json   (VS Code Copilot)');
+  console.log('  codex         shells out to `codex mcp add` (writes ~/.codex/config.toml)');
   console.log('  antigravity   prints snippet to paste via MCP Store UI');
   console.log('  all           run all of the above');
 }
@@ -162,6 +199,7 @@ async function cmdInit() {
         { value: 'claude', label: 'Claude Code', hint: '.mcp.json (prefer the plugin if installed)' },
         { value: 'cursor', label: 'Cursor', hint: '.cursor/mcp.json' },
         { value: 'vscode', label: 'VS Code Copilot', hint: '.vscode/mcp.json' },
+        { value: 'codex', label: 'Codex CLI', hint: 'codex mcp add → ~/.codex/config.toml' },
         { value: 'antigravity', label: 'Antigravity', hint: 'snippet — paste via MCP Store UI' },
         { value: 'all', label: 'All of the above' },
       ],
@@ -188,6 +226,9 @@ async function cmdInit() {
       const snippet = antigravitySnippet(port).split('\n').map(l => '    ' + l).join('\n');
       console.log(snippet);
       console.log('');
+    } else if (t === 'codex') {
+      const res = configureCodex(port);
+      console.log(`  ${t.padEnd(12)} ${res.message}`);
     } else {
       const path = writeForTool(t as InitTool, port);
       console.log(`  ${t.padEnd(12)} ${path}`);
