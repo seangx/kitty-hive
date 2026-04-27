@@ -45,6 +45,36 @@ async function cmdServe() {
   await startServer(port, dbPath);
 }
 
+// Long-running daemon that bridges hive push events to a Codex agent.
+// Codex CLI has no native equivalent of Claude Code's notifications/claude/channel,
+// so we fan out hive pushes by spawning `codex exec "<prompt>"` on each event.
+// codex-channel.ts ships at the package root next to channel.ts; we forward all
+// process args/env to it via tsx.
+async function cmdCodexChannel() {
+  // Resolve codex-channel.ts relative to this script (dist/index.js → ../codex-channel.ts)
+  const scriptPath = join(__dirname, '..', 'codex-channel.ts');
+  if (!existsSync(scriptPath)) {
+    console.error(`[codex-channel] cannot locate codex-channel.ts at ${scriptPath}`);
+    process.exit(1);
+  }
+  // exec replaces this process; user sees codex-channel output directly + Ctrl+C works
+  const { spawn } = await import('node:child_process');
+  const child = spawn(findNpx(), ['-y', 'tsx', scriptPath, ...args.slice(1)], {
+    stdio: 'inherit',
+  });
+  child.on('exit', (code) => process.exit(code ?? 0));
+  child.on('error', (err) => {
+    console.error('[codex-channel] failed to spawn tsx:', err);
+    process.exit(1);
+  });
+  // Forward signals so Ctrl+C reaches codex-channel
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => { try { child.kill(sig); } catch { /* ignore */ } });
+  }
+  // Block until child exits (handled above)
+  await new Promise(() => { /* never resolves; child.on('exit') terminates */ });
+}
+
 const INIT_TOOLS = ['claude', 'cursor', 'vscode'] as const;
 type InitTool = typeof INIT_TOOLS[number];
 // codex is config'd via its own CLI (`codex mcp add ... --url ...`) writing
@@ -1720,7 +1750,8 @@ Usage:
 
 Top-level commands:
   serve [--port 4123] [--db path] [-v|-q]    Start the MCP server
-  init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|antigravity|all)
+  init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|codex|antigravity|all)
+  codex-channel [--name X] [--profile P]     Run a long-lived codex agent that receives hive push events
   status [--port 4123]                       Server & agent status
 
 Command groups:
@@ -1857,6 +1888,9 @@ switch (command) {
     break;
   case 'init':
     run(cmdInit);
+    break;
+  case 'codex-channel':
+    run(cmdCodexChannel);
     break;
   case 'status':
     run(cmdStatus);
