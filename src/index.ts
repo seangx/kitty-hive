@@ -858,6 +858,120 @@ async function cmdTeamTransfer() {
   console.log(`✅ Host of "${team.name}" → ${newHost.display_name}.`);
 }
 
+async function cmdTeamKick() {
+  const { dbPath } = parseFlags(1);
+  let teamArg = '';
+  let agentArg = '';
+  let assumeYes = false;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--yes' || args[i] === '-y') { assumeYes = true; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+    else if (!args[i].startsWith('-') && !teamArg) teamArg = args[i];
+    else if (!args[i].startsWith('-') && !agentArg) agentArg = args[i];
+  }
+  const db = initDB(dbPath);
+  const dbMod = await import('./db.js');
+
+  // --- Resolve team ---
+  let team: { id: string; name: string; host_agent_id: string | null } | undefined;
+  if (teamArg) {
+    team = dbMod.getTeamById(teamArg) || dbMod.getTeamByName(teamArg);
+    if (!team) { console.error(`Team "${teamArg}" not found.`); process.exit(1); }
+  } else {
+    if (!isInteractive()) {
+      console.error('Usage: kitty-hive team kick <team> <agent> [--yes]');
+      process.exit(1);
+    }
+    const teams = dbMod.listTeams(false);
+    if (teams.length === 0) { console.log('No teams.'); process.exit(0); }
+    const teamId = await askSelect<string>({
+      message: 'Kick from which team?',
+      options: teams.map(t => ({
+        value: t.id,
+        label: t.name,
+        hint: `${dbMod.countTeamMembers(t.id)} member(s)`,
+      })),
+    });
+    team = teams.find(t => t.id === teamId)!;
+  }
+
+  // --- Resolve target agent (must be a current member) ---
+  const members = dbMod.getTeamMembers(team.id);
+  if (members.length === 0) {
+    console.log(`Team "${team.name}" has no members.`);
+    process.exit(0);
+  }
+  let target: { id: string; display_name: string } | undefined;
+  if (agentArg) {
+    const byId = members.find(m => m.agent_id === agentArg);
+    if (byId) {
+      target = db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(byId.agent_id) as any;
+    } else {
+      // Fall back to display_name match within members
+      const candidateAgents = members.map(m => db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(m.agent_id) as any).filter(Boolean);
+      const byName = candidateAgents.filter(a => a.display_name === agentArg);
+      if (byName.length === 0) { console.error(`Agent "${agentArg}" is not a member of "${team.name}".`); process.exit(1); }
+      if (byName.length > 1) {
+        console.error(`"${agentArg}" matches ${byName.length} members. Use agent id to disambiguate.`);
+        for (const a of byName) console.error(`  ${a.id}  ${a.display_name}`);
+        process.exit(1);
+      }
+      target = byName[0];
+    }
+  } else {
+    if (!isInteractive()) {
+      console.error('Usage: kitty-hive team kick <team> <agent> [--yes]');
+      process.exit(1);
+    }
+    const memberAgents = members
+      .map(m => db.prepare('SELECT id, display_name FROM agents WHERE id = ?').get(m.agent_id) as any)
+      .filter(Boolean);
+    const id = await askSelect<string>({
+      message: `Kick whom from "${team.name}"?`,
+      options: memberAgents.map(a => ({
+        value: a.id,
+        label: a.display_name,
+        hint: a.id === team!.host_agent_id ? '(host)' : a.id,
+      })),
+    });
+    target = memberAgents.find(a => a.id === id);
+  }
+  if (!target) { console.error('Target not found.'); process.exit(1); }
+
+  // --- Refuse to kick the host (would orphan the team) ---
+  if (target.id === team.host_agent_id) {
+    console.error(`"${target.display_name}" is the team host. Use \`kitty-hive team transfer\` to move host first, or \`kitty-hive agent remove\` to delete the agent (cascades all team membership).`);
+    process.exit(1);
+  }
+
+  if (!assumeYes) {
+    const ok = await askConfirm({
+      message: `Remove "${target.display_name}" from team "${team.name}"?`,
+      initialValue: true,
+    });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+
+  dbMod.removeTeamMember(team.id, target.id);
+  dbMod.appendTeamEvent(team.id, 'leave', null, {
+    agent_id: target.id,
+    display_name: target.display_name,
+    reason: 'kicked-by-operator',
+  });
+  try {
+    const sessionsMod = await import('./sessions.js');
+    await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+      type: 'team-kick',
+      team_id: team.id,
+      team_name: team.name,
+      agent_id: target.id,
+      display_name: target.display_name,
+    }));
+  } catch { /* push best-effort */ }
+
+  console.log(`✅ Removed "${target.display_name}" from "${team.name}".`);
+}
+
 // --- Node config ---
 
 function getConfigPath(): string {
@@ -1794,6 +1908,8 @@ Subcommands:
   list                                              List all teams with host + member counts
   transfer [<team>] --to <agent> [--add-member]     Transfer team host to another local agent.
                                                     --add-member auto-joins target if not yet a member.
+  kick [<team>] [<agent>] [--yes]                   Remove an agent from a team (operator-side).
+                                                    Cannot kick the host — transfer first.
 
 Note: agents normally manage teams via the hive-team-* MCP tools.
 This group is for operator-level maintenance (e.g. before removing a host agent).`);
@@ -1908,6 +2024,7 @@ switch (command) {
     switch (args[1]) {
       case 'list':     run(cmdTeamList);     break;
       case 'transfer': run(cmdTeamTransfer); break;
+      case 'kick':     run(cmdTeamKick);     break;
       default:         showTeamHelp();        break;
     }
     break;
