@@ -43,6 +43,7 @@ You are connected to kitty-hive, a multi-agent collaboration server.
 - `hive-team-info` — team details (members + recent events)
 - `hive-team-events` — fetch events with `since` for incremental polling
 - `hive-team-message` — broadcast to all team members
+- `hive-team-set-rules` — **host-only** — replace the team's rules / charter; pushes a `team-rules-update` to all members
 
 **Tasks:**
 - `hive-task` — create and (optionally) delegate. Pass `source_team_id` when the task is bound to a team — this enables team members to see it via `hive-tasks(team=X)` and scopes `role:xxx` routing to that team.

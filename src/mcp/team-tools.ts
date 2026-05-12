@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   handleTeamCreate, handleTeamJoin, handleTeamList, handleTeamInfo,
-  handleTeamEvents, handleTeamMessage, handleMyTeams,
+  handleTeamEvents, handleTeamMessage, handleTeamSetRules, handleMyTeams,
 } from '../tools/team.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyTeamMembers } from '../sessions.js';
@@ -113,6 +113,29 @@ export function registerTeamTools(mcp: McpServer) {
         from: agent.display_name,
         from_agent_id: agent.id,
         event_id: teamEventId(params.team_id, 'team-message'),
+        team_id: params.team_id,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_team_set_rules',
+    'Replace a team\'s rules / charter (free-form markdown shown to all members on hive_start + hive_team_info). HOST-ONLY: only the team\'s host agent can call this; non-hosts are rejected. Pass empty string to clear. The change is pushed to all members as a `team-rules-update` notification — they should re-fetch via hive_team_info to read the new text.',
+    {
+      as: asParam,
+      team_id: z.string().describe('Team id'),
+      rules: z.string().max(10000, 'rules max 10000 chars').describe('Full new rules text (markdown). Pass "" to clear.'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTeamSetRules(agent.id, { team_id: params.team_id, rules: params.rules });
+      await notifyTeamMembers(params.team_id, agent.id, buildPushMessage({
+        type: 'team-rules-update',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: teamEventId(params.team_id, 'team-rules-update'),
         team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };

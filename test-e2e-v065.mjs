@@ -220,7 +220,54 @@ async function run() {
   ok(t5.assignee?.id === at.agent_id,
      `role:reviewer matches alphaT via explicit roles field (got ${t5.assignee?.display_name})`);
 
-  console.log('\n=== Test 6: _self_review hint appears when roles is empty (v0.6.8) ===');
+  console.log('\n=== Test 6 (v0.6.12): hive_team_set_rules — host-only mutation ===');
+  // alice is host of team-A (created earlier), alphaT is a member, bob is non-member.
+  // 1. host (alice) sets rules → success
+  const setOk = await alice.callTool('hive_team_set_rules', {
+    team_id: team.team_id,
+    rules: '## Team-A house rules\n- always gate UI changes\n- DM responses must reference task_id',
+  });
+  ok(setOk.rules_length > 0 && setOk.previous_length === 0,
+     `host (alice) sets rules → length=${setOk.rules_length}, previous=${setOk.previous_length}`);
+
+  // 2. rules surface in hive_team_info for members
+  const infoForMember = await alphaT.callTool('hive_team_info', { team_id: team.team_id });
+  ok(typeof infoForMember.team?.rules === 'string' && /house rules/i.test(infoForMember.team.rules),
+     `member (alphaT) sees rules in hive_team_info`);
+
+  // 3. non-host member tries to set → 403-equivalent (throws)
+  let nonHostBlocked = false;
+  try {
+    await alphaT.callTool('hive_team_set_rules', { team_id: team.team_id, rules: 'malicious override' });
+  } catch (err) {
+    nonHostBlocked = /only the team host/i.test(String(err.message));
+  }
+  ok(nonHostBlocked, 'non-host member (alphaT) is rejected with "only the team host" error');
+
+  // 4. completely external agent (bob, not even in team) → also rejected (host check fails first)
+  let outsiderBlocked = false;
+  try {
+    await bob.callTool('hive_team_set_rules', { team_id: team.team_id, rules: 'outsider override' });
+  } catch (err) {
+    outsiderBlocked = /only the team host/i.test(String(err.message));
+  }
+  ok(outsiderBlocked, 'non-member (bob) is also rejected by host check');
+
+  // 5. host can clear by passing empty string
+  const cleared = await alice.callTool('hive_team_set_rules', { team_id: team.team_id, rules: '' });
+  ok(cleared.rules_length === 0 && cleared.previous_length > 0,
+     `host clears with empty string → length=${cleared.rules_length}, was=${cleared.previous_length}`);
+
+  // 6. length cap (10000): 10001 chars → schema rejects
+  let tooLong = false;
+  try {
+    await alice.callTool('hive_team_set_rules', { team_id: team.team_id, rules: 'x'.repeat(10001) });
+  } catch (err) {
+    tooLong = /max|10000|length/i.test(String(err.message));
+  }
+  ok(tooLong, 'rules >10000 chars rejected by schema');
+
+  console.log('\n=== Test 7: _self_review hint appears when roles is empty (v0.6.8) ===');
   // Fresh agent with empty roles → step_complete response should carry the nudge.
   const fresh = new HiveClient('fresh');
   await fresh.init();
@@ -247,7 +294,7 @@ async function run() {
   ok(completeResp2._self_review === undefined,
      'agent with roles set does NOT get _self_review hint (taper-off)');
 
-  console.log('\n=== Test 7: step accepts string (LLM quote-mistake tolerance, v0.6.7) ===');
+  console.log('\n=== Test 8: step accepts string (LLM quote-mistake tolerance, v0.6.7) ===');
   // LLMs sometimes quote numbers in tool calls. z.coerce.number() accepts both.
   const t6 = await alice.callTool('hive_task', { to: bt.agent_id, title: 'coerce test' });
   // Propose a workflow with step as STRING (simulating buggy LLM output)

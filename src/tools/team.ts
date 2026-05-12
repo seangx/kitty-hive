@@ -2,7 +2,7 @@ import {
   createTeam, getTeamById, getTeamByName, listTeams, getAgentTeams,
   addTeamMember, isTeamMember, getTeamMembers, getTeamMember,
   getTeamDisplayName, appendTeamEvent, getTeamEvents, getLatestTeamEvents,
-  getAgentById,
+  getAgentById, setTeamRules,
 } from '../db.js';
 import type { Team, TeamEvent } from '../models.js';
 
@@ -86,6 +86,30 @@ export function handleTeamInfo(actorId: string, input: { team_id: string }): Inf
   return {
     team, members,
     latest_events: getLatestTeamEvents(input.team_id, 10),
+  };
+}
+
+// --- hive_team_set_rules ---
+
+/** Set or clear a team's rules (markdown). Host-only — only the team's host
+ *  agent can call this via MCP; the operator CLI bypasses this restriction.
+ *  Pass empty string to clear. Length-capped at 10000 chars (set higher than
+ *  any reasonable team charter; mostly to prevent accidental dumps). */
+export function handleTeamSetRules(actorId: string, input: { team_id: string; rules: string }): { team_id: string; team_name: string; rules_length: number; previous_length: number } {
+  const team = getTeamById(input.team_id);
+  if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  if (team.closed_at) throw new Error('Team is closed');
+  if (team.host_agent_id !== actorId) {
+    throw new Error('Only the team host can change rules. Ask the host, or use `kitty-hive team rules` (operator CLI) to override.');
+  }
+  const prev = team.rules || '';
+  const next = input.rules ?? '';
+  setTeamRules(input.team_id, next);
+  return {
+    team_id: input.team_id,
+    team_name: team.name,
+    rules_length: next.length,
+    previous_length: prev.length,
   };
 }
 
