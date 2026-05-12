@@ -122,7 +122,13 @@ export function buildPushMessage(p: PushPayloadInput): string {
     const reasonLabel = p.reason ? ` — reason: ${p.reason}` : '';
     preview = `[hive] ${p.type}${fromLabel} on task ${p.task_id}${reasonLabel} — call hive-check({ task_id: "${p.task_id}" }) for full state.`;
   } else if (p.team_id) {
-    preview = `[hive] ${p.type}${fromLabel} in team ${p.team_id} — call hive-team-events({ team_id: "${p.team_id}" }) for details.`;
+    // Most team events live in team_events (hive-team-events to see them).
+    // team-rules-update is the exception — rules are on the team object
+    // itself, so members must call hive-team-info to read the new text.
+    const fetchHint = p.type === 'team-rules-update'
+      ? `call hive-team-info({ team_id: "${p.team_id}" }) to see the new rules.`
+      : `call hive-team-events({ team_id: "${p.team_id}" }) for details.`;
+    preview = `[hive] ${p.type}${fromLabel} in team ${p.team_id} — ${fetchHint}`;
   } else {
     preview = `[hive] ${p.type}${fromLabel}`;
   }

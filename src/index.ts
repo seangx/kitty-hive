@@ -14,9 +14,26 @@ import { join, dirname, basename, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execSync } from 'node:child_process';
+import { buildPushMessage } from './preview.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
+
+// Build a properly-formatted push payload from operator-side CLI commands.
+// Operator has no agent identity, so `from` is empty (buildPushMessage drops
+// the "from X" suffix when empty). The push goes through the same code path
+// as MCP-side notifications, so receivers see consistent `[hive] xxx — call
+// hive-... for details.` hints regardless of whether the change came from
+// CLI or an agent calling an MCP tool.
+function operatorPush(opts: { type: string; teamId: string; eventId: string }): string {
+  return buildPushMessage({
+    type: opts.type,
+    from: '',
+    from_agent_id: '',
+    event_id: opts.eventId,
+    team_id: opts.teamId,
+  });
+}
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -582,12 +599,10 @@ async function cmdAgentRemove() {
         reason: 'agent-remove',
       });
       try {
-        await sessionsMod.notifyTeamMembers(r.team.id, undefined, JSON.stringify({
+        await sessionsMod.notifyTeamMembers(r.team.id, undefined, operatorPush({
           type: 'team-host-transfer',
-          team_id: r.team.id,
-          team_name: r.team.name,
-          from: name,
-          to: transferAgent.display_name,
+          teamId: r.team.id,
+          eventId: `team:${r.team.id}:host-transfer:${Date.now()}`,
         }));
       } catch { /* push best-effort */ }
     }
@@ -846,12 +861,10 @@ async function cmdTeamTransfer() {
   });
   try {
     const sessionsMod = await import('./sessions.js');
-    await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+    await sessionsMod.notifyTeamMembers(team.id, undefined, operatorPush({
       type: 'team-host-transfer',
-      team_id: team.id,
-      team_name: team.name,
-      from: currentHostName,
-      to: newHost.display_name,
+      teamId: team.id,
+      eventId: `team:${team.id}:host-transfer:${Date.now()}`,
     }));
   } catch { /* push best-effort */ }
 
@@ -960,12 +973,10 @@ async function cmdTeamKick() {
   });
   try {
     const sessionsMod = await import('./sessions.js');
-    await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+    await sessionsMod.notifyTeamMembers(team.id, undefined, operatorPush({
       type: 'team-kick',
-      team_id: team.id,
-      team_name: team.name,
-      agent_id: target.id,
-      display_name: target.display_name,
+      teamId: team.id,
+      eventId: `team:${team.id}:kick:${Date.now()}`,
     }));
   } catch { /* push best-effort */ }
 
@@ -1048,8 +1059,10 @@ async function cmdTeamRules() {
     dbMod.setTeamRules(team.id, '');
     try {
       const sessionsMod = await import('./sessions.js');
-      await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
-        type: 'team-rules-update', team_id: team.id, team_name: team.name, cleared: true,
+      await sessionsMod.notifyTeamMembers(team.id, undefined, operatorPush({
+        type: 'team-rules-update',
+        teamId: team.id,
+        eventId: `team:${team.id}:rules-update:${Date.now()}`,
       }));
     } catch { /* best-effort */ }
     console.log(`✅ Cleared rules for "${team.name}".`);
@@ -1061,8 +1074,10 @@ async function cmdTeamRules() {
     dbMod.setTeamRules(team.id, content);
     try {
       const sessionsMod = await import('./sessions.js');
-      await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
-        type: 'team-rules-update', team_id: team.id, team_name: team.name, length: content.length,
+      await sessionsMod.notifyTeamMembers(team.id, undefined, operatorPush({
+        type: 'team-rules-update',
+        teamId: team.id,
+        eventId: `team:${team.id}:rules-update:${Date.now()}`,
       }));
     } catch { /* best-effort */ }
     console.log(`✅ ${label === 'set' ? 'Set' : 'Updated'} rules for "${team.name}" (${content.length} chars).`);
