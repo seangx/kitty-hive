@@ -19,6 +19,10 @@ export interface Team {
   host_agent_id: string | null;
   created_at: string;
   closed_at: string | null;
+  /** Free-form team rules / charter — markdown text. All members see it on
+   *  hive_start (in the teams[] payload) and on hive_team_info, and are
+   *  expected to follow it. Operator-set via `kitty-hive team rules`. */
+  rules: string;
 }
 
 export interface TeamMember {

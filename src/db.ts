@@ -39,7 +39,8 @@ export function initDB(dbPath?: string): Database.Database {
       name            TEXT NOT NULL UNIQUE,
       host_agent_id   TEXT REFERENCES agents(id),
       created_at      TEXT NOT NULL,
-      closed_at       TEXT
+      closed_at       TEXT,
+      rules           TEXT NOT NULL DEFAULT ''
     );
 
     CREATE TABLE IF NOT EXISTS team_members (
@@ -180,6 +181,7 @@ export function initDB(dbPath?: string): Database.Database {
   migrateTasksStatusCheck(db);
   migrateTeamEventsTypeCheck(db);
   migrateClearChannelRoles(db);
+  migrateTeamsAddRules(db);
 
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_agents_remote ON agents(origin_peer, remote_id);
@@ -331,6 +333,16 @@ function migrateClearChannelRoles(db: Database.Database): void {
   if (before.n === 0) return;
   db.prepare("UPDATE agents SET roles = '' WHERE roles = 'channel'").run();
   console.log(`[db] cleared channel-polluted roles on ${before.n} agent(s)`);
+}
+
+// Add teams.rules column on older DBs (introduced in v0.6.12).
+// SQLite ALTER TABLE supports adding a NOT NULL column when a DEFAULT is given,
+// so this is a single-statement, idempotent migration (PRAGMA detects existence).
+function migrateTeamsAddRules(db: Database.Database): void {
+  const cols = db.prepare("PRAGMA table_info(teams)").all() as Array<{ name: string }>;
+  if (cols.some(c => c.name === 'rules')) return; // already migrated (or fresh DB with new schema)
+  db.exec("ALTER TABLE teams ADD COLUMN rules TEXT NOT NULL DEFAULT ''");
+  console.log('[db] added teams.rules column');
 }
 
 // --- Agent queries ---
@@ -546,10 +558,11 @@ export function createTeam(name: string, hostAgentId: string | null): Team {
     id: ulid(), name,
     host_agent_id: hostAgentId,
     created_at: nowISO(), closed_at: null,
+    rules: '',
   };
   getDB().prepare(`
-    INSERT INTO teams (id, name, host_agent_id, created_at, closed_at)
-    VALUES (@id, @name, @host_agent_id, @created_at, @closed_at)
+    INSERT INTO teams (id, name, host_agent_id, created_at, closed_at, rules)
+    VALUES (@id, @name, @host_agent_id, @created_at, @closed_at, @rules)
   `).run(team);
   return team;
 }
@@ -580,6 +593,10 @@ export function countTeamMembers(teamId: string): number {
 
 export function transferTeamHost(teamId: string, newHostAgentId: string): void {
   getDB().prepare('UPDATE teams SET host_agent_id = ? WHERE id = ?').run(newHostAgentId, teamId);
+}
+
+export function setTeamRules(teamId: string, rules: string): void {
+  getDB().prepare('UPDATE teams SET rules = ? WHERE id = ?').run(rules ?? '', teamId);
 }
 
 export function getAgentTeams(agentId: string, activeOnly: boolean = true): Team[] {

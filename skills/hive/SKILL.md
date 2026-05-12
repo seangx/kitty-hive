@@ -104,6 +104,16 @@ Common roles: `tester, reviewer, frontend, backend, db, devops, ux, design, docs
 
 If your `roles` is empty, routing falls back to `display_name` substring match — so a `display_name` containing your role (e.g. `"tester"`) still gets you found. Setting `roles` makes routing more precise.
 
+## Team rules
+
+Each team you belong to may have a `rules` field — free-form markdown set by the team operator (via `kitty-hive team rules <team> edit`). `hive-start` returns it inside the teams[] payload; `hive-team-info` also includes it.
+
+**Treat team rules as binding house rules for that team.** They describe how the operator wants members to behave inside it (naming conventions, when to gate, who reviews what, etc.). Honor them on every team-scoped action.
+
+**Precedence**: team.rules > general MCP instructions / SKILL.md (for actions inside that team). team.rules vs explicit user request → ask before overriding.
+
+A `team-rules-update` push means the rules changed — re-fetch via `hive-team-info(team=X)` to read the current text.
+
 ## Team collaboration
 
 When a task has `source_team_id`, or you belong to a team:

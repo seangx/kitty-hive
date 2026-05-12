@@ -972,6 +972,122 @@ async function cmdTeamKick() {
   console.log(`✅ Removed "${target.display_name}" from "${team.name}".`);
 }
 
+// Manage a team's rules (free-form markdown shown to all members on hive_start
+// and hive_team_info). Operator-side — no MCP tool exposes mutation, so rules
+// can't be hijacked by a member. Subcommands: show / edit / set / clear.
+async function cmdTeamRules() {
+  const { dbPath } = parseFlags(2);
+  const sub = args[2] && !args[2].startsWith('-') ? args[2] : '';
+  if (!sub) {
+    console.log('Usage:');
+    console.log('  kitty-hive team rules <team>                show   (alias: omit subcommand)');
+    console.log('  kitty-hive team rules <team> show');
+    console.log('  kitty-hive team rules <team> edit                  Open $EDITOR for interactive edit');
+    console.log('  kitty-hive team rules <team> set --file <path>     Replace from file');
+    console.log('  kitty-hive team rules <team> set --text "..."      Replace from string');
+    console.log('  kitty-hive team rules <team> clear');
+    process.exit(1);
+  }
+
+  // First positional is team; second positional may be subcommand or absent (defaults to show)
+  const teamArg = sub;
+  const action = (args[3] && !args[3].startsWith('-')) ? args[3] : 'show';
+  const db = initDB(dbPath);
+  const dbMod = await import('./db.js');
+  const team = dbMod.getTeamById(teamArg) || dbMod.getTeamByName(teamArg);
+  if (!team) { console.error(`Team "${teamArg}" not found.`); process.exit(1); }
+
+  if (action === 'show') {
+    if (!team.rules) {
+      console.log(`Team "${team.name}" has no rules set.`);
+      console.log(`Set them with: kitty-hive team rules ${team.name} edit`);
+      return;
+    }
+    console.log(`# Rules for team "${team.name}"\n`);
+    console.log(team.rules);
+    return;
+  }
+
+  if (action === 'clear') {
+    let assumeYes = false;
+    for (let i = 4; i < args.length; i++) if (args[i] === '--yes' || args[i] === '-y') assumeYes = true;
+    if (!assumeYes && isInteractive()) {
+      const ok = await askConfirm({ message: `Clear rules for team "${team.name}"?`, initialValue: false });
+      if (!ok) { console.log('Cancelled.'); process.exit(0); }
+    }
+    dbMod.setTeamRules(team.id, '');
+    try {
+      const sessionsMod = await import('./sessions.js');
+      await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+        type: 'team-rules-update', team_id: team.id, team_name: team.name, cleared: true,
+      }));
+    } catch { /* best-effort */ }
+    console.log(`✅ Cleared rules for "${team.name}".`);
+    return;
+  }
+
+  if (action === 'set') {
+    let filePath = '';
+    let text: string | null = null;
+    for (let i = 4; i < args.length; i++) {
+      if (args[i] === '--file' && args[i + 1]) { filePath = args[i + 1]; i++; }
+      else if (args[i] === '--text' && args[i + 1]) { text = args[i + 1]; i++; }
+    }
+    let content: string;
+    if (filePath) {
+      if (!existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
+      content = readFileSync(filePath, 'utf8');
+    } else if (text !== null) {
+      content = text;
+    } else {
+      console.error('Usage: kitty-hive team rules <team> set --file <path>  |  --text "..."');
+      process.exit(1);
+    }
+    dbMod.setTeamRules(team.id, content);
+    try {
+      const sessionsMod = await import('./sessions.js');
+      await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+        type: 'team-rules-update', team_id: team.id, team_name: team.name, length: content.length,
+      }));
+    } catch { /* best-effort */ }
+    console.log(`✅ Set rules for "${team.name}" (${content.length} chars).`);
+    return;
+  }
+
+  if (action === 'edit') {
+    if (!isInteractive()) {
+      console.error('`team rules <team> edit` requires a TTY. Use --file or --text in non-interactive contexts.');
+      process.exit(1);
+    }
+    const editor = process.env.EDITOR || process.env.VISUAL || (process.platform === 'win32' ? 'notepad' : 'vi');
+    const tmpDir = '/tmp';
+    const tmpPath = join(tmpDir, `kitty-hive-team-rules-${team.id.slice(-12)}-${Date.now()}.md`);
+    writeFileSync(tmpPath, team.rules || `# Rules for team "${team.name}"\n\n(Write the team's rules here. Lines starting with # are headings, not comments — everything is kept.)\n`);
+    try {
+      execSync(`${editor} "${tmpPath}"`, { stdio: 'inherit' });
+      const newContent = readFileSync(tmpPath, 'utf8');
+      if (newContent === team.rules) {
+        console.log('No changes — rules unchanged.');
+        return;
+      }
+      dbMod.setTeamRules(team.id, newContent);
+      try {
+        const sessionsMod = await import('./sessions.js');
+        await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
+          type: 'team-rules-update', team_id: team.id, team_name: team.name, length: newContent.length,
+        }));
+      } catch { /* best-effort */ }
+      console.log(`✅ Updated rules for "${team.name}" (${newContent.length} chars).`);
+    } finally {
+      try { unlinkSync(tmpPath); } catch { /* ignore */ }
+    }
+    return;
+  }
+
+  console.error(`Unknown action: "${action}". Use show / edit / set / clear.`);
+  process.exit(1);
+}
+
 // --- Node config ---
 
 function getConfigPath(): string {
@@ -1910,6 +2026,9 @@ Subcommands:
                                                     --add-member auto-joins target if not yet a member.
   kick [<team>] [<agent>] [--yes]                   Remove an agent from a team (operator-side).
                                                     Cannot kick the host — transfer first.
+  rules <team> [show|edit|set|clear]                Manage the team's rules / charter (free-form
+                                                    markdown; surfaced to all members on hive_start
+                                                    + hive_team_info). Default: show.
 
 Note: agents normally manage teams via the hive-team-* MCP tools.
 This group is for operator-level maintenance (e.g. before removing a host agent).`);
@@ -2025,6 +2144,7 @@ switch (command) {
       case 'list':     run(cmdTeamList);     break;
       case 'transfer': run(cmdTeamTransfer); break;
       case 'kick':     run(cmdTeamKick);     break;
+      case 'rules':    run(cmdTeamRules);    break;
       default:         showTeamHelp();        break;
     }
     break;
