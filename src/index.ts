@@ -977,25 +977,55 @@ async function cmdTeamKick() {
 // can't be hijacked by a member. Subcommands: show / edit / set / clear.
 async function cmdTeamRules() {
   const { dbPath } = parseFlags(2);
-  const sub = args[2] && !args[2].startsWith('-') ? args[2] : '';
-  if (!sub) {
-    console.log('Usage:');
-    console.log('  kitty-hive team rules <team>                show   (alias: omit subcommand)');
-    console.log('  kitty-hive team rules <team> show');
-    console.log('  kitty-hive team rules <team> edit                  Open $EDITOR for interactive edit');
-    console.log('  kitty-hive team rules <team> set --file <path>     Replace from file');
-    console.log('  kitty-hive team rules <team> set --text "..."      Replace from string');
-    console.log('  kitty-hive team rules <team> clear');
-    process.exit(1);
-  }
+  let teamArg = args[2] && !args[2].startsWith('-') ? args[2] : '';
+  let action = args[3] && !args[3].startsWith('-') ? args[3] : '';
 
-  // First positional is team; second positional may be subcommand or absent (defaults to show)
-  const teamArg = sub;
-  const action = (args[3] && !args[3].startsWith('-')) ? args[3] : 'show';
   const db = initDB(dbPath);
   const dbMod = await import('./db.js');
+
+  // --- Resolve team (interactive picker when omitted in a TTY) ---
+  if (!teamArg) {
+    if (!isInteractive()) {
+      console.log('Usage:');
+      console.log('  kitty-hive team rules <team>                show   (alias: omit subcommand)');
+      console.log('  kitty-hive team rules <team> show');
+      console.log('  kitty-hive team rules <team> edit                  Open $EDITOR for interactive edit');
+      console.log('  kitty-hive team rules <team> set --file <path>     Replace from file');
+      console.log('  kitty-hive team rules <team> set --text "..."      Replace from string');
+      console.log('  kitty-hive team rules <team> clear');
+      process.exit(1);
+    }
+    const teams = dbMod.listTeams(false);
+    if (teams.length === 0) { console.log('No teams.'); process.exit(0); }
+    teamArg = await askSelect<string>({
+      message: 'Which team?',
+      options: teams.map(t => ({
+        value: t.id,
+        label: t.name,
+        hint: t.rules ? `${t.rules.length} chars of rules` : '(no rules)',
+      })),
+    });
+  }
   const team = dbMod.getTeamById(teamArg) || dbMod.getTeamByName(teamArg);
   if (!team) { console.error(`Team "${teamArg}" not found.`); process.exit(1); }
+
+  // --- Resolve action (interactive picker when omitted in a TTY) ---
+  if (!action) {
+    if (!isInteractive()) {
+      action = 'show'; // default in scripts: just print
+    } else {
+      action = await askSelect<string>({
+        message: `Rules for "${team.name}" — what do you want to do?`,
+        options: [
+          { value: 'show',  label: 'Show current rules' },
+          { value: 'edit',  label: 'Edit in $EDITOR' },
+          { value: 'set',   label: 'Replace from file or text' },
+          { value: 'clear', label: 'Clear rules' },
+        ],
+        initialValue: team.rules ? 'show' : 'edit',
+      });
+    }
+  }
 
   if (action === 'show') {
     if (!team.rules) {
@@ -1026,23 +1056,8 @@ async function cmdTeamRules() {
     return;
   }
 
-  if (action === 'set') {
-    let filePath = '';
-    let text: string | null = null;
-    for (let i = 4; i < args.length; i++) {
-      if (args[i] === '--file' && args[i + 1]) { filePath = args[i + 1]; i++; }
-      else if (args[i] === '--text' && args[i + 1]) { text = args[i + 1]; i++; }
-    }
-    let content: string;
-    if (filePath) {
-      if (!existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
-      content = readFileSync(filePath, 'utf8');
-    } else if (text !== null) {
-      content = text;
-    } else {
-      console.error('Usage: kitty-hive team rules <team> set --file <path>  |  --text "..."');
-      process.exit(1);
-    }
+  // Helper: persist new rules + push notification (used by set + edit branches)
+  const applyRules = async (content: string, label: 'set' | 'updated') => {
     dbMod.setTeamRules(team.id, content);
     try {
       const sessionsMod = await import('./sessions.js');
@@ -1050,8 +1065,57 @@ async function cmdTeamRules() {
         type: 'team-rules-update', team_id: team.id, team_name: team.name, length: content.length,
       }));
     } catch { /* best-effort */ }
-    console.log(`✅ Set rules for "${team.name}" (${content.length} chars).`);
-    return;
+    console.log(`✅ ${label === 'set' ? 'Set' : 'Updated'} rules for "${team.name}" (${content.length} chars).`);
+  };
+
+  if (action === 'set') {
+    let filePath = '';
+    let text: string | null = null;
+    for (let i = 4; i < args.length; i++) {
+      if (args[i] === '--file' && args[i + 1]) { filePath = args[i + 1]; i++; }
+      else if (args[i] === '--text' && args[i + 1]) { text = args[i + 1]; i++; }
+    }
+    if (filePath) {
+      if (!existsSync(filePath)) { console.error(`File not found: ${filePath}`); process.exit(1); }
+      await applyRules(readFileSync(filePath, 'utf8'), 'set');
+      return;
+    }
+    if (text !== null) {
+      await applyRules(text, 'set');
+      return;
+    }
+    // No flags — interactive picker for source (editor / file / text)
+    if (!isInteractive()) {
+      console.error('Usage: kitty-hive team rules <team> set --file <path>  |  --text "..."');
+      process.exit(1);
+    }
+    const source = await askSelect<string>({
+      message: 'Where should the new rules come from?',
+      options: [
+        { value: 'editor', label: 'Open $EDITOR (multi-line markdown)' },
+        { value: 'file',   label: 'Load from file' },
+        { value: 'text',   label: 'Type/paste a one-liner' },
+      ],
+      initialValue: 'editor',
+    });
+    if (source === 'editor') {
+      action = 'edit'; // promote — edit handler below picks it up
+    } else if (source === 'file') {
+      const p = await askText({
+        message: 'Path to file?',
+        validate: (v) => ((v ?? '').trim().length === 0 ? 'Path required' : undefined),
+      });
+      if (!existsSync(p)) { console.error(`File not found: ${p}`); process.exit(1); }
+      await applyRules(readFileSync(p, 'utf8'), 'set');
+      return;
+    } else {
+      const oneliner = await askText({
+        message: 'New rules (single line):',
+        validate: (v) => ((v ?? '').trim().length === 0 ? 'Rules cannot be empty (use clear instead)' : undefined),
+      });
+      await applyRules(oneliner, 'set');
+      return;
+    }
   }
 
   if (action === 'edit') {
@@ -1060,9 +1124,8 @@ async function cmdTeamRules() {
       process.exit(1);
     }
     const editor = process.env.EDITOR || process.env.VISUAL || (process.platform === 'win32' ? 'notepad' : 'vi');
-    const tmpDir = '/tmp';
-    const tmpPath = join(tmpDir, `kitty-hive-team-rules-${team.id.slice(-12)}-${Date.now()}.md`);
-    writeFileSync(tmpPath, team.rules || `# Rules for team "${team.name}"\n\n(Write the team's rules here. Lines starting with # are headings, not comments — everything is kept.)\n`);
+    const tmpPath = join('/tmp', `kitty-hive-team-rules-${team.id.slice(-12)}-${Date.now()}.md`);
+    writeFileSync(tmpPath, team.rules || `# Rules for team "${team.name}"\n\n(Write the team's rules here. Save and exit to apply; quit without saving to abort.)\n`);
     try {
       execSync(`${editor} "${tmpPath}"`, { stdio: 'inherit' });
       const newContent = readFileSync(tmpPath, 'utf8');
@@ -1070,14 +1133,7 @@ async function cmdTeamRules() {
         console.log('No changes — rules unchanged.');
         return;
       }
-      dbMod.setTeamRules(team.id, newContent);
-      try {
-        const sessionsMod = await import('./sessions.js');
-        await sessionsMod.notifyTeamMembers(team.id, undefined, JSON.stringify({
-          type: 'team-rules-update', team_id: team.id, team_name: team.name, length: newContent.length,
-        }));
-      } catch { /* best-effort */ }
-      console.log(`✅ Updated rules for "${team.name}" (${newContent.length} chars).`);
+      await applyRules(newContent, 'updated');
     } finally {
       try { unlinkSync(tmpPath); } catch { /* ignore */ }
     }
