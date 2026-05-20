@@ -270,6 +270,7 @@ function buildPrompt(ev: ParsedEvent): string {
 let pushMode: 'appserver' | 'exec' | null = null;
 let appserverProc: ChildProcess | null = null;
 let appserverWs: any /* WebSocket */ = null;
+let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outside callers via supervisor
 let threadId: string | null = null;
 let nextRpcId = 100;
 const pendingResponses = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
@@ -376,7 +377,17 @@ async function setupAppserver(): Promise<void> {
   const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
   threadId = threadResp?.thread?.id;
   if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
+  appserverWsUrl = `ws://127.0.0.1:${port}`;
   console.error(`[codex-channel] appserver thread started: ${threadId}`);
+
+  // 2a. Announce ready signal back to hive supervisor so kitty-kitty (or any
+  // other launcher) can query the (ws_url, thread_id) pair via
+  // hive_codex_pane_ws / GET /admin/codex-daemons. Best-effort: failure here
+  // just means the daemon's pane info isn't immediately discoverable; daemon
+  // still processes pushes normally.
+  await announceReady().catch(err => {
+    console.error('[codex-channel] failed to announce ready to supervisor:', err);
+  });
 
   // 3. intro turn — establishes hive identity in the persistent thread.
   // Subsequent per-event turns are short because context persists.
@@ -402,6 +413,28 @@ async function setupAppserver(): Promise<void> {
     `Acknowledge readiness briefly, then wait for the first event.`,
   ].join('\n');
   await sendTurn(intro);
+}
+
+/** Tell the hive supervisor (the parent process that spawned us) that we have
+ *  a live ws + thread, so it can answer hive_codex_pane_ws / show in admin
+ *  snapshots. HIVE_URL is the supervisor's MCP base url (set explicitly by
+ *  codex-supervisor when it spawns us); derive admin URL from it. */
+async function announceReady(): Promise<void> {
+  if (!agentId || !appserverWsUrl || !threadId) return;
+  const adminUrl = ENV_URL.replace(/\/mcp\/?$/, '') + '/admin/codex-daemon-ready';
+  const res = await fetch(adminUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      agent_id: agentId,
+      ws_url: appserverWsUrl,
+      thread_id: threadId,
+    }),
+  });
+  if (!res.ok) {
+    throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
+  }
+  console.error(`[codex-channel] announced ready: ws=${appserverWsUrl} thread=${threadId.slice(0, 8)}...`);
 }
 
 async function rpcCall(method: string, params: any, timeoutMs = 30000): Promise<any> {

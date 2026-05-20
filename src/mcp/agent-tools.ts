@@ -1,7 +1,8 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { handleStart } from '../tools/start.js';
-import { renameAgent, listAllAgents, getAgentsByName, updateAgentRoles, getAgentById } from '../db.js';
+import { renameAgent, listAllAgents, getAgentsByName, updateAgentRoles, getAgentById, getAgentByExternalKey } from '../db.js';
+import { getDaemonForAgent } from '../codex-supervisor.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { bindSession } from '../sessions.js';
 
@@ -93,6 +94,71 @@ export function registerAgentTools(mcp: McpServer) {
       const oldName = agent.display_name;
       renameAgent(agent.id, params.name);
       return { content: [{ type: 'text', text: JSON.stringify({ agent_id: agent.id, old_name: oldName, new_name: params.name }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_codex_pane_ws',
+    'Look up the codex app-server ws endpoint + thread_id for a tool=codex agent. ' +
+    'Used by launchers (kitty-kitty etc.) to spawn `codex --remote <ws_url>` inside a visible pane attached to the SAME thread the hive supervisor\'s daemon is injecting hive events into. Three-way share: daemon (ws client) injects, TUI shows the thread, user can type — all into one thread. ' +
+    'Pass agent_id or agent_key; agent_id wins. Returns status="ready" only when the supervisor-spawned daemon has finished setting up its codex app-server and reported back. status="starting" means the daemon is still booting (retry shortly). status="not_supervised" means there\'s no daemon for this agent (agent missing, agent.tool != "codex", or supervisor not running).',
+    {
+      agent_id: z.string().optional().describe('Hive agent id (ULID).'),
+      agent_key: z.string().optional().describe('Agent external_key (alternative to agent_id).'),
+    },
+    async (params) => {
+      if (!params.agent_id && !params.agent_key) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'agent_id or agent_key required' }) }], isError: true };
+      }
+      // Resolve to agent_id first
+      let agent: ReturnType<typeof getAgentById>;
+      if (params.agent_id) {
+        agent = getAgentById(params.agent_id);
+      } else {
+        agent = getAgentByExternalKey(params.agent_key!);
+      }
+      if (!agent) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'not_supervised',
+          error: `agent not found: ${params.agent_id || params.agent_key}`,
+        }) }] };
+      }
+      if (agent.tool !== 'codex') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'not_supervised',
+          agent_id: agent.id,
+          display_name: agent.display_name,
+          error: `agent.tool="${agent.tool}", not "codex" — only codex agents are supervised`,
+        }) }] };
+      }
+      const snap = getDaemonForAgent({ agentId: agent.id });
+      if (!snap) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'not_supervised',
+          agent_id: agent.id,
+          display_name: agent.display_name,
+          error: 'no daemon running for this agent — hive serve may not have spawned one (restart serve, or check that tool=codex was set when the agent registered)',
+        }) }] };
+      }
+      if (!snap.ready) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'starting',
+          agent_id: agent.id,
+          display_name: agent.display_name,
+          pid: snap.pid,
+          uptime_ms: snap.uptime_ms,
+          // No ws_url / thread_id yet — daemon is still booting codex app-server
+        }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({
+        status: 'ready',
+        agent_id: agent.id,
+        display_name: agent.display_name,
+        ws_url: snap.ws_url,
+        thread_id: snap.thread_id,
+        pid: snap.pid,
+        uptime_ms: snap.uptime_ms,
+      }) }] };
     },
   );
 

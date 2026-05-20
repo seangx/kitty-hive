@@ -8,7 +8,7 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
 import * as db from './db.js';
 import { log } from './log.js';
-import { getDaemonSnapshots } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonReady } from './codex-supervisor.js';
 
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress || '';
@@ -86,6 +86,38 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
   if (url.pathname === '/admin/codex-daemons' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ daemons: getDaemonSnapshots() }));
+    return;
+  }
+
+  // POST /admin/codex-daemon-ready — daemon announces (ws_url, thread_id) after
+  // its codex app-server is up. Lets external callers (kitty-kitty) discover
+  // where to point `codex --remote` to see the same thread the daemon is
+  // injecting into.
+  if (url.pathname === '/admin/codex-daemon-ready' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id, ws_url, thread_id } = body;
+      if (typeof agent_id !== 'string' || typeof ws_url !== 'string' || typeof thread_id !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id, ws_url, thread_id all required (strings)' }));
+        return;
+      }
+      const ok = markDaemonReady(agent_id, ws_url, thread_id);
+      if (!ok) {
+        // Daemon wasn't in the supervisor's map — could be a manually-started
+        // codex-channel (not via supervisor). Accept the POST silently with a
+        // soft warning; admin endpoint is loopback-only so it's safe.
+        log('warn', `[admin] codex-daemon-ready for unknown agent_id=${agent_id}; not tracked by supervisor`);
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, tracked: false }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, tracked: true }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
     return;
   }
 

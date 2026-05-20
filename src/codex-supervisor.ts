@@ -40,6 +40,12 @@ interface DaemonInfo {
   pid: number;
   startedAt: Date;
   restartCount: number;
+  // Populated when the spawned codex-channel daemon POSTs to
+  // /admin/codex-daemon-ready after its codex app-server is up and the
+  // thread is created. null while the daemon is still booting.
+  wsUrl: string | null;
+  threadId: string | null;
+  readyAt: Date | null;
 }
 
 const daemons = new Map<string, DaemonInfo>();
@@ -114,6 +120,7 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   const info: DaemonInfo = {
     agentId, displayName, child, pid: child.pid,
     startedAt: new Date(), restartCount,
+    wsUrl: null, threadId: null, readyAt: null,
   };
   daemons.set(agentId, info);
 
@@ -190,13 +197,19 @@ export function stopCodexSupervisor(): Promise<void> {
   });
 }
 
-// Status snapshot for `kitty-hive status` / `kitty-hive agent list`
+// Status snapshot for `kitty-hive status` / `kitty-hive agent list` and the
+// /admin/codex-daemons endpoint.
 export interface DaemonSnapshot {
   agent_id: string;
   display_name: string;
   pid: number;
   uptime_ms: number;
   restart_count: number;
+  // Populated after the daemon POSTs to /admin/codex-daemon-ready. Until then
+  // ws_url/thread_id are null (daemon still booting codex app-server).
+  ws_url: string | null;
+  thread_id: string | null;
+  ready: boolean;
 }
 
 export function getDaemonSnapshots(): DaemonSnapshot[] {
@@ -207,5 +220,48 @@ export function getDaemonSnapshots(): DaemonSnapshot[] {
     pid: info.pid,
     uptime_ms: now - info.startedAt.getTime(),
     restart_count: info.restartCount,
+    ws_url: info.wsUrl,
+    thread_id: info.threadId,
+    ready: !!info.readyAt,
   }));
+}
+
+/** Look up the live daemon for an agent, by agent_id or external_key.
+ *  Returns null when no daemon is running for that agent. */
+export function getDaemonForAgent(
+  lookup: { agentId?: string; agentKey?: string },
+): DaemonSnapshot | null {
+  let info: DaemonInfo | undefined;
+  if (lookup.agentId) {
+    info = daemons.get(lookup.agentId);
+  } else if (lookup.agentKey) {
+    // No reverse index — small N, just scan. Need DB lookup to map key→id.
+    // To avoid pulling db in here, callers should resolve key→agent_id
+    // upstream (the MCP tool does that) and pass agent_id.
+    return null;
+  }
+  if (!info) return null;
+  return {
+    agent_id: info.agentId,
+    display_name: info.displayName,
+    pid: info.pid,
+    uptime_ms: Date.now() - info.startedAt.getTime(),
+    restart_count: info.restartCount,
+    ws_url: info.wsUrl,
+    thread_id: info.threadId,
+    ready: !!info.readyAt,
+  };
+}
+
+/** Called by /admin/codex-daemon-ready when a daemon's codex app-server is up
+ *  and its thread is created. Stores ws_url + thread_id on the DaemonInfo so
+ *  outside callers can attach via `codex --remote <ws_url>`. */
+export function markDaemonReady(agentId: string, wsUrl: string, threadId: string): boolean {
+  const info = daemons.get(agentId);
+  if (!info) return false;
+  info.wsUrl = wsUrl;
+  info.threadId = threadId;
+  info.readyAt = new Date();
+  log('info', `[codex-supervisor] daemon "${info.displayName}" ready: ws=${wsUrl} thread=${threadId.slice(0, 8)}...`);
+  return true;
 }
