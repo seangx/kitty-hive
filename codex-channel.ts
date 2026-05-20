@@ -31,8 +31,9 @@
  *   CODEX_EXTRA_ARGS  extra space-separated args before the prompt
  */
 
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
+import { createServer } from 'node:net';
 
 // --- Config (env) ---
 
@@ -44,6 +45,12 @@ const HIVE_AGENT_ROLES = process.env.HIVE_AGENT_ROLES || '';
 const CODEX_CMD = process.env.CODEX_CMD || 'codex';
 const CODEX_PROFILE = process.env.CODEX_PROFILE || '';
 const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || '').trim();
+// CODEX_CHANNEL_MODE: 'auto' (default) tries appserver first, falls back to
+// exec if codex < 0.124 or app-server fails to start. 'appserver' forces
+// appserver mode (fails hard if unavailable). 'exec' forces the legacy
+// spawn-per-event mode (works on any codex version, no shared context).
+const CODEX_CHANNEL_MODE = (process.env.CODEX_CHANNEL_MODE || 'auto') as 'auto' | 'appserver' | 'exec';
+const CODEX_APPSERVER_CWD = process.env.CODEX_APPSERVER_CWD || process.cwd();
 
 // Allow CLI flags to override env
 for (let i = 2; i < process.argv.length; i++) {
@@ -254,6 +261,201 @@ function buildPrompt(ev: ParsedEvent): string {
   ].join('\n');
 }
 
+// ===== Appserver mode (codex ≥ 0.124) =====
+// Long-lived codex via `codex app-server --listen ws://127.0.0.1:<port>`.
+// One JSON-RPC WebSocket connection, one persistent thread, one turn per
+// hive event injected via turn/start. Thread context survives across events
+// — no codex startup overhead, no fresh-context loss.
+
+let pushMode: 'appserver' | 'exec' | null = null;
+let appserverProc: ChildProcess | null = null;
+let appserverWs: any /* WebSocket */ = null;
+let threadId: string | null = null;
+let nextRpcId = 100;
+const pendingResponses = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
+const turnCompleteWaiters: Array<() => void> = [];
+
+function pickFreePort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const srv = createServer();
+    srv.listen(0, '127.0.0.1', () => {
+      const addr = srv.address();
+      const port = typeof addr === 'object' && addr ? addr.port : 0;
+      srv.close(() => port ? resolve(port) : reject(new Error('failed to pick free port')));
+    });
+    srv.on('error', reject);
+  });
+}
+
+async function setupAppserver(): Promise<void> {
+  if (typeof (globalThis as any).WebSocket !== 'function') {
+    throw new Error('global WebSocket not available (need Node 22+); set CODEX_CHANNEL_MODE=exec');
+  }
+  const port = await pickFreePort();
+  console.error(`[codex-channel] starting appserver: ${CODEX_CMD} app-server --listen ws://127.0.0.1:${port}`);
+
+  appserverProc = spawn(CODEX_CMD, ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  // Wait for listen-ready line on stderr, or fail after 10s
+  await new Promise<void>((resolve, reject) => {
+    let ready = false;
+    const timer = setTimeout(() => {
+      if (!ready) { ready = true; reject(new Error('codex app-server did not become ready within 10s')); }
+    }, 10000);
+    appserverProc!.stderr!.on('data', (chunk) => {
+      const s = String(chunk);
+      process.stderr.write(`[codex-app] ${s}`);
+      if (!ready && /Listening|listen|started|ready/i.test(s)) {
+        ready = true; clearTimeout(timer); resolve();
+      }
+    });
+    appserverProc!.stdout!.on('data', (chunk) => process.stderr.write(`[codex-app] ${chunk}`));
+    appserverProc!.on('exit', (code) => {
+      if (!ready) { ready = true; clearTimeout(timer); reject(new Error(`codex app-server exited (code=${code}) before becoming ready`)); }
+    });
+    appserverProc!.on('error', (err) => {
+      if (!ready) { ready = true; clearTimeout(timer); reject(err); }
+    });
+  });
+
+  // Even after the "listening" log line, give the WS endpoint a beat to accept.
+  await new Promise(r => setTimeout(r, 200));
+
+  // Open WS
+  appserverWs = new (globalThis as any).WebSocket(`ws://127.0.0.1:${port}`);
+  await new Promise<void>((resolve, reject) => {
+    const onOpen = () => { cleanup(); resolve(); };
+    const onErr = (e: any) => { cleanup(); reject(new Error(`WS open failed: ${e?.message || e?.type || 'unknown'}`)); };
+    const cleanup = () => {
+      appserverWs.removeEventListener('open', onOpen);
+      appserverWs.removeEventListener('error', onErr);
+    };
+    appserverWs.addEventListener('open', onOpen);
+    appserverWs.addEventListener('error', onErr);
+    setTimeout(() => { if (appserverWs.readyState !== 1) { cleanup(); reject(new Error('WS open timeout')); } }, 5000);
+  });
+
+  appserverWs.addEventListener('message', (ev: any) => {
+    let msg: any;
+    try { msg = JSON.parse(String(ev.data)); } catch (err) {
+      console.error('[codex-channel] WS parse error:', err);
+      return;
+    }
+    // RPC response
+    if (msg.id != null && (msg.result !== undefined || msg.error !== undefined)) {
+      const pending = pendingResponses.get(msg.id);
+      if (pending) {
+        pendingResponses.delete(msg.id);
+        if (msg.error) pending.reject(new Error(`codex rpc error: ${JSON.stringify(msg.error)}`));
+        else pending.resolve(msg.result);
+      }
+      return;
+    }
+    // Notification
+    if (msg.method === 'turn/completed' || msg.method === 'turn/interrupt') {
+      const w = turnCompleteWaiters.shift();
+      if (w) w();
+    }
+    // Optional: tap into item/agentMessage/delta etc. for live progress — skipped.
+  });
+
+  appserverWs.addEventListener('close', () => {
+    console.error('[codex-channel] appserver WS closed');
+  });
+
+  // 1. initialize
+  await rpcCall('initialize', {
+    clientInfo: { name: 'kitty-hive-codex-channel', version: '0.7.0' },
+  });
+  // initialized notification — fire and forget
+  appserverWs.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }));
+
+  // 2. thread/start (new thread per daemon lifetime — keep it simple)
+  const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
+  threadId = threadResp?.thread?.id;
+  if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
+  console.error(`[codex-channel] appserver thread started: ${threadId}`);
+
+  // 3. intro turn — establishes hive identity in the persistent thread.
+  // Subsequent per-event turns are short because context persists.
+  const intro = [
+    `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
+    ``,
+    `You are running inside a persistent codex thread driven by the kitty-hive`,
+    `codex-channel daemon. The daemon will inject one short message per hive`,
+    `event into this thread; you handle the event and wait for the next.`,
+    ``,
+    `FIRST ACTION: call hive_start({ id: "${agentId}" }) to bind your MCP`,
+    `session to your hive identity. This makes every hive_* tool call run`,
+    `as you (not as a new agent). Do this BEFORE handling the first event.`,
+    ``,
+    `For each event:`,
+    `- Push notifications are id-only by design — call the fetch tool the`,
+    `  daemon points to (hive_dm_read / hive_check / hive_team_events /`,
+    `  hive_team_info) BEFORE acting on the event content.`,
+    `- Handle per type (DM, task-propose, step-start, awaiting_approval,`,
+    `  team-message, ...) using the matching hive_* tools.`,
+    `- When done, just stop. The next event will arrive as a new turn.`,
+    ``,
+    `Acknowledge readiness briefly, then wait for the first event.`,
+  ].join('\n');
+  await sendTurn(intro);
+}
+
+async function rpcCall(method: string, params: any, timeoutMs = 30000): Promise<any> {
+  if (!appserverWs || appserverWs.readyState !== 1) throw new Error('appserver WS not open');
+  const id = nextRpcId++;
+  const payload = JSON.stringify({ jsonrpc: '2.0', id, method, params });
+  return new Promise((resolve, reject) => {
+    pendingResponses.set(id, { resolve, reject });
+    appserverWs.send(payload);
+    setTimeout(() => {
+      if (pendingResponses.has(id)) {
+        pendingResponses.delete(id);
+        reject(new Error(`codex appserver rpc '${method}' timed out after ${timeoutMs}ms`));
+      }
+    }, timeoutMs);
+  });
+}
+
+async function sendTurn(text: string, turnTimeoutMs = 600000 /* 10 min */): Promise<void> {
+  const turnDone = new Promise<void>((resolve) => { turnCompleteWaiters.push(resolve); });
+  await rpcCall('turn/start', {
+    threadId,
+    input: [{ type: 'text', text }],
+  });
+  await Promise.race([
+    turnDone,
+    new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`turn did not complete within ${turnTimeoutMs}ms`)), turnTimeoutMs)),
+  ]);
+}
+
+/** Short prompt for appserver mode — context is persistent, so each event is
+ *  just "here's what arrived + how to fetch full content". */
+function buildEventTurnText(ev: ParsedEvent): string {
+  const senderLabel = ev.from || ev.from_agent_id || 'unknown';
+  const summary = ev.title || ev.preview || ev.raw || `(no summary)`;
+  let fetchHint: string;
+  if (ev.type === 'message' && ev.message_id != null) {
+    fetchHint = `hive_dm_read({ message_id: ${ev.message_id} })`;
+  } else if (ev.task_id) {
+    fetchHint = `hive_check({ task_id: "${ev.task_id}" })`;
+  } else if (ev.team_id) {
+    fetchHint = ev.type === 'team-rules-update'
+      ? `hive_team_info({ team_id: "${ev.team_id}" })  # rules updated; refresh`
+      : `hive_team_events({ team_id: "${ev.team_id}" })`;
+  } else {
+    fetchHint = `hive_inbox()`;
+  }
+  return [
+    `[hive event] type=${ev.type} from=${senderLabel}`,
+    `summary: ${summary}`,
+    `fetch:   ${fetchHint}`,
+  ].join('\n');
+}
+
 function spawnCodex(prompt: string): Promise<void> {
   return new Promise((resolve) => {
     const args: string[] = ['exec'];
@@ -289,11 +491,26 @@ async function processNextEvent() {
   if (!next) return;
   codexBusy = true;
   try {
-    await spawnCodex(buildPrompt(next));
+    if (pushMode === 'appserver') {
+      const text = buildEventTurnText(next);
+      console.error(`[codex-channel] inject turn (${text.length} chars) into thread ${threadId?.slice(-8)}`);
+      await sendTurn(text);
+    } else {
+      await spawnCodex(buildPrompt(next));
+    }
+  } catch (err) {
+    console.error('[codex-channel] event processing failed:', err);
+    // Don't lose the event — push back to front of queue
+    eventQueue.unshift(next);
+    // If appserver died, fall back to exec for subsequent events
+    if (pushMode === 'appserver' && (!appserverWs || appserverWs.readyState !== 1)) {
+      console.error('[codex-channel] appserver appears dead; switching remaining events to exec mode');
+      pushMode = 'exec';
+    }
   } finally {
     codexBusy = false;
   }
-  // Drain any events that piled up while codex was running
+  // Drain any events that piled up while codex was busy
   if (eventQueue.length > 0) setImmediate(processNextEvent);
 }
 
@@ -371,8 +588,52 @@ async function listenSSE() {
 
 // --- Boot ---
 
+async function setupPushMode() {
+  if (CODEX_CHANNEL_MODE === 'exec') {
+    pushMode = 'exec';
+    console.error(`[codex-channel] mode: exec (per-event codex spawn; forced via CODEX_CHANNEL_MODE=exec)`);
+    return;
+  }
+  // 'auto' or 'appserver': try appserver
+  try {
+    await setupAppserver();
+    pushMode = 'appserver';
+    console.error(`[codex-channel] mode: appserver (long-lived codex thread; context persists across events)`);
+  } catch (err) {
+    if (CODEX_CHANNEL_MODE === 'appserver') {
+      console.error(`[codex-channel] appserver mode forced but setup failed: ${err}`);
+      cleanupAppserver();
+      process.exit(1);
+    }
+    console.error(`[codex-channel] appserver setup failed, falling back to exec mode: ${err}`);
+    cleanupAppserver();
+    pushMode = 'exec';
+  }
+}
+
+function cleanupAppserver() {
+  if (appserverWs) {
+    try { appserverWs.close(); } catch { /* ignore */ }
+    appserverWs = null;
+  }
+  if (appserverProc) {
+    try { appserverProc.kill('SIGTERM'); } catch { /* ignore */ }
+    appserverProc = null;
+  }
+  threadId = null;
+}
+
+function shutdown(signal: NodeJS.Signals) {
+  console.error(`[codex-channel] received ${signal}, shutting down...`);
+  cleanupAppserver();
+  process.exit(0);
+}
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
 async function main() {
   preflight();
+  // 1. register on hive
   while (true) {
     try {
       await initHiveSession();
@@ -385,10 +646,14 @@ async function main() {
       await new Promise((r) => setTimeout(r, 3000));
     }
   }
+  // 2. set up codex push mode (appserver preferred, exec fallback)
+  await setupPushMode();
+  // 3. subscribe to hive SSE
   await listenSSE();
 }
 
 main().catch((err) => {
   console.error('[codex-channel] fatal:', err);
+  cleanupAppserver();
   process.exit(1);
 });
