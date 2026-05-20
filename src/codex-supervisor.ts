@@ -299,3 +299,20 @@ export function notifyAgentCreated(agentId: string): boolean {
   spawnDaemon(agent.id, agent.display_name, 0);
   return true;
 }
+
+/** Kill the daemon (if any) for an agent that just got removed. Mirror of
+ *  notifyAgentCreated for the delete path. Without this, `kitty-hive agent
+ *  remove` deletes the row but leaves a ghost daemon (and its codex
+ *  app-server + ws) running — see Bug 1 reported on 2026-05-20: a stale
+ *  ws confused TUI routing into a schism. SIGTERM the child; the existing
+ *  child.on('exit') handler in spawnDaemon checks `getAgentById(agentId)`
+ *  before respawning, so a deleted row naturally short-circuits the
+ *  respawn logic — no per-daemon "intentional kill" flag needed.
+ *  Returns true if a daemon was killed. */
+export function notifyAgentRemoved(agentId: string): boolean {
+  const info = daemons.get(agentId);
+  if (!info) return false;
+  log('info', `[codex-supervisor] notify-agent-removed: "${info.displayName}" (${agentId.slice(-12)}) → killing daemon`);
+  try { info.child.kill('SIGTERM'); } catch { /* ignore */ }
+  return true;
+}

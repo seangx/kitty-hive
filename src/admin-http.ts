@@ -8,7 +8,7 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
 import * as db from './db.js';
 import { log } from './log.js';
-import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved } from './codex-supervisor.js';
 
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress || '';
@@ -107,6 +107,31 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
       const spawned = notifyAgentCreated(agent_id);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, spawned }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
+  // POST /admin/notify-agent-removed — the CLI `agent remove` calls this
+  // after deleting an agent row so the codex-supervisor can kill the daemon
+  // (and its codex app-server + ws) right away. Without this, a removed
+  // agent leaves a ghost daemon running on the old ws_url, causing routing
+  // schisms when a new agent later self-registers with the same name. See
+  // Bug 1 reported on 2026-05-20.
+  if (url.pathname === '/admin/notify-agent-removed' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) required' }));
+        return;
+      }
+      const killed = notifyAgentRemoved(agent_id);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, killed }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));

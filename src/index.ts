@@ -569,7 +569,7 @@ async function cmdDbClear() {
 }
 
 async function cmdAgentRemove() {
-  const { dbPath } = parseFlags(1);
+  const { dbPath, port } = parseFlags(1);
   // Flags: --key <K>            look up by external_key (idempotent: missing = exit 0)
   //        --yes                skip confirmation (scripts)
   //        --transfer-to <a>    transfer hosted teams to this agent before deleting
@@ -757,6 +757,26 @@ async function cmdAgentRemove() {
   db.prepare('DELETE FROM agents WHERE id = ?').run(agent.id);
 
   console.log(`✅ Removed agent "${name}".`);
+
+  // Tell the live supervisor (if any) to kill the daemon for this agent.
+  // Without this, a deleted tool=codex agent's daemon keeps running on its
+  // old ws_url, causing routing schisms when another agent later self-
+  // registers with the same name. Mirrors the agent-register notify path.
+  // Best-effort: failures silently ignored — agent row is already gone.
+  try {
+    const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-removed`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agent.id }),
+      signal: AbortSignal.timeout(2000),
+    });
+    if (notifyRes.ok) {
+      const { killed } = await notifyRes.json() as { killed: boolean };
+      if (killed) console.error(`   → supervisor killed codex daemon`);
+    }
+  } catch {
+    // serve not running, or admin endpoint not reachable — fine, no daemon to kill anyway
+  }
 }
 
 async function cmdAgentRegister() {

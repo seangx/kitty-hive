@@ -313,8 +313,15 @@ async function setupAppserver(): Promise<void> {
   const port = await pickFreePort();
   console.error(`[codex-channel] starting appserver: ${CODEX_CMD} app-server --listen ws://127.0.0.1:${port}`);
 
+  // detached: true puts appserverProc in its own process group, so SIGTERM
+  // to -pid kills the entire subtree (npm/npx wrapper + grandchild codex
+  // binary). Without this, killing only the wrapper leaves the actual codex
+  // process orphaned and still LISTENing on the ws port — see Bug 1 follow-up
+  // (2026-05-20): `agent remove` killed the daemon but `lsof -i :<port>` still
+  // showed the vendor codex binary holding the port.
   appserverProc = spawn(CODEX_CMD, ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: true,
   });
 
   // Wait for listen-ready line on stderr, or fail after 10s
@@ -683,7 +690,14 @@ function cleanupAppserver() {
     try { appserverWs.close(); } catch { /* ignore */ }
     appserverWs = null;
   }
-  if (appserverProc) {
+  if (appserverProc?.pid) {
+    // Kill the WHOLE process group (negative pid). Because we spawned with
+    // `detached: true`, appserverProc.pid is also the group leader id; the
+    // grandchild codex binary the wrapper exec'd is in the same group and
+    // will receive SIGTERM too. Without this, the wrapper dies but the
+    // grandchild codex binary stays alive holding the ws port.
+    try { process.kill(-appserverProc.pid, 'SIGTERM'); } catch { /* ignore */ }
+    // Fallback: also SIGTERM the wrapper itself in case kill -group missed.
     try { appserverProc.kill('SIGTERM'); } catch { /* ignore */ }
     appserverProc = null;
   }
