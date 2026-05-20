@@ -43,6 +43,16 @@ function randomDisplayName(): string {
  */
 export function handleStart(input: StartInput): StartOutput {
   let agent: Agent | undefined;
+  // Track which lookup path matched the existing agent. Used downstream to
+  // decide whether to silently mutate identity-sensitive fields (display_name,
+  // tool): id-match is operator-explicit, name-match is name-only (so by
+  // definition name agrees), but key-match means an orchestrator key resolved
+  // to an existing agent — if the caller's `name`/`tool` disagree, that's
+  // almost always a stray .mcp.json env or env-leak situation, not an
+  // intentional rename. See silent-rename incident 2026-05-20 (kitty-kitty
+  // → skillsmgr-web-slave; project .mcp.json hardcoded NAME but KEY was
+  // inherited correctly from the pane env).
+  let matchedVia: 'id' | 'key' | 'name' | null = null;
 
   // 1. id wins (exact identity)
   if (input.id) {
@@ -56,6 +66,7 @@ export function handleStart(input: StartInput): StartOutput {
     // real owner. See agent-id collision incident, 2026-04-22.
     if (candidate && candidate.origin_peer === '') {
       agent = candidate;
+      matchedVia = 'id';
     } else if (candidate) {
       log('warn', `[start] refusing to bind to remote placeholder agent=${candidate.id} origin_peer=${candidate.origin_peer}; falling back to key/name`);
     }
@@ -63,13 +74,17 @@ export function handleStart(input: StartInput): StartOutput {
   // 2. key (external orchestrator handle)
   if (!agent && input.key) {
     const candidate = getAgentByExternalKey(input.key);
-    if (candidate && candidate.origin_peer === '') agent = candidate;
+    if (candidate && candidate.origin_peer === '') {
+      agent = candidate;
+      matchedVia = 'key';
+    }
   }
   // 3. name (fuzzy, reuse latest match — local only)
   if (!agent && input.name) {
     const matches = getAgentsByName(input.name).filter(a => a.origin_peer === '');
     if (matches.length > 0) {
       agent = matches.sort((a, b) => b.last_seen.localeCompare(a.last_seen))[0];
+      matchedVia = 'name';
     }
   }
 
@@ -98,14 +113,41 @@ export function handleStart(input: StartInput): StartOutput {
     touchAgent(agent.id);
     const updates: string[] = [];
     const params: any[] = [];
-    if (input.tool) { updates.push('tool = ?'); params.push(input.tool); }
+
+    // Silent identity updates on existing agents need different trust levels
+    // per lookup path (see matchedVia above):
+    //   - id match  : operator was explicit ("I am agent X"); allow silent
+    //                 updates to display_name and tool.
+    //   - name match: matched by name itself, so by definition input.name
+    //                 equals agent.display_name; tool update allowed.
+    //   - key match : key matched but caller MAY be confused about identity
+    //                 (typical cause: project .mcp.json hardcodes a NAME but
+    //                 the KEY env was inherited from a parent pane bound to
+    //                 a different agent). Refuse to silently change
+    //                 identity-sensitive fields (display_name, tool); cheap
+    //                 metadata (roles, expertise) is still fair game.
+    const trustIdentityUpdates = matchedVia !== 'key';
+
+    // tool / display_name — gated on trust
+    if (input.tool && input.tool !== agent.tool) {
+      if (trustIdentityUpdates) {
+        updates.push('tool = ?'); params.push(input.tool);
+      } else {
+        log('warn', `[start] refusing silent tool change via key path: agent=${agent.id} key="${input.key}" current_tool="${agent.tool}" proposed_tool="${input.tool}". Caller likely has stale env. Use hive_start with explicit id= or call dedicated mutation tools to change tool intentionally.`);
+      }
+    }
+    if (input.name && input.name !== agent.display_name) {
+      if (trustIdentityUpdates) {
+        updates.push('display_name = ?'); params.push(input.name);
+      } else {
+        log('warn', `[start] refusing silent rename via key path: agent=${agent.id} key="${input.key}" current_name="${agent.display_name}" proposed_name="${input.name}". Caller likely has stale env (e.g. project .mcp.json hardcoded HIVE_AGENT_NAME while HIVE_AGENT_KEY was inherited from elsewhere). Use hive_rename to rename intentionally.`);
+      }
+    }
+
+    // roles / expertise — cheap descriptive metadata, silent update always OK
     if (input.roles) { updates.push('roles = ?'); params.push(input.roles); }
     if (input.expertise) { updates.push('expertise = ?'); params.push(input.expertise); }
-    // Silent display_name refresh when caller supplied a different name
-    // (orchestrator updates the pane title → hive picks it up automatically).
-    if (input.name && input.name !== agent.display_name) {
-      updates.push('display_name = ?'); params.push(input.name);
-    }
+
     if (updates.length > 0) {
       params.push(agent.id);
       getDB().prepare(`UPDATE agents SET ${updates.join(', ')} WHERE id = ?`).run(...params);
