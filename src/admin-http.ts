@@ -8,6 +8,7 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
 import * as db from './db.js';
 import { log } from './log.js';
+import { getDaemonSnapshots } from './codex-supervisor.js';
 
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress || '';
@@ -78,6 +79,13 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     const url = db.getNodeState('public_url') || '';
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ url }));
+    return;
+  }
+
+  // GET /admin/codex-daemons — snapshot of the codex daemon supervisor
+  if (url.pathname === '/admin/codex-daemons' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ daemons: getDaemonSnapshots() }));
     return;
   }
 

@@ -410,6 +410,36 @@ async function cmdStatus() {
         console.log(renderTable(['ID', 'NAME', 'PEER', 'STATUS', 'LAST SEEN'], rrows, '   '));
       }
     }
+
+    // Codex daemon supervisor snapshot — fetched live via admin endpoint
+    // so we get the actual running state, not just the DB intent.
+    try {
+      const daemonsRes = await fetch(`http://localhost:${port}/admin/codex-daemons`);
+      if (daemonsRes.ok) {
+        const { daemons } = await daemonsRes.json() as { daemons: Array<{ display_name: string; pid: number; uptime_ms: number; restart_count: number }> };
+        const codexAgents = agents.filter((a: any) => a.tool === 'codex');
+        if (codexAgents.length > 0 || daemons.length > 0) {
+          console.log(`\n🤖 Codex daemons`);
+          const liveByName = new Map(daemons.map(d => [d.display_name, d]));
+          const rows = codexAgents.map((a: any) => {
+            const live = liveByName.get(a.display_name);
+            if (live) {
+              const min = Math.floor(live.uptime_ms / 60000);
+              const uptimeStr = min < 60 ? `${min}m` : `${Math.floor(min / 60)}h${min % 60}m`;
+              return [a.display_name, `pid=${live.pid}`, `up ${uptimeStr}`, `restarts=${live.restart_count}`];
+            }
+            return [a.display_name, '(not running)', '', ''];
+          });
+          // Also surface zombie daemons (running but agent row deleted)
+          for (const d of daemons) {
+            if (!codexAgents.some((a: any) => a.display_name === d.display_name)) {
+              rows.push([`${d.display_name} ⚠️ orphan`, `pid=${d.pid}`, '', `restarts=${d.restart_count}`]);
+            }
+          }
+          console.log(renderTable(['NAME', 'PID', 'UPTIME', 'RESTARTS'], rows, '   '));
+        }
+      }
+    } catch { /* serve might not expose admin yet — silently skip */ }
   } catch {
     console.log(`\n⚠️  Cannot read database`);
   }

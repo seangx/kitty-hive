@@ -440,6 +440,17 @@ export function listAllAgents(activeOnly: boolean = false): Agent[] {
 }
 
 /**
+ * Local agents registered with tool='codex'. Used by the codex-supervisor
+ * to decide which daemons to auto-spawn on hive serve boot. Excludes remote
+ * placeholders (origin_peer != '') since their codex lives on another node.
+ */
+export function listLocalCodexAgents(): Agent[] {
+  return getDB().prepare(
+    "SELECT * FROM agents WHERE tool = 'codex' AND origin_peer = '' ORDER BY display_name"
+  ).all() as Agent[];
+}
+
+/**
  * Find an active local agent matching a role string.
  *
  * Lookup priority (first hit wins):
