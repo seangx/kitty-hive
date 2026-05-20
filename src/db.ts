@@ -174,6 +174,11 @@ export function initDB(dbPath?: string): Database.Database {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_external_key
       ON agents(external_key) WHERE external_key != '';
   `);
+  // project_dir: operator-supplied working directory hint. codex-supervisor
+  // uses it as cwd when spawning the daemon's codex app-server, so the TUI
+  // user attaches via `codex --remote` lands in the right project — without
+  // it, codex sees serve's cwd and the user sees the wrong files.
+  addColumnIfMissing('agents', 'project_dir', "TEXT NOT NULL DEFAULT ''");
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
@@ -352,6 +357,29 @@ export interface CreateAgentOpts {
   externalKey?: string;   // opaque key from an external orchestrator
   originPeer?: string;
   remoteId?: string;
+  projectDir?: string;    // working directory hint for codex agents (supervisor cwd)
+}
+
+// Hook: subscribers (e.g. codex-supervisor) get notified after a new agent
+// row is inserted. Lets the supervisor spawn a daemon on demand when kitty
+// registers a new local tool=codex agent — no serve restart required.
+// Subscribers are responsible for filtering (e.g. supervisor checks tool +
+// origin_peer); db.ts just fires the event.
+type AgentCreateListener = (agent: Agent) => void;
+const agentCreateListeners: AgentCreateListener[] = [];
+
+export function onAgentCreated(fn: AgentCreateListener): void {
+  agentCreateListeners.push(fn);
+}
+
+function emitAgentCreated(agent: Agent): void {
+  for (const fn of agentCreateListeners) {
+    try { fn(agent); } catch (err) {
+      // listener errors are isolated; don't break createAgent
+      // eslint-disable-next-line no-console
+      console.error('[db] onAgentCreated listener threw:', err);
+    }
+  }
 }
 
 export function createAgent(
@@ -370,17 +398,26 @@ export function createAgent(
     origin_peer: opts.originPeer || '',
     remote_id: opts.remoteId || '',
     external_key: opts.externalKey || '',
+    project_dir: opts.projectDir || '',
   };
   getDB().prepare(`
-    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key)
-    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key)
+    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir)
+    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key, @project_dir)
   `).run(agent);
+  emitAgentCreated(agent);
   return agent;
 }
 
 export function getAgentByExternalKey(key: string): Agent | undefined {
   if (!key) return undefined;
   return getDB().prepare('SELECT * FROM agents WHERE external_key = ?').get(key) as Agent | undefined;
+}
+
+/** Update an agent's project_dir hint (used by codex-supervisor as cwd when
+ *  spawning the daemon's codex app-server). Idempotent; empty string = clear.
+ *  No-op for unknown ids. */
+export function setAgentProjectDir(agentId: string, projectDir: string): void {
+  getDB().prepare('UPDATE agents SET project_dir = ? WHERE id = ?').run(projectDir || '', agentId);
 }
 
 /** Try to set agent.external_key. Silently no-ops on UNIQUE conflict (another

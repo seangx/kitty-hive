@@ -8,7 +8,7 @@
 import { IncomingMessage, ServerResponse } from 'node:http';
 import * as db from './db.js';
 import { log } from './log.js';
-import { getDaemonSnapshots, markDaemonReady } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated } from './codex-supervisor.js';
 
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress || '';
@@ -86,6 +86,31 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
   if (url.pathname === '/admin/codex-daemons' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ daemons: getDaemonSnapshots() }));
+    return;
+  }
+
+  // POST /admin/notify-agent-created — the CLI `agent register` calls this
+  // after it writes a new agent row, so the codex-supervisor (in serve's
+  // process) can dynamically spawn a daemon for new tool=codex agents without
+  // requiring a serve restart. The in-process onAgentCreated hook only fires
+  // when register goes through the live serve via MCP; this endpoint bridges
+  // the CLI-direct-DB-write path.
+  if (url.pathname === '/admin/notify-agent-created' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) required' }));
+        return;
+      }
+      const spawned = notifyAgentCreated(agent_id);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, spawned }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
     return;
   }
 

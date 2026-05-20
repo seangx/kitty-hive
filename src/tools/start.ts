@@ -1,6 +1,6 @@
 import {
   createAgent, getAgentById, getAgentsByName, touchAgent, getDB, getAgentTeams,
-  getAgentByExternalKey, trySetAgentExternalKey,
+  getAgentByExternalKey, trySetAgentExternalKey, setAgentProjectDir,
 } from '../db.js';
 import { log } from '../log.js';
 import type { Agent, Team } from '../models.js';
@@ -12,6 +12,7 @@ interface StartInput {
   roles?: string;
   tool?: string;
   expertise?: string;
+  projectDir?: string;  // working directory hint (codex agents); set as agent.project_dir
 }
 
 interface StartOutput {
@@ -107,7 +108,7 @@ export function handleStart(input: StartInput): StartOutput {
       input.tool ?? '',
       input.roles ?? '',
       input.expertise ?? '',
-      { id: createId, externalKey: input.key },
+      { id: createId, externalKey: input.key, projectDir: input.projectDir },
     );
   } else {
     touchAgent(agent.id);
@@ -160,6 +161,12 @@ export function handleStart(input: StartInput): StartOutput {
       if (!ok) {
         log('warn', `[start] external_key="${input.key}" already owned by another agent; agent=${agent.id} keeps key="${agent.external_key || '(none)'}"`);
       }
+    }
+    // Update project_dir if caller supplied one and it differs. Lets a launcher
+    // (kitty etc.) update an agent's cwd hint across re-registrations without
+    // creating a new agent row.
+    if (input.projectDir !== undefined && input.projectDir !== agent.project_dir) {
+      setAgentProjectDir(agent.id, input.projectDir);
     }
   }
 

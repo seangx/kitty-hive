@@ -92,6 +92,94 @@ async function cmdCodexChannel() {
   await new Promise(() => { /* never resolves; child.on('exit') terminates */ });
 }
 
+// codex-pane <subcommand>: launcher-facing utilities for path B (visible codex
+// via `codex --remote`). Currently has one subcommand:
+//   ws --key <K> | --id <I>   Print the daemon's ws_url + thread_id as JSON,
+//                             so a launcher (kitty-kitty etc.) can spawn
+//                             `codex --remote <ws_url>` inside a pane. Polls
+//                             with exponential backoff until status='ready'
+//                             or hard timeout.
+async function cmdCodexPane() {
+  const sub = args[1];
+  if (sub !== 'ws') {
+    console.error('Usage: kitty-hive codex-pane ws --key <K> | --id <I> [--port 4123] [--timeout-ms 5000]');
+    process.exit(2);
+  }
+  const { port, dbPath } = parseFlags(1);
+  let agentKey = '';
+  let agentId = '';
+  let timeoutMs = 5000;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--key' && args[i + 1]) { agentKey = args[i + 1]; i++; }
+    else if (args[i] === '--id' && args[i + 1]) { agentId = args[i + 1]; i++; }
+    else if (args[i] === '--timeout-ms' && args[i + 1]) { timeoutMs = parseInt(args[i + 1], 10) || 5000; i++; }
+    else if (args[i] === '--port' || args[i] === '-p') { i++; }
+    else if (args[i] === '--db') { i++; }
+  }
+  if (!agentKey && !agentId) {
+    console.error('Usage: kitty-hive codex-pane ws --key <K> | --id <I>');
+    process.exit(2);
+  }
+
+  // Backoff: 200ms / 400 / 800 / 1600 / 3200 / cap at remaining time
+  const start = Date.now();
+  const delays = [200, 400, 800, 1600, 3200];
+  let attempt = 0;
+  let lastBody: any = null;
+  while (true) {
+    try {
+      const url = new URL(`http://127.0.0.1:${port}/admin/codex-daemons`);
+      const res = await fetch(url);
+      if (res.ok) {
+        const { daemons } = await res.json() as { daemons: Array<any> };
+        const match = daemons.find(d =>
+          (agentId && d.agent_id === agentId) ||
+          // No external_key in admin snapshot, so we have to look up by id.
+          // For agent_key path, resolve via DB locally.
+          false,
+        );
+        let chosen = match;
+        if (!chosen && agentKey) {
+          // Resolve key → id via DB (use the same dbPath as serve uses)
+          const db = initDB(dbPath);
+          const row = db.prepare('SELECT id FROM agents WHERE external_key = ?').get(agentKey) as { id: string } | undefined;
+          if (row) chosen = daemons.find(d => d.agent_id === row.id);
+        }
+        if (chosen) {
+          lastBody = chosen;
+          if (chosen.ready && chosen.ws_url && chosen.thread_id) {
+            console.log(JSON.stringify({
+              status: 'ready',
+              agent_id: chosen.agent_id,
+              display_name: chosen.display_name,
+              ws_url: chosen.ws_url,
+              thread_id: chosen.thread_id,
+              pid: chosen.pid,
+            }));
+            process.exit(0);
+          }
+        } else {
+          lastBody = { status: 'not_supervised', error: 'no daemon for that agent_key/id (agent not registered with tool=codex, or supervisor not running)' };
+        }
+      }
+    } catch (err) {
+      lastBody = { status: 'error', error: String((err as any)?.message || err) };
+    }
+
+    if (Date.now() - start >= timeoutMs) break;
+    const delay = delays[Math.min(attempt, delays.length - 1)];
+    attempt++;
+    await new Promise(r => setTimeout(r, Math.min(delay, Math.max(50, timeoutMs - (Date.now() - start)))));
+  }
+
+  // Timeout — emit what we last saw, exit non-zero
+  console.log(JSON.stringify(lastBody || {
+    status: 'timeout',
+    error: `daemon did not reach ready within ${timeoutMs}ms`,
+  }));
+  process.exit(1);
+}
+
 const INIT_TOOLS = ['claude', 'cursor', 'vscode'] as const;
 type InitTool = typeof INIT_TOOLS[number];
 // codex is config'd via its own CLI (`codex mcp add ... --url ...`) writing
@@ -672,6 +760,7 @@ async function cmdAgentRegister() {
   let roles = '';
   let tool = '';
   let agentIdOverride = '';
+  let projectDir = '';
   for (let i = 2; i < args.length; i++) {
     if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
     else if (args[i] === '--display-name' && args[i + 1]) { displayName = args[i + 1]; i++; }
@@ -679,13 +768,16 @@ async function cmdAgentRegister() {
     else if (args[i] === '--roles' && args[i + 1]) { roles = args[i + 1]; i++; }
     else if (args[i] === '--tool' && args[i + 1]) { tool = args[i + 1]; i++; }
     else if (args[i] === '--id' && args[i + 1]) { agentIdOverride = args[i + 1]; i++; }
+    else if (args[i] === '--project-dir' && args[i + 1]) { projectDir = args[i + 1]; i++; }
   }
   if (!externalKey && !agentIdOverride && !displayName) {
-    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T]');
+    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P]');
     console.error('  All three of --key/--id/--display-name optional, but at least one required.');
+    console.error('  --project-dir: working directory hint for codex agents (passed as cwd when supervisor spawns codex app-server).');
     process.exit(1);
   }
 
+  const { port } = parseFlags(1);
   initDB(dbPath);
   const { handleStart } = await import('./tools/start.js');
   try {
@@ -695,11 +787,36 @@ async function cmdAgentRegister() {
       name: displayName || undefined,
       roles: roles || undefined,
       tool: tool || undefined,
+      projectDir: projectDir || undefined,
     });
     // Stdout: one line, just the agent_id (script-friendly)
     console.log(result.agent_id);
     // Stderr: human context
-    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}`);
+    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}${projectDir ? ` cwd=${projectDir}` : ''}`);
+
+    // If serve is running and we registered a tool=codex agent, notify the
+    // supervisor so it can spawn a daemon for it on the fly (without this,
+    // dynamic spawn requires a serve restart because the in-process
+    // onAgentCreated hook lives in serve's process, not this CLI process).
+    // Best-effort: failures are silently ignored — agent row is already written.
+    if (tool === 'codex') {
+      try {
+        const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-created`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent_id: result.agent_id }),
+          // Short timeout: register shouldn't block waiting for a dead serve
+          signal: AbortSignal.timeout(2000),
+        });
+        if (notifyRes.ok) {
+          const { spawned } = await notifyRes.json() as { spawned: boolean };
+          if (spawned) console.error(`   → supervisor spawning codex daemon`);
+        }
+      } catch {
+        // serve not running, or admin endpoint not reachable — that's fine,
+        // daemon will spawn at the next serve boot.
+      }
+    }
   } catch (err: any) {
     console.error(`Failed: ${err.message ?? err}`);
     process.exit(1);
@@ -2227,6 +2344,9 @@ switch (command) {
     break;
   case 'codex-channel':
     run(cmdCodexChannel);
+    break;
+  case 'codex-pane':
+    run(cmdCodexPane);
     break;
   case 'status':
     run(cmdStatus);

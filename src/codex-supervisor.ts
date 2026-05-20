@@ -28,7 +28,8 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { log } from './log.js';
-import { listLocalCodexAgents, getAgentById } from './db.js';
+import { listLocalCodexAgents, getAgentById, onAgentCreated } from './db.js';
+import type { Agent } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -106,6 +107,14 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // supervisor knows), not whatever was in the operator shell or the daemon's
   // own fallback default.
   cleanEnv.HIVE_URL = `http://127.0.0.1:${supervisorPort}/mcp`;
+  // CODEX_APPSERVER_CWD: codex-channel.ts reads this and passes to thread/start
+  // as cwd. Determines where the codex agent thinks it's running — must match
+  // the operator's intent (the project the kitty pane was launched for), not
+  // the cwd hive serve happens to be running from. agent.project_dir is
+  // operator-set via `agent register --project-dir`; empty falls back to
+  // serve's own cwd.
+  const fresh = getAgentById(agentId);
+  if (fresh?.project_dir) cleanEnv.CODEX_APPSERVER_CWD = fresh.project_dir;
 
   const child = spawn(findNpx(), ['-y', 'tsx', scriptPath], {
     env: cleanEnv,
@@ -160,13 +169,24 @@ export function startCodexSupervisor(port: number = 4123): void {
   supervisorPort = port;
   const agents = listLocalCodexAgents();
   if (agents.length === 0) {
-    log('info', '[codex-supervisor] no local tool=codex agents — nothing to spawn');
-    return;
+    log('info', '[codex-supervisor] no local tool=codex agents — nothing to spawn at boot');
+  } else {
+    log('info', `[codex-supervisor] starting ${agents.length} codex daemon(s): ${agents.map(a => a.display_name).join(', ')}`);
+    for (const agent of agents) {
+      spawnDaemon(agent.id, agent.display_name, 0);
+    }
   }
-  log('info', `[codex-supervisor] starting ${agents.length} codex daemon(s): ${agents.map(a => a.display_name).join(', ')}`);
-  for (const agent of agents) {
+
+  // Dynamic spawn: kitty / any other launcher may register a NEW codex agent
+  // while serve is running. Listen for agent-create events and spawn a daemon
+  // on the fly so the launcher doesn't have to restart serve. Subscribe AFTER
+  // initial boot scan so we don't double-spawn the already-spawned set above.
+  onAgentCreated((agent: Agent) => {
+    if (agent.tool !== 'codex' || agent.origin_peer !== '') return;
+    if (daemons.has(agent.id)) return; // already spawning
+    log('info', `[codex-supervisor] new local tool=codex agent registered: "${agent.display_name}" (${agent.id.slice(-12)}) → spawning daemon`);
     spawnDaemon(agent.id, agent.display_name, 0);
-  }
+  });
 }
 
 export function stopCodexSupervisor(): Promise<void> {
@@ -263,5 +283,19 @@ export function markDaemonReady(agentId: string, wsUrl: string, threadId: string
   info.threadId = threadId;
   info.readyAt = new Date();
   log('info', `[codex-supervisor] daemon "${info.displayName}" ready: ws=${wsUrl} thread=${threadId.slice(0, 8)}...`);
+  return true;
+}
+
+/** Called by /admin/notify-agent-created when a CLI-side `agent register`
+ *  inserts a row. The CLI runs in its own process so the in-process
+ *  onAgentCreated hook doesn't reach the supervisor; this is the bridge.
+ *  Idempotent: returns false if already spawned, true if a new spawn started. */
+export function notifyAgentCreated(agentId: string): boolean {
+  if (daemons.has(agentId)) return false;
+  const agent = getAgentById(agentId);
+  if (!agent) return false;
+  if (agent.tool !== 'codex' || agent.origin_peer !== '') return false;
+  log('info', `[codex-supervisor] notify-agent-created: "${agent.display_name}" (${agentId.slice(-12)}) → spawning daemon`);
+  spawnDaemon(agent.id, agent.display_name, 0);
   return true;
 }

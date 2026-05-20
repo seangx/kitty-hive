@@ -11,6 +11,7 @@ export interface Agent {
   origin_peer: string;   // empty for local agents; peer name for placeholders
   remote_id: string;     // empty for local agents; original agent_id on the peer
   external_key: string;  // opaque key from an external orchestrator (kitty session id, tmux pane, CI runner, ...). Empty when unmanaged. Unique when set.
+  project_dir: string;   // working directory hint (operator-supplied). codex-supervisor uses this as cwd when spawning the daemon's codex app-server, so the TUI a user later opens via `codex --remote` lands in the right project. Empty falls back to serve's cwd.
 }
 
 export interface Team {
