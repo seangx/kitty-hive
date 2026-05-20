@@ -146,7 +146,6 @@ async function cmdCodexPane() {
           if (row) chosen = daemons.find(d => d.agent_id === row.id);
         }
         if (chosen) {
-          lastBody = chosen;
           if (chosen.ready && chosen.ws_url && chosen.thread_id) {
             console.log(JSON.stringify({
               status: 'ready',
@@ -158,6 +157,17 @@ async function cmdCodexPane() {
             }));
             process.exit(0);
           }
+          // daemon row exists but its codex app-server hasn't reported ready
+          // back yet — wrap in the contract shape so callers can switch on
+          // `status` consistently (no raw daemon snapshot leaking out).
+          lastBody = {
+            status: 'starting',
+            agent_id: chosen.agent_id,
+            display_name: chosen.display_name,
+            pid: chosen.pid,
+            uptime_ms: chosen.uptime_ms,
+            restart_count: chosen.restart_count,
+          };
         } else {
           lastBody = { status: 'not_supervised', error: 'no daemon for that agent_key/id (agent not registered with tool=codex, or supervisor not running)' };
         }
