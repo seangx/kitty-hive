@@ -272,6 +272,24 @@ let appserverProc: ChildProcess | null = null;
 let appserverWs: any /* WebSocket */ = null;
 let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outside callers via supervisor
 let threadId: string | null = null;
+let appserverDeathHandled = false;  // guard so multiple death signals only exit once
+
+/** Called when EITHER codex app-server child process dies post-ready OR the WS
+ *  closes / errors. Both fire together when app-server crashes. Exits the
+ *  daemon with non-zero so the supervisor's child.on('exit') triggers an
+ *  exponential-backoff respawn with a fresh codex app-server. In-flight events
+ *  in the local queue ARE lost — known limitation, documented in v0.7.0 notes.
+ *  Idempotent via the appserverDeathHandled guard. */
+function onAppserverDeath(reason: string): void {
+  if (appserverDeathHandled) return;
+  appserverDeathHandled = true;
+  console.error(`[codex-channel] appserver died: ${reason}`);
+  console.error('[codex-channel] exiting daemon — supervisor will respawn with fresh codex app-server');
+  try { appserverWs?.close(); } catch { /* ignore */ }
+  try { appserverProc?.kill('SIGTERM'); } catch { /* ignore */ }
+  // exit code 2 distinguishes "app-server crash" from "clean shutdown via SIGTERM"
+  process.exit(2);
+}
 let nextRpcId = 100;
 const pendingResponses = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
 const turnCompleteWaiters: Array<() => void> = [];
@@ -313,11 +331,24 @@ async function setupAppserver(): Promise<void> {
       }
     });
     appserverProc!.stdout!.on('data', (chunk) => process.stderr.write(`[codex-app] ${chunk}`));
-    appserverProc!.on('exit', (code) => {
-      if (!ready) { ready = true; clearTimeout(timer); reject(new Error(`codex app-server exited (code=${code}) before becoming ready`)); }
+    appserverProc!.on('exit', (code, signal) => {
+      if (!ready) {
+        ready = true; clearTimeout(timer);
+        reject(new Error(`codex app-server exited (code=${code}, signal=${signal}) before becoming ready`));
+        return;
+      }
+      // post-ready exit: codex app-server crashed mid-flight. Daemon's WS will
+      // also close immediately; further turn/start calls would silently fail.
+      // Best recovery is for daemon to die so supervisor respawns it cleanly
+      // with a fresh codex app-server. In-flight events in the local queue
+      // are lost — acceptable for v1 (rare path); pending_pushes in hive
+      // will hold any events that arrived AFTER daemon exit and re-deliver
+      // when supervisor's new daemon binds.
+      onAppserverDeath(`codex app-server exited (code=${code}, signal=${signal})`);
     });
     appserverProc!.on('error', (err) => {
-      if (!ready) { ready = true; clearTimeout(timer); reject(err); }
+      if (!ready) { ready = true; clearTimeout(timer); reject(err); return; }
+      onAppserverDeath(`codex app-server process error: ${err?.message || err}`);
     });
   });
 
@@ -363,7 +394,10 @@ async function setupAppserver(): Promise<void> {
   });
 
   appserverWs.addEventListener('close', () => {
-    console.error('[codex-channel] appserver WS closed');
+    onAppserverDeath('appserver WS closed by remote (codex app-server likely exited)');
+  });
+  appserverWs.addEventListener('error', (e: any) => {
+    onAppserverDeath(`appserver WS error: ${e?.message || e?.type || 'unknown'}`);
   });
 
   // 1. initialize
@@ -657,6 +691,10 @@ function cleanupAppserver() {
 }
 
 function shutdown(signal: NodeJS.Signals) {
+  // Mark intentional shutdown BEFORE killing children — otherwise
+  // appserverProc.kill() triggers our death handler thinking app-server
+  // crashed, racing process.exit(0) with process.exit(2).
+  appserverDeathHandled = true;
   console.error(`[codex-channel] received ${signal}, shutting down...`);
   cleanupAppserver();
   process.exit(0);
