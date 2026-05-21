@@ -861,6 +861,18 @@ export function getTaskEvents(taskId: string, since: number = 0, limit: number =
   return getDB().prepare('SELECT * FROM task_events WHERE task_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?').all(taskId, since, limit) as TaskEvent[];
 }
 
+/** Latest seq number in task_events for a task (0 if no events). Used by the
+ *  MCP layer to build stable event_id values for push notifications — calling
+ *  this RIGHT AFTER a handler that appended events gives the seq of that
+ *  handler's last event. Stable across re-delivery, so channel-side dedup
+ *  can absorb duplicates from queue replay / daemon retry. */
+export function getLatestTaskEventSeq(taskId: string): number {
+  const row = getDB().prepare(
+    'SELECT COALESCE(MAX(seq), 0) AS max_seq FROM task_events WHERE task_id = ?'
+  ).get(taskId) as { max_seq: number };
+  return row.max_seq;
+}
+
 // --- Read cursors ---
 
 export function getReadCursor(agentId: string, targetType: string, targetId: string): number {

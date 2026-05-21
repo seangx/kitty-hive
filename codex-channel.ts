@@ -212,7 +212,21 @@ interface ParsedEvent {
   title?: string;
   event_id?: string;
   raw?: string;
+  // Internal: count of processNextEvent retries already attempted for this
+  // event. Capped at MAX_EVENT_RETRIES below — without the cap, a single
+  // failing event (e.g. codex thread stuck so `turn/start` never reaches
+  // turn/completed → 10-min timeout → unshift) keeps re-injecting the same
+  // logical event forever. Real incident 2026-05-21: one daemon spammed
+  // an agent with ~48 copies of the same step-start over 8 hours.
+  _retries?: number;
 }
+
+// After this many failed processing attempts, drop the event and log loudly.
+// 3 retries × the natural delay between failures (typically the sendTurn
+// timeout of 600s) ≈ 30 minutes total before we give up — long enough to
+// ride out a transient codex hiccup, short enough that a stuck event won't
+// flood the agent's thread.
+const MAX_EVENT_RETRIES = 3;
 
 let codexBusy = false;
 const eventQueue: ParsedEvent[] = [];
@@ -573,14 +587,35 @@ async function processNextEvent() {
       await spawnCodex(buildPrompt(next));
     }
   } catch (err) {
-    console.error('[codex-channel] event processing failed:', err);
-    // Don't lose the event — push back to front of queue
-    eventQueue.unshift(next);
+    const attempts = (next._retries || 0) + 1;
+    next._retries = attempts;
+    console.error(`[codex-channel] event processing failed (attempt ${attempts}/${MAX_EVENT_RETRIES}):`, err);
     // If appserver died, fall back to exec for subsequent events
     if (pushMode === 'appserver' && (!appserverWs || appserverWs.readyState !== 1)) {
       console.error('[codex-channel] appserver appears dead; switching remaining events to exec mode');
       pushMode = 'exec';
     }
+    if (attempts < MAX_EVENT_RETRIES) {
+      // Re-queue at head so order is preserved across the retry. Use a
+      // backoff timer (5s, 15s, 45s …) instead of setImmediate so a
+      // persistent failure mode (e.g. codex thread permanently wedged)
+      // doesn't tight-loop on the same event before sendTurn's own 10-min
+      // timeout fires. Without backoff, even a 600s timeout still produces
+      // hundreds of retries over a day.
+      eventQueue.unshift(next);
+      const backoffMs = Math.min(60_000, 5_000 * Math.pow(3, attempts - 1));
+      console.error(`[codex-channel] will retry in ${backoffMs}ms`);
+      codexBusy = false;
+      setTimeout(() => { if (!codexBusy) processNextEvent(); }, backoffMs);
+      return;
+    }
+    // Out of retries — drop the event so the queue can move on. Logged at
+    // ERROR level so the operator can investigate (and so codex thread
+    // history shows the gap if any inspection is done later).
+    console.error(`[codex-channel] DROPPING event after ${MAX_EVENT_RETRIES} failed attempts: ${JSON.stringify({
+      type: next.type, event_id: next.event_id, task_id: next.task_id,
+      message_id: next.message_id, from: next.from || next.from_agent_id,
+    })}`);
   } finally {
     codexBusy = false;
   }

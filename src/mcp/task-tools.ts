@@ -12,8 +12,20 @@ import { buildPushMessage } from '../preview.js';
 import * as db from '../db.js';
 import type { Task } from '../models.js';
 
-function eventId(taskId: string, type: string): string {
-  return `task:${taskId}:${type}:${Date.now()}`;
+/** Build a stable event_id for a task push notification.
+ *
+ *  Format: `task:<task_id>:<type>:<seq>` — seq comes from task_events.seq,
+ *  monotonic per task. The CALLER must read seq (db.getLatestTaskEventSeq)
+ *  right after the workflow handler runs, so the seq reflects the event the
+ *  handler just appended.
+ *
+ *  Stability matters: codex-channel and other channel clients dedup pushes
+ *  by event_id. If the id contains `Date.now()` (older versions did), each
+ *  re-delivery looks like a new event — a single retry loop in the daemon
+ *  injects the same logical step-start dozens of times into the codex thread.
+ *  Bug fixed 2026-05-21 after a stuck daemon spammed an agent for ~8 hours. */
+function eventId(taskId: string, type: string, seq: number): string {
+  return `task:${taskId}:${type}:${seq}`;
 }
 
 // --- Task list output projection ---
@@ -63,11 +75,12 @@ export function registerTaskTools(mcp: McpServer) {
         source_team_id: params.source_team_id,
       });
       if (result.assignee) {
+        const seq = db.getLatestTaskEventSeq(result.task_id);
         await notifyAgents([result.assignee.id], agent.id, buildPushMessage({
           type: 'task-assigned',
           from: agent.display_name,
           from_agent_id: agent.id,
-          event_id: eventId(result.task_id, 'task-assigned'),
+          event_id: eventId(result.task_id, 'task-assigned', seq),
           task_id: result.task_id,
         }));
       }
@@ -83,11 +96,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = await handleTaskClaimAsync(params.task_id, agent.id);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: 'task-claimed',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, 'task-claimed'),
+        event_id: eventId(params.task_id, 'task-claimed', seq),
         task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -106,11 +120,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = await handleTaskCancelAsync(params.task_id, agent.id, params.reason);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: 'task-cancel',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, 'task-cancel'),
+        event_id: eventId(params.task_id, 'task-cancel', seq),
         task_id: params.task_id,
         reason: params.reason,
       }));
@@ -183,11 +198,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       await handleWorkflowProposeAsync(params.task_id, agent.id, params.workflow as any);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: 'task-propose',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, 'task-propose'),
+        event_id: eventId(params.task_id, 'task-propose', seq),
         task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'proposing', steps: params.workflow.length }) }] };
@@ -202,11 +218,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleWorkflowApproveAsync(params.task_id, agent.id);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: 'step-start',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, 'step-start'),
+        event_id: eventId(params.task_id, 'step-start', seq),
         task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, status: 'approved', action }) }] };
@@ -227,11 +244,12 @@ export function registerTaskTools(mcp: McpServer) {
       if (!agent) return authError();
       const action = await handleStepCompleteAsync(params.task_id, agent.id, params.step, params.result);
       const pushType = action?.type || 'step-complete';
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: pushType,
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, pushType),
+        event_id: eventId(params.task_id, pushType, seq),
         task_id: params.task_id,
       }));
       // Inline self-review hint when roles is empty. The hint disappears once
@@ -260,11 +278,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleStepApproveAsync(params.task_id, agent.id);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: action.type,
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, action.type),
+        event_id: eventId(params.task_id, action.type, seq),
         task_id: params.task_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
@@ -284,11 +303,12 @@ export function registerTaskTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const action = await handleWorkflowRejectAsync(params.task_id, agent.id, params.step, params.reason);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
       await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
         type: 'task-reject',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: eventId(params.task_id, 'task-reject'),
+        event_id: eventId(params.task_id, 'task-reject', seq),
         task_id: params.task_id,
         reason: params.reason,
       }));
