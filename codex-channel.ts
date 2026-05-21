@@ -428,46 +428,86 @@ async function setupAppserver(): Promise<void> {
   // initialized notification — fire and forget
   appserverWs.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }));
 
-  // 2. thread/start (new thread per daemon lifetime — keep it simple)
-  const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
-  threadId = threadResp?.thread?.id;
-  if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
+  // 2. thread/resume (if we have a persisted thread_id from a prior daemon
+  //    lifetime) or thread/start (first-time spawn). Supervisor injects
+  //    HIVE_AGENT_THREAD_ID after the first ready announcement, persisted in
+  //    agents.thread_id; codex app-server loads the corresponding jsonl from
+  //    ~/.codex/sessions/ so conversation history survives daemon kill /
+  //    serve restart / machine reboot.
+  const persistedThreadId = (process.env.HIVE_AGENT_THREAD_ID || '').trim();
+  let resumed = false;
+  if (persistedThreadId) {
+    try {
+      const resumeResp = await rpcCall('thread/resume', { threadId: persistedThreadId });
+      const resumedId = resumeResp?.thread?.id;
+      if (!resumedId) throw new Error(`thread/resume returned no thread.id: ${JSON.stringify(resumeResp)}`);
+      threadId = resumedId;
+      resumed = true;
+      console.error(`[codex-channel] appserver thread resumed: ${threadId} (${resumeResp?.thread?.turns?.length ?? 0} turns)`);
+    } catch (err) {
+      // Common cause: jsonl missing (stale thread_id from a wiped ~/.codex)
+      // or codex schema upgrade. Fall back to a fresh thread; the new
+      // thread_id will overwrite the stale one in agents.thread_id via
+      // markDaemonReady → setAgentThreadId, so this self-heals.
+      console.error(`[codex-channel] thread/resume failed for ${persistedThreadId}, falling back to thread/start: ${err}`);
+    }
+  }
+  if (!resumed) {
+    const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
+    threadId = threadResp?.thread?.id;
+    if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
+    console.error(`[codex-channel] appserver thread started: ${threadId}`);
+  }
   appserverWsUrl = `ws://127.0.0.1:${port}`;
-  console.error(`[codex-channel] appserver thread started: ${threadId}`);
 
   // 2a. Announce ready signal back to hive supervisor so kitty-kitty (or any
   // other launcher) can query the (ws_url, thread_id) pair via
   // hive_codex_pane_ws / GET /admin/codex-daemons. Best-effort: failure here
   // just means the daemon's pane info isn't immediately discoverable; daemon
-  // still processes pushes normally.
+  // still processes pushes normally. Also persists thread_id for next spawn.
   await announceReady().catch(err => {
     console.error('[codex-channel] failed to announce ready to supervisor:', err);
   });
 
-  // 3. intro turn — establishes hive identity in the persistent thread.
-  // Subsequent per-event turns are short because context persists.
-  const intro = [
-    `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
-    ``,
-    `You are running inside a persistent codex thread driven by the kitty-hive`,
-    `codex-channel daemon. The daemon will inject one short message per hive`,
-    `event into this thread; you handle the event and wait for the next.`,
-    ``,
-    `FIRST ACTION: call hive_start({ id: "${agentId}" }) to bind your MCP`,
-    `session to your hive identity. This makes every hive_* tool call run`,
-    `as you (not as a new agent). Do this BEFORE handling the first event.`,
-    ``,
-    `For each event:`,
-    `- Push notifications are id-only by design — call the fetch tool the`,
-    `  daemon points to (hive_dm_read / hive_check / hive_team_events /`,
-    `  hive_team_info) BEFORE acting on the event content.`,
-    `- Handle per type (DM, task-propose, step-start, awaiting_approval,`,
-    `  team-message, ...) using the matching hive_* tools.`,
-    `- When done, just stop. The next event will arrive as a new turn.`,
-    ``,
-    `Acknowledge readiness briefly, then wait for the first event.`,
-  ].join('\n');
-  await sendTurn(intro);
+  // 3. intro turn. On thread/start (first-time spawn), inject the full agent
+  // brief. On thread/resume, the brief is already in thread history — but the
+  // daemon process is brand new, so its MCP client session lost the
+  // hive_start binding that the thread previously made. Inject a short
+  // re-bind notice so codex calls hive_start again before the next event.
+  if (resumed) {
+    const rebind = [
+      `[kitty-hive] daemon restarted — your MCP session is fresh.`,
+      `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
+      `before handling the next event. Then wait silently for the next push.`,
+    ].join('\n');
+    await sendTurn(rebind);
+  } else {
+    const intro = [
+      `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
+      ``,
+      `You are running inside a persistent codex thread driven by the kitty-hive`,
+      `codex-channel daemon. The daemon will inject one short message per hive`,
+      `event into this thread; you handle the event and wait for the next.`,
+      ``,
+      `FIRST ACTION: call hive_start({ id: "${agentId}" }) to bind your MCP`,
+      `session to your hive identity. This makes every hive_* tool call run`,
+      `as you (not as a new agent). Do this BEFORE handling the first event.`,
+      `NOTE: if you ever see a "[kitty-hive] daemon restarted" notice, call`,
+      `hive_start again — the daemon process restarted and the MCP binding`,
+      `was lost (but this thread's history was preserved).`,
+      ``,
+      `For each event:`,
+      `- Push notifications are id-only by design — call the fetch tool the`,
+      `  daemon points to (hive_dm_read / hive_check / hive_team_events /`,
+      `  hive_team_info) BEFORE acting on the event content.`,
+      `- Handle per type (DM, task-propose, step-start, awaiting_approval,`,
+      `  team-message, ...) using the matching hive_* tools.`,
+      `- When done, just stop. The next event will arrive as a new turn.`,
+      ``,
+      `Acknowledge readiness briefly, then wait for the first event.`,
+    ].join('\n');
+    await sendTurn(intro);
+  }
 }
 
 /** Tell the hive supervisor (the parent process that spawned us) that we have
