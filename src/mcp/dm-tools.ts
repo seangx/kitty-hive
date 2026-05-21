@@ -14,14 +14,15 @@ export function registerDMTools(mcp: McpServer) {
   mcp.tool(
     'hive_dm',
     'Send a direct message to another agent. `to` accepts agent id, team-nickname (within your teams), display_name (only if unambiguous), or "id@node" for federation. ' +
-    'IMPORTANT: any file path you mention in `content` is local-to-YOUR-machine ONLY — the receiver cannot read it (they may be on a different OS). ' +
-    'To actually share a file, pass `attach: [absolute path on YOUR disk]`; hive copies the bytes into storage (replicating across federation if needed) and the receiver gets a `file_id` they fetch via `hive_file_fetch`. ' +
-    'Use `attach` for screenshots, PDFs, CSVs, logs, pasted-image temp files, anything binary.',
+    'File-sharing — pick the cheaper of two: ' +
+    '(1) Same machine + receiver can read your filesystem (most common case for two local agents in the same project): just mention the absolute path inside `content`. Receiver opens it directly — zero copy, no DB bloat, the file stays live with your edits. ' +
+    '(2) Cross-machine (target ends in `@node` for federation), or receiver runs in a sandbox / container / different cwd that cannot reach your path, or the file is binary (screenshot, PDF, CSV, log, paste-buffer temp file): pass `attach: [absolute path on YOUR disk]`. Hive copies the bytes into storage (replicating across federation as needed), receiver gets a `file_id` to fetch via `hive_file_fetch`. ' +
+    'When in doubt about receiver reachability, default to `attach`.',
     {
       as: asParam,
       to: z.string().describe('Target: agent id, team-nickname, display_name, or "id@node"'),
-      content: z.string().describe('Message text. NEVER put a local file path here expecting the receiver to read it — use `attach` instead.'),
-      attach: z.array(z.string()).optional().describe('Absolute paths on YOUR machine; bytes are copied into hive and referenced by file_id on the receiver side.'),
+      content: z.string().describe('Message text. Inline an absolute path here when sender+receiver share a filesystem and the receiver can read it (same-machine same-project is the common case); otherwise use `attach`.'),
+      attach: z.array(z.string()).optional().describe('Absolute paths on YOUR machine; bytes are copied into hive and referenced by file_id on the receiver side. Use for cross-machine sends, binary blobs, or anything the receiver cannot read at its own path.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
