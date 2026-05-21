@@ -179,6 +179,12 @@ export function initDB(dbPath?: string): Database.Database {
   // user attaches via `codex --remote` lands in the right project — without
   // it, codex sees serve's cwd and the user sees the wrong files.
   addColumnIfMissing('agents', 'project_dir', "TEXT NOT NULL DEFAULT ''");
+  // thread_id: persisted codex thread/session uuid for the agent's daemon.
+  // When the daemon respawns, supervisor injects this as HIVE_AGENT_THREAD_ID;
+  // daemon then calls `thread/resume {threadId}` instead of `thread/start`,
+  // so conversation history (stored as jsonl by codex app-server) survives
+  // daemon kill / serve restart / machine reboot.
+  addColumnIfMissing('agents', 'thread_id', "TEXT NOT NULL DEFAULT ''");
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
@@ -399,6 +405,7 @@ export function createAgent(
     remote_id: opts.remoteId || '',
     external_key: opts.externalKey || '',
     project_dir: opts.projectDir || '',
+    thread_id: '',
   };
   getDB().prepare(`
     INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir)
@@ -418,6 +425,15 @@ export function getAgentByExternalKey(key: string): Agent | undefined {
  *  No-op for unknown ids. */
 export function setAgentProjectDir(agentId: string, projectDir: string): void {
   getDB().prepare('UPDATE agents SET project_dir = ? WHERE id = ?').run(projectDir || '', agentId);
+}
+
+/** Persist the codex thread/session uuid for a codex agent. Supervisor reads
+ *  this on daemon (re)spawn and injects via HIVE_AGENT_THREAD_ID env, so the
+ *  daemon calls `thread/resume` instead of `thread/start` — preserving the
+ *  jsonl-backed conversation history across daemon kill / serve restart.
+ *  Empty string clears (used as fallback when resume fails on a stale id). */
+export function setAgentThreadId(agentId: string, threadId: string): void {
+  getDB().prepare('UPDATE agents SET thread_id = ? WHERE id = ?').run(threadId || '', agentId);
 }
 
 /** Try to set agent.external_key. Silently no-ops on UNIQUE conflict (another

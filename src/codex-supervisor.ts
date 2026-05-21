@@ -14,12 +14,17 @@
  *   - Daemon stderr/stdout are tee'd into serve's own stderr with an
  *     `[codex:<display_name>]` prefix.
  *
+ * Thread persistence (v0.7.0):
+ *   - daemon's codex thread_id is stored on agents.thread_id after first ready.
+ *   - On respawn, supervisor injects HIVE_AGENT_THREAD_ID so daemon calls
+ *     `thread/resume` (against the jsonl codex app-server already wrote to
+ *     ~/.codex/sessions/) instead of `thread/start`. Conversation survives
+ *     daemon kill / serve restart / machine reboot.
+ *
  * Out of scope (deferred):
  *   - Hot reload on DB changes (poll / watch). Add/remove agents → must
  *     restart serve to pick up. Acceptable for now since codex agents are
  *     long-lived once configured.
- *   - Thread persistence across serve restarts. Each spawn → new codex thread
- *     → fresh context. Fine for task-driven workers.
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -28,7 +33,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { log } from './log.js';
-import { listLocalCodexAgents, getAgentById, onAgentCreated } from './db.js';
+import { listLocalCodexAgents, getAgentById, onAgentCreated, setAgentThreadId } from './db.js';
 import type { Agent } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -115,6 +120,14 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // serve's own cwd.
   const fresh = getAgentById(agentId);
   if (fresh?.project_dir) cleanEnv.CODEX_APPSERVER_CWD = fresh.project_dir;
+  // HIVE_AGENT_THREAD_ID: presence tells codex-channel to `thread/resume` an
+  // existing codex thread (jsonl already on disk in ~/.codex/sessions/)
+  // instead of `thread/start`. Set on every spawn after the first ready
+  // (markDaemonReady persists it to agents.thread_id). On a respawn after
+  // resume failure, codex-channel announces a brand-new thread_id and
+  // markDaemonReady overwrites — old jsonl is orphaned but content survives
+  // on disk.
+  if (fresh?.thread_id) cleanEnv.HIVE_AGENT_THREAD_ID = fresh.thread_id;
 
   const child = spawn(findNpx(), ['-y', 'tsx', scriptPath], {
     env: cleanEnv,
@@ -282,6 +295,12 @@ export function markDaemonReady(agentId: string, wsUrl: string, threadId: string
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
+  // Persist thread_id so next spawn (after daemon kill / serve restart) can
+  // resume the same codex thread instead of starting fresh. Idempotent —
+  // setting the same id is a cheap UPDATE.
+  try { setAgentThreadId(agentId, threadId); } catch (err) {
+    log('warn', `[codex-supervisor] failed to persist thread_id for ${agentId}: ${err}`);
+  }
   log('info', `[codex-supervisor] daemon "${info.displayName}" ready: ws=${wsUrl} thread=${threadId.slice(0, 8)}...`);
   return true;
 }
