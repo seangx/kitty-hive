@@ -34,6 +34,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
+import { TurnTracker, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -212,21 +213,14 @@ interface ParsedEvent {
   title?: string;
   event_id?: string;
   raw?: string;
-  // Internal: count of processNextEvent retries already attempted for this
-  // event. Capped at MAX_EVENT_RETRIES below — without the cap, a single
-  // failing event (e.g. codex thread stuck so `turn/start` never reaches
-  // turn/completed → 10-min timeout → unshift) keeps re-injecting the same
-  // logical event forever. Real incident 2026-05-21: one daemon spammed
-  // an agent with ~48 copies of the same step-start over 8 hours.
-  _retries?: number;
 }
 
-// After this many failed processing attempts, drop the event and log loudly.
-// 3 retries × the natural delay between failures (typically the sendTurn
-// timeout of 600s) ≈ 30 minutes total before we give up — long enough to
-// ride out a transient codex hiccup, short enough that a stuck event won't
-// flood the agent's thread.
-const MAX_EVENT_RETRIES = 3;
+// NO daemon-side retry. Earlier versions retried failed `sendTurn`s up to 3×;
+// that turned out to be the proximate cause of the 2026-05-26 duplicate-turn
+// incident — see codex-channel-runtime.ts header for the post-mortem. The
+// TurnTracker now blocks re-issue of `turn/start` for an already-attempted
+// event_id; loss recovery (hive SSE replay, pending_pushes drain on daemon
+// respawn) lives at a higher layer.
 
 let codexBusy = false;
 const eventQueue: ParsedEvent[] = [];
@@ -287,6 +281,7 @@ let appserverWs: any /* WebSocket */ = null;
 let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outside callers via supervisor
 let threadId: string | null = null;
 let appserverDeathHandled = false;  // guard so multiple death signals only exit once
+let turnTracker: TurnTracker | null = null;
 
 /** Called when EITHER codex app-server child process dies post-ready OR the WS
  *  closes / errors. Both fire together when app-server crashes. Exits the
@@ -306,7 +301,6 @@ function onAppserverDeath(reason: string): void {
 }
 let nextRpcId = 100;
 const pendingResponses = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
-const turnCompleteWaiters: Array<() => void> = [];
 
 function pickFreePort(): Promise<number> {
   return new Promise((resolve, reject) => {
@@ -406,12 +400,12 @@ async function setupAppserver(): Promise<void> {
       }
       return;
     }
-    // Notification
-    if (msg.method === 'turn/completed' || msg.method === 'turn/interrupt') {
-      const w = turnCompleteWaiters.shift();
-      if (w) w();
+    // Notification — let the tracker route turn-related ones by turn id.
+    // Unmatched notifications (item delta, agentMessage stream, etc.) are
+    // ignored at this layer.
+    if (msg.method && turnTracker?.handleNotification(msg.method, msg.params)) {
+      return;
     }
-    // Optional: tap into item/agentMessage/delta etc. for live progress — skipped.
   });
 
   appserverWs.addEventListener('close', () => {
@@ -460,6 +454,14 @@ async function setupAppserver(): Promise<void> {
   }
   appserverWsUrl = `ws://127.0.0.1:${port}`;
 
+  // Bring up the TurnTracker now that we have a thread. RpcTransport is a
+  // thin adapter over the local rpcCall — the tracker stays decoupled from
+  // our WS plumbing so tests can swap in a stub transport.
+  turnTracker = new TurnTracker(
+    { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+    threadId!,
+  );
+
   // 2a. Announce ready signal back to hive supervisor so kitty-kitty (or any
   // other launcher) can query the (ws_url, thread_id) pair via
   // hive_codex_pane_ws / GET /admin/codex-daemons. Best-effort: failure here
@@ -480,7 +482,10 @@ async function setupAppserver(): Promise<void> {
       `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
       `before handling the next event. Then wait silently for the next push.`,
     ].join('\n');
-    await sendTurn(rebind);
+    const outcome = await sendTurn(rebind, { eventId: `daemon-rebind:${threadId}:${Date.now()}` });
+    if (outcome.kind !== 'completed') {
+      console.error(`[codex-channel] rebind intro turn outcome: ${outcome.kind} — continuing anyway`);
+    }
   } else {
     const intro = [
       `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
@@ -506,7 +511,10 @@ async function setupAppserver(): Promise<void> {
       ``,
       `Acknowledge readiness briefly, then wait for the first event.`,
     ].join('\n');
-    await sendTurn(intro);
+    const outcome = await sendTurn(intro, { eventId: `daemon-intro:${threadId}:${Date.now()}` });
+    if (outcome.kind !== 'completed') {
+      console.error(`[codex-channel] startup intro turn outcome: ${outcome.kind} — continuing anyway`);
+    }
   }
 }
 
@@ -548,16 +556,16 @@ async function rpcCall(method: string, params: any, timeoutMs = 30000): Promise<
   });
 }
 
-async function sendTurn(text: string, turnTimeoutMs = 600000 /* 10 min */): Promise<void> {
-  const turnDone = new Promise<void>((resolve) => { turnCompleteWaiters.push(resolve); });
-  await rpcCall('turn/start', {
-    threadId,
-    input: [{ type: 'text', text }],
-  });
-  await Promise.race([
-    turnDone,
-    new Promise<void>((_, reject) => setTimeout(() => reject(new Error(`turn did not complete within ${turnTimeoutMs}ms`)), turnTimeoutMs)),
-  ]);
+/** Inject one hive event as a turn into the codex thread. Returns the
+ *  terminal outcome — caller branches on `outcome.kind` rather than catching.
+ *  See codex-channel-runtime.ts for the design rationale (2026-05-26 incident
+ *  notes). The eventId is used for cross-attempt idempotency: once an event
+ *  has been handed to the tracker, the tracker refuses to re-issue
+ *  `turn/start` for the same id, no matter what kind of failure intervened.
+ *  This is the core defense against duplicate-turn injection. */
+async function sendTurn(text: string, opts: { eventId?: string } = {}): Promise<TurnOutcome> {
+  if (!turnTracker) throw new Error('turnTracker not initialized — did setupAppserver run?');
+  return turnTracker.sendTurn(text, opts);
 }
 
 /** Short prompt for appserver mode — context is persistent, so each event is
@@ -613,6 +621,20 @@ function spawnCodex(prompt: string): Promise<void> {
   });
 }
 
+/** Build a stable dedup key from a parsed event. Used as TurnTracker's
+ *  eventId so even a retry/replay of the same logical hive event never
+ *  produces a second `turn/start` on codex's side. Falls back to a content
+ *  hash when nothing else is available. */
+function eventDedupKey(ev: ParsedEvent): string {
+  if (ev.event_id) return `evid:${ev.event_id}`;
+  if (ev.message_id != null) return `dm:${ev.message_id}`;
+  if (ev.task_id) return `task:${ev.task_id}:${ev.type || 'unknown'}`;
+  if (ev.team_id) return `team:${ev.team_id}:${ev.type || 'unknown'}`;
+  // Last resort — should be rare; hash content + sender so unrelated events
+  // don't collide.
+  return `raw:${ev.from_agent_id || 'unknown'}:${ev.type || 'unknown'}:${(ev.raw || ev.preview || '').slice(0, 80)}`;
+}
+
 async function processNextEvent() {
   if (codexBusy) return;
   const next = eventQueue.shift();
@@ -621,38 +643,51 @@ async function processNextEvent() {
   try {
     if (pushMode === 'appserver') {
       const text = buildEventTurnText(next);
-      console.error(`[codex-channel] inject turn (${text.length} chars) into thread ${threadId?.slice(-8)}`);
-      await sendTurn(text);
+      const eventId = eventDedupKey(next);
+      console.error(`[codex-channel] inject turn (${text.length} chars) eventId=${eventId} into thread ${threadId?.slice(-8)}`);
+      const outcome = await sendTurn(text, { eventId });
+      // TurnOutcome is a closed union — each kind reflects a known terminal
+      // state observed at codex's side. We DON'T retry locally on any of
+      // these: re-issuing turn/start was the exact cause of the 2026-05-26
+      // duplicate-turn incident. Loss recovery (if any is warranted) lives
+      // a layer up: hive's pending_pushes / SSE replay across daemon
+      // respawn delivers missed events again.
+      switch (outcome.kind) {
+        case 'completed':
+          // Normal path. Nothing more to do.
+          break;
+        case 'failed':
+          console.error(`[codex-channel] turn failed on codex (turnId=${outcome.turnId} willRetry=${outcome.willRetry}): ${JSON.stringify(outcome.error)}`);
+          break;
+        case 'interrupted':
+          console.error(`[codex-channel] turn interrupted on codex (turnId=${outcome.turnId}) — event consumed`);
+          break;
+        case 'timeout':
+          console.error(`[codex-channel] turn did not complete within ${outcome.afterMs}ms (turnId=${outcome.turnId}); leaving turn in-flight on codex, NOT retrying to avoid duplicate inject`);
+          break;
+        case 'rpc_send_error':
+          console.error(`[codex-channel] turn/start RPC error (event eventId=${eventId}): ${outcome.error.message}`);
+          if (!appserverWs || appserverWs.readyState !== 1) {
+            console.error('[codex-channel] appserver WS appears dead; switching subsequent events to exec mode (daemon will exit shortly anyway)');
+            pushMode = 'exec';
+          }
+          break;
+        case 'skipped_duplicate':
+          // Should only fire if the same eventId is enqueued twice in this
+          // daemon lifetime — e.g. SSE drain replay after a brief disconnect.
+          // Expected behavior; log at info to make it visible without alarm.
+          console.error(`[codex-channel] skipped already-injected event (eventId=${outcome.eventId})`);
+          break;
+      }
     } else {
       await spawnCodex(buildPrompt(next));
     }
   } catch (err) {
-    const attempts = (next._retries || 0) + 1;
-    next._retries = attempts;
-    console.error(`[codex-channel] event processing failed (attempt ${attempts}/${MAX_EVENT_RETRIES}):`, err);
-    // If appserver died, fall back to exec for subsequent events
-    if (pushMode === 'appserver' && (!appserverWs || appserverWs.readyState !== 1)) {
-      console.error('[codex-channel] appserver appears dead; switching remaining events to exec mode');
-      pushMode = 'exec';
-    }
-    if (attempts < MAX_EVENT_RETRIES) {
-      // Re-queue at head so order is preserved across the retry. Use a
-      // backoff timer (5s, 15s, 45s …) instead of setImmediate so a
-      // persistent failure mode (e.g. codex thread permanently wedged)
-      // doesn't tight-loop on the same event before sendTurn's own 10-min
-      // timeout fires. Without backoff, even a 600s timeout still produces
-      // hundreds of retries over a day.
-      eventQueue.unshift(next);
-      const backoffMs = Math.min(60_000, 5_000 * Math.pow(3, attempts - 1));
-      console.error(`[codex-channel] will retry in ${backoffMs}ms`);
-      codexBusy = false;
-      setTimeout(() => { if (!codexBusy) processNextEvent(); }, backoffMs);
-      return;
-    }
-    // Out of retries — drop the event so the queue can move on. Logged at
-    // ERROR level so the operator can investigate (and so codex thread
-    // history shows the gap if any inspection is done later).
-    console.error(`[codex-channel] DROPPING event after ${MAX_EVENT_RETRIES} failed attempts: ${JSON.stringify({
+    // Anything that throws now is genuinely unexpected (sendTurn no longer
+    // throws — it returns TurnOutcome). Log loudly and move on; do not
+    // re-queue, to preserve the no-duplicate guarantee.
+    console.error('[codex-channel] unexpected processing error (event dropped to preserve no-duplicate guarantee):', err);
+    console.error(`[codex-channel] dropped event: ${JSON.stringify({
       type: next.type, event_id: next.event_id, task_id: next.task_id,
       message_id: next.message_id, from: next.from || next.from_agent_id,
     })}`);
