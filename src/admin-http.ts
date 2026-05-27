@@ -6,9 +6,58 @@
  */
 
 import { IncomingMessage, ServerResponse } from 'node:http';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
-import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn } from './codex-supervisor.js';
+
+// Per-agent serialization for /admin/codex-set-thread. Two concurrent
+// callers must not both SIGTERM the daemon — the second would race against
+// the supervisor's respawn from the first. A simple promise-chain per
+// agent_id is enough; calls await the previous chain head before starting.
+const setThreadLocks = new Map<string, Promise<unknown>>();
+function lockPerAgent<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = setThreadLocks.get(agentId) ?? Promise.resolve();
+  const next = prev.catch(() => undefined).then(fn);
+  setThreadLocks.set(agentId, next);
+  // Cleanup map entry once this call settles AND no later call has chained
+  // onto it (we re-check identity before deleting).
+  next.finally(() => {
+    if (setThreadLocks.get(agentId) === next) setThreadLocks.delete(agentId);
+  });
+  return next;
+}
+
+/** Locate the codex rollout jsonl for a given thread_id. Codex stores them
+ *  under `~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl`. We
+ *  don't know the date directory, so this walks `~/.codex/sessions/` looking
+ *  for any file whose name ends in `-<thread_id>.jsonl`. Returns true if
+ *  found. Used to validate set_thread requests so callers can't pin to a
+ *  non-existent thread (which would otherwise fall through to thread/start
+ *  and silently overwrite the intended thread_id). */
+function codexRolloutExists(threadId: string): boolean {
+  const base = join(homedir(), '.codex', 'sessions');
+  if (!existsSync(base)) return false;
+  const needle = `-${threadId}.jsonl`;
+  function scan(dir: string): boolean {
+    let entries: string[];
+    try { entries = readdirSync(dir); } catch { return false; }
+    for (const e of entries) {
+      const full = join(dir, e);
+      let st;
+      try { st = statSync(full); } catch { continue; }
+      if (st.isDirectory()) {
+        if (scan(full)) return true;
+      } else if (e.endsWith(needle)) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return scan(base);
+}
 
 function isLoopback(req: IncomingMessage): boolean {
   const addr = req.socket.remoteAddress || '';
@@ -164,6 +213,125 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, tracked: true }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
+  // POST /admin/codex-set-thread — switch the daemon for a codex agent to a
+  // specific thread (resume) or to a fresh thread (reset).
+  //
+  // body: { agent_id: string, thread_id: string | null }
+  //   thread_id non-empty string → resume that thread. jsonl must exist on
+  //                                 disk in ~/.codex/sessions/.
+  //   thread_id === null or "" → reset: clear agents.thread_id and let the
+  //                                 daemon thread/start a new thread.
+  //   thread_id field missing → 400 (use null explicitly to reset; prevents
+  //                                 accidental reset from a serialization bug).
+  //
+  // Implementation:
+  //   1. UPDATE agents.thread_id (or '' for reset)
+  //   2. SIGTERM existing daemon (supervisor auto-respawns) OR spawn fresh if
+  //      none exists. requestDaemonRespawn() handles both.
+  //   3. Wait up to 30s for the new daemon to report ready (which means it
+  //      successfully resumed/started a thread and POSTed to
+  //      /admin/codex-daemon-ready).
+  //
+  // Returns: { ok, thread_id, ws_url, ready, error? }
+  //   thread_id is the ACTUAL one the new daemon now holds (matches the
+  //   request on resume; on reset it's the codex-assigned new id).
+  //   ws_url is the new daemon's ws://127.0.0.1:<port>; differs from any
+  //   previous value if the daemon respawned with a new free port.
+  //
+  // Use cases (kitty UI):
+  //   - User picks a historical thread from a session picker → resume
+  //   - User clicks "🆕 new conversation" → reset
+  //
+  // Serialized per agent_id so two concurrent callers can't race the
+  // SIGTERM/respawn flow.
+  if (url.pathname === '/admin/codex-set-thread' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string' || !agent_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) required' }));
+        return;
+      }
+      // thread_id MUST be present. Accept string | null. A missing field is
+      // a 400 — never want a JSON-serialization bug (e.g. undefined dropped
+      // by JSON.stringify) to silently nuke an agent's thread.
+      if (!('thread_id' in body)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'thread_id required (pass null explicitly to reset)' }));
+        return;
+      }
+      const rawThreadId = body.thread_id;
+      if (rawThreadId !== null && typeof rawThreadId !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'thread_id must be string or null' }));
+        return;
+      }
+      const targetThreadId = (rawThreadId ?? '').trim();  // '' means reset
+
+      const agent = db.getAgentById(agent_id);
+      if (!agent) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `agent not found: ${agent_id}` }));
+        return;
+      }
+      if (agent.tool !== 'codex') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `agent.tool="${agent.tool}", expected "codex"` }));
+        return;
+      }
+      if (agent.origin_peer !== '') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'cannot set thread for a remote (federated) agent' }));
+        return;
+      }
+      // For resume: verify the jsonl exists. If we just blindly trust the
+      // caller and the file is missing, the daemon's thread/resume will
+      // fail and fall back to thread/start — overwriting the intended
+      // thread_id with a fresh one (and from the caller's perspective the
+      // pin silently failed).
+      if (targetThreadId && !codexRolloutExists(targetThreadId)) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          error: `no codex rollout jsonl found for thread_id=${targetThreadId} under ~/.codex/sessions/`,
+        }));
+        return;
+      }
+
+      // Serialize per-agent so concurrent set_thread calls don't trample
+      // each other's SIGTERM / respawn flow.
+      const result = await lockPerAgent(agent_id, async () => {
+        db.setAgentThreadId(agent_id, targetThreadId);
+        log('info', `[admin] codex-set-thread agent=${agent_id.slice(-12)} → ${targetThreadId || '(reset)'}`);
+        const snap = await requestDaemonRespawn(agent_id, 30_000);
+        return snap;
+      });
+
+      if (!result) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          thread_id: targetThreadId || null,
+          ws_url: null,
+          ready: false,
+          error: 'daemon did not become ready within 30s; poll hive_codex_pane_ws or GET /admin/codex-daemons',
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        thread_id: result.thread_id,
+        ws_url: result.ws_url,
+        ready: true,
+      }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));

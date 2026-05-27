@@ -335,3 +335,60 @@ export function notifyAgentRemoved(agentId: string): boolean {
   try { info.child.kill('SIGTERM'); } catch { /* ignore */ }
   return true;
 }
+
+/** Force a daemon to (re)spawn for an agent, then wait up to `timeoutMs` for
+ *  it to reach ready state. Used by /admin/codex-set-thread when the caller
+ *  has just mutated agents.thread_id and needs the daemon to pick up the
+ *  new value (either via thread/resume of a different thread, or thread/start
+ *  for a fresh thread when thread_id was cleared).
+ *
+ *  Two paths:
+ *   - Daemon already running → SIGTERM it; supervisor's on-exit handler
+ *     respawns automatically (with backoff, but immediate for the first
+ *     restart). The new daemon will pick up the fresh agents.thread_id at
+ *     its env-injection step.
+ *   - No daemon → call notifyAgentCreated (skips if not eligible).
+ *
+ *  After kicking, polls `daemons.get(agentId)` for readiness every 200ms.
+ *  Returns the ready snapshot, or null on timeout. The caller is expected to
+ *  have validated that the agent exists and is tool=codex; this function
+ *  trusts that. */
+export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000): Promise<DaemonSnapshot | null> {
+  const existing = daemons.get(agentId);
+  if (existing) {
+    log('info', `[codex-supervisor] requestDaemonRespawn: SIGTERM existing daemon for "${existing.displayName}" (${agentId.slice(-12)})`);
+    try { existing.child.kill('SIGTERM'); } catch { /* ignore */ }
+  } else {
+    log('info', `[codex-supervisor] requestDaemonRespawn: no live daemon for ${agentId.slice(-12)}, requesting spawn`);
+    notifyAgentCreated(agentId);
+  }
+
+  const startedAt = Date.now();
+  // Wait for the OLD daemon (if any) to exit and the supervisor's restart
+  // backoff to fire, plus the new daemon to call markDaemonReady (which
+  // happens after thread/resume or thread/start succeeds and the daemon
+  // POSTs /admin/codex-daemon-ready). Poll cheaply: 200ms is well below the
+  // typical daemon spawn-to-ready time (~5s) and short enough to bound
+  // perceived latency for the kitty UI caller.
+  while (Date.now() - startedAt < timeoutMs) {
+    await new Promise(r => setTimeout(r, 200));
+    const snap = daemons.get(agentId);
+    if (!snap) continue;        // still respawning; existing was killed, new not yet started
+    if (!snap.readyAt) continue; // spawned but codex app-server / thread not ready yet
+    // Don't return the old daemon's snapshot if we just SIGTERM'd it — the
+    // pid will have changed when the new daemon spawns. Use startedAt as a
+    // sentinel: the new daemon's startedAt > our startedAt.
+    if (existing && snap.startedAt.getTime() <= startedAt) continue;
+    return {
+      agent_id: snap.agentId,
+      display_name: snap.displayName,
+      pid: snap.pid,
+      uptime_ms: Date.now() - snap.startedAt.getTime(),
+      restart_count: snap.restartCount,
+      ws_url: snap.wsUrl,
+      thread_id: snap.threadId,
+      ready: true,
+    };
+  }
+  return null;
+}
