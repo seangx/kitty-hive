@@ -327,7 +327,23 @@ async function setupAppserver(): Promise<void> {
   // process orphaned and still LISTENing on the ws port — see Bug 1 follow-up
   // (2026-05-20): `agent remove` killed the daemon but `lsof -i :<port>` still
   // showed the vendor codex binary holding the port.
-  appserverProc = spawn(CODEX_CMD, ['app-server', '--listen', `ws://127.0.0.1:${port}`], {
+  // Spawn codex app-server with config overrides so the daemon's intro turn
+  // (which auto-calls hive_start to bind the codex thread's MCP session)
+  // doesn't hang waiting for an approval dialog that has no human attached.
+  //
+  // Background: users typically set `[mcp_servers.hive.tools.hive_start]
+  // approval_mode = "approve"` in ~/.codex/config.toml so a Claude or codex
+  // they're interacting with prompts before identifying. But the headless
+  // daemon's intro turn fires before any user attaches to the pane — there's
+  // no UI to click approve, so the tool call hangs (real incident 2026-05-27,
+  // monkeys-tester pane saw "Working (16m12s)" because hive_start never
+  // completed). Overriding via `-c` is per-spawn and doesn't touch the
+  // user's other codex sessions.
+  appserverProc = spawn(CODEX_CMD, [
+    'app-server',
+    '--listen', `ws://127.0.0.1:${port}`,
+    '-c', 'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
+  ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
@@ -482,10 +498,23 @@ async function setupAppserver(): Promise<void> {
       `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
       `before handling the next event. Then wait silently for the next push.`,
     ].join('\n');
-    const outcome = await sendTurn(rebind, { eventId: `daemon-rebind:${threadId}:${Date.now()}` });
-    if (outcome.kind !== 'completed') {
-      console.error(`[codex-channel] rebind intro turn outcome: ${outcome.kind} — continuing anyway`);
-    }
+    // Fire-and-forget: codex creates the turn immediately on turn/start, so
+    // proceeding to listenSSE doesn't lose the intro. Awaiting was the cause
+    // of the 2026-05-27 "daemon blocks for 10 min on a stuck intro turn"
+    // path — if codex's intro processing hangs (e.g., on an MCP tool waiting
+    // for human approval), the daemon was sitting idle the entire time
+    // before falling through after the 10-min sendTurn timeout. With this
+    // change the daemon listens to SSE events from the moment it announces
+    // ready; the intro turn runs in the background and we log its outcome.
+    void sendTurn(rebind, { eventId: `daemon-rebind:${threadId}:${Date.now()}` })
+      .then((outcome) => {
+        if (outcome.kind !== 'completed') {
+          console.error(`[codex-channel] rebind intro turn outcome: ${outcome.kind} — daemon already proceeded`);
+        }
+      })
+      .catch((err) => {
+        console.error('[codex-channel] rebind intro turn promise rejected:', err);
+      });
   } else {
     const intro = [
       `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
@@ -511,10 +540,17 @@ async function setupAppserver(): Promise<void> {
       ``,
       `Acknowledge readiness briefly, then wait for the first event.`,
     ].join('\n');
-    const outcome = await sendTurn(intro, { eventId: `daemon-intro:${threadId}:${Date.now()}` });
-    if (outcome.kind !== 'completed') {
-      console.error(`[codex-channel] startup intro turn outcome: ${outcome.kind} — continuing anyway`);
-    }
+    // Same fire-and-forget pattern as the rebind branch above — daemon must
+    // not block on intro turn completion. See the rebind comment for why.
+    void sendTurn(intro, { eventId: `daemon-intro:${threadId}:${Date.now()}` })
+      .then((outcome) => {
+        if (outcome.kind !== 'completed') {
+          console.error(`[codex-channel] startup intro turn outcome: ${outcome.kind} — daemon already proceeded`);
+        }
+      })
+      .catch((err) => {
+        console.error('[codex-channel] startup intro turn promise rejected:', err);
+      });
   }
 }
 
