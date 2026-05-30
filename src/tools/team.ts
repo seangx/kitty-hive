@@ -1,6 +1,7 @@
 import {
   createTeam, getTeamById, getTeamByName, listTeams, getAgentTeams,
-  addTeamMember, isTeamMember, getTeamMembers, getTeamMember,
+  addTeamMember, removeTeamMember, renameTeamMember,
+  isTeamMember, getTeamMembers, getTeamMember,
   getTeamDisplayName, appendTeamEvent, getTeamEvents, getLatestTeamEvents,
   getAgentById, setTeamRules,
 } from '../db.js';
@@ -130,6 +131,88 @@ export function handleTeamMessage(actorId: string, input: { team_id: string; con
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
   const event = appendTeamEvent(input.team_id, 'message', actorId, { content: input.content });
   return { team_id: input.team_id, event_id: event.id, seq: event.seq };
+}
+
+// --- hive_team_rename_nickname ---
+//
+// Self-only: changes the caller's nickname in a team they belong to. Useful
+// when the agent joined without a nickname (and now wants one) or wants to
+// rename the existing one. Pass empty string to clear (display_name fallback
+// then takes over). Writes a 'rename' team event so other members see the
+// change in their team-events stream.
+//
+// Validation:
+//   - caller must be a team member
+//   - new nickname must not collide with another existing member's nickname
+//     (SQLite UNIQUE on (team_id, nickname) — we check up-front for a
+//     clearer error than the raw constraint violation)
+
+export function handleTeamRenameNickname(
+  actorId: string,
+  input: { team_id: string; nickname: string },
+): { team_id: string; team_name: string; previous_nickname: string | null; nickname: string | null } {
+  const team = getTeamById(input.team_id);
+  if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  const me = getTeamMember(team.id, actorId);
+  if (!me) throw new Error(`You are not a member of team "${team.name}"`);
+
+  const normalized = input.nickname.trim();
+  if (normalized) {
+    const conflict = getTeamMembers(team.id).find(
+      m => m.agent_id !== actorId && m.nickname === normalized,
+    );
+    if (conflict) throw new Error(`Nickname "${normalized}" already taken in this team`);
+  }
+
+  const ok = renameTeamMember(team.id, actorId, normalized);
+  if (!ok) throw new Error('Failed to update nickname (member row missing)');
+
+  appendTeamEvent(team.id, 'rename', actorId, {
+    previous: me.nickname,
+    nickname: normalized || null,
+  });
+
+  return {
+    team_id: team.id,
+    team_name: team.name,
+    previous_nickname: me.nickname,
+    nickname: normalized || null,
+  };
+}
+
+// --- hive_team_leave ---
+//
+// Self-only: caller leaves a team they belong to. Writes a 'leave' team
+// event before removing the member row so other members see the departure
+// in their team-events stream (and the actor_agent_id resolves through
+// agents table for display).
+//
+// Constraint: the team's host cannot leave (would orphan host responsibility,
+// including the host-only hive_team_set_rules). Host must transfer host
+// first — but host-transfer is not yet implemented either, so for now the
+// host of a team they want to dissolve has to remove via admin / future tool.
+
+export function handleTeamLeave(
+  actorId: string,
+  input: { team_id: string },
+): { team_id: string; team_name: string } {
+  const team = getTeamById(input.team_id);
+  if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  if (!isTeamMember(team.id, actorId)) {
+    throw new Error(`You are not a member of team "${team.name}"`);
+  }
+  if (team.host_agent_id === actorId) {
+    throw new Error(
+      `You are the host of "${team.name}" and cannot leave. ` +
+      `Transfer host first (not yet supported via MCP) or dissolve the team out-of-band.`,
+    );
+  }
+  // Append event BEFORE removing — once the member row is gone, this still
+  // references the actor by agent_id (team_events.actor_agent_id is the
+  // agents.id, not team_members.id), so display lookups still work.
+  appendTeamEvent(team.id, 'leave', actorId, {});
+  removeTeamMember(team.id, actorId);
+  return { team_id: team.id, team_name: team.name };
 }
 
 // --- hive_team_list (mine) ---

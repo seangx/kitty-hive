@@ -686,6 +686,24 @@ export function removeTeamMember(teamId: string, agentId: string): void {
   getDB().prepare('DELETE FROM team_members WHERE team_id = ? AND agent_id = ?').run(teamId, agentId);
 }
 
+/** Update the nickname of an existing team member. Pass empty string to
+ *  clear (display_name fallback then applies). Returns false if the agent
+ *  isn't a member; throws on UNIQUE conflict (another member in this team
+ *  already uses the nickname). Caller is responsible for resolving conflicts
+ *  before calling — the schema enforces `UNIQUE (team_id, nickname)`. */
+export function renameTeamMember(teamId: string, agentId: string, nickname: string): boolean {
+  const existing = getTeamMember(teamId, agentId);
+  if (!existing) return false;
+  // SQLite treats UNIQUE on a nullable column as "multiple NULLs allowed but
+  // distinct non-null values must be unique". Normalize empty string → null
+  // so `''` doesn't collide with other empty-nickname members.
+  const nick = nickname.trim() === '' ? null : nickname.trim();
+  getDB().prepare(
+    'UPDATE team_members SET nickname = ? WHERE team_id = ? AND agent_id = ?'
+  ).run(nick, teamId, agentId);
+  return true;
+}
+
 export function isTeamMember(teamId: string, agentId: string): boolean {
   const row = getDB().prepare('SELECT 1 FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, agentId);
   return !!row;
