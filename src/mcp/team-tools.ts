@@ -3,6 +3,7 @@ import { z } from 'zod';
 import {
   handleTeamCreate, handleTeamJoin, handleTeamList, handleTeamInfo,
   handleTeamEvents, handleTeamMessage, handleTeamSetRules, handleMyTeams,
+  handleTeamRenameNickname, handleTeamLeave,
 } from '../tools/team.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyTeamMembers } from '../sessions.js';
@@ -150,6 +151,65 @@ export function registerTeamTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = handleMyTeams(agent.id);
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_team_rename_nickname',
+    'Change YOUR nickname in a team you belong to. ' +
+    'Self-only: you can only rename your own nickname, not other members\'. ' +
+    'Pass an empty string to clear (your display_name will be used instead). ' +
+    'The new nickname must be unique within the team (server-checked; conflict → error). ' +
+    'A `rename` team event is appended so other members see the change in hive_team_events.',
+    {
+      as: asParam,
+      team_id: z.string().describe('Team id (find via hive_teams or hive_team_list)'),
+      nickname: z.string().describe('New nickname. Empty string = clear (fall back to display_name).'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTeamRenameNickname(agent.id, { team_id: params.team_id, nickname: params.nickname });
+      await notifyTeamMembers(params.team_id, agent.id, buildPushMessage({
+        type: 'rename',
+        from: result.nickname || agent.display_name,
+        from_agent_id: agent.id,
+        event_id: teamEventId(params.team_id, 'rename'),
+        team_id: params.team_id,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_team_leave',
+    'Leave a team you belong to. ' +
+    'Self-only: you can only remove yourself. ' +
+    'Constraint: if you are the team\'s host you cannot leave (would orphan host-only operations like hive_team_set_rules). ' +
+    'A `leave` team event is appended so other members see the departure in hive_team_events. ' +
+    'You can re-join later with hive_team_join, which gives you a fresh chance to set a nickname.',
+    {
+      as: asParam,
+      team_id: z.string().describe('Team id'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleTeamLeave(agent.id, { team_id: params.team_id });
+      // Notify BEFORE the member-row is gone? Already done: handleTeamLeave
+      // appends the event first, then removes the row, so other members'
+      // hive_team_events sees the leave with proper actor lineage. Push
+      // notifies remaining members (the leaver themselves is excluded via
+      // the from_agent_id arg — they don't need a notification about their
+      // own action).
+      await notifyTeamMembers(params.team_id, agent.id, buildPushMessage({
+        type: 'leave',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: teamEventId(params.team_id, 'leave'),
+        team_id: params.team_id,
+      }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
