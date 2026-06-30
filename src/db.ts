@@ -659,6 +659,41 @@ export function transferTeamHost(teamId: string, newHostAgentId: string): void {
   getDB().prepare('UPDATE teams SET host_agent_id = ? WHERE id = ?').run(newHostAgentId, teamId);
 }
 
+/** Soft-close a team: set closed_at = now. Idempotent — re-closing an
+ *  already-closed team just refreshes the timestamp (rare; not worth
+ *  guarding). Closed teams reject join / message / set_rules / rename /
+ *  leave via the handler-side checks; data is preserved (history readable,
+ *  hive_team_info still works). Use `reopenTeam` to undo. */
+export function closeTeam(teamId: string): void {
+  getDB().prepare('UPDATE teams SET closed_at = ? WHERE id = ?').run(nowISO(), teamId);
+}
+
+/** Undo `closeTeam`: clear closed_at so the team is active again. */
+export function reopenTeam(teamId: string): void {
+  getDB().prepare('UPDATE teams SET closed_at = NULL WHERE id = ?').run(teamId);
+}
+
+/** Hard-delete a team and everything tied to it: events, member rows,
+ *  read cursors pointing at the team. Single transaction. Irreversible —
+ *  callers (CLI `team delete`) should require the team be `closeTeam`-ed
+ *  first as a guard against fat-finger destruction.
+ *
+ *  Tasks bound via source_team_id are NOT deleted (they have their own
+ *  lifecycle) — their source_team_id row reference just dangles; the
+ *  `hive_tasks(team=X)` query returns 0 because the team row is gone.
+ *  If you need to reap orphaned source_team_id refs too, do it in a
+ *  follow-up sweep. */
+export function deleteTeamCascade(teamId: string): void {
+  const d = getDB();
+  const tx = d.transaction(() => {
+    d.prepare('DELETE FROM team_events WHERE team_id = ?').run(teamId);
+    d.prepare('DELETE FROM team_members WHERE team_id = ?').run(teamId);
+    d.prepare("DELETE FROM read_cursors WHERE target_type = 'team' AND target_id = ?").run(teamId);
+    d.prepare('DELETE FROM teams WHERE id = ?').run(teamId);
+  });
+  tx();
+}
+
 export function setTeamRules(teamId: string, rules: string): void {
   getDB().prepare('UPDATE teams SET rules = ? WHERE id = ?').run(rules ?? '', teamId);
 }

@@ -1359,6 +1359,150 @@ function getNodeName(): string {
   return getNodeConfig().name || hostname().split('.')[0];
 }
 
+// --- Team lifecycle: close / reopen / delete ---
+//
+// These are operator-only knobs (no MCP equivalent — agents shouldn't be able
+// to nuke teams). Semantics:
+//   close   - sets closed_at; MCP-side handlers reject join/message/rename/
+//             leave/set_rules on closed teams (already implemented). History
+//             stays readable via hive_team_info/events.
+//   reopen  - clears closed_at; team operational again.
+//   delete  - hard wipe (events + members + read_cursors + team row).
+//             REQUIRES the team to be `close`-ed first as a guard against
+//             fat-finger destruction — operator must do close → delete in
+//             two steps. Source-team-id task rows are NOT touched (they
+//             dangle, but hive_tasks(team=X) returns 0).
+
+async function resolveTeamArg(): Promise<{ teamId: string; teamName: string; team: any }> {
+  const { dbPath } = parseFlags(1);
+  let teamArg = '';
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--yes' || args[i] === '-y') continue;
+    if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; continue; }
+    if (!args[i].startsWith('-') && !teamArg) teamArg = args[i];
+  }
+  initDB(dbPath);
+  const dbMod = await import('./db.js');
+  if (!teamArg) {
+    if (!isInteractive()) {
+      console.error('Usage: kitty-hive team <close|reopen|delete> <team-name-or-id> [--yes]');
+      process.exit(1);
+    }
+    const teams = dbMod.listTeams(false);
+    if (teams.length === 0) { console.log('No teams.'); process.exit(0); }
+    const teamId = await askSelect<string>({
+      message: 'Which team?',
+      options: teams.map(t => ({
+        value: t.id,
+        label: t.name,
+        hint: `${t.closed_at ? 'closed' : 'active'} · ${dbMod.countTeamMembers(t.id)} member(s)`,
+      })),
+    });
+    const team = teams.find(t => t.id === teamId)!;
+    return { teamId: team.id, teamName: team.name, team };
+  }
+  const team = dbMod.getTeamById(teamArg) || dbMod.getTeamByName(teamArg);
+  if (!team) { console.error(`Team "${teamArg}" not found.`); process.exit(1); }
+  return { teamId: team.id, teamName: team.name, team };
+}
+
+function flagYes(): boolean {
+  return args.includes('--yes') || args.includes('-y');
+}
+
+async function cmdTeamClose() {
+  const { teamId, teamName, team } = await resolveTeamArg();
+  const dbMod = await import('./db.js');
+  if (team.closed_at) {
+    console.log(`"${teamName}" is already closed (closed_at=${team.closed_at}).`);
+    process.exit(0);
+  }
+  const memberCount = dbMod.countTeamMembers(teamId);
+  if (!flagYes()) {
+    if (!isInteractive()) {
+      console.error(`"${teamName}" has ${memberCount} member(s). Re-run with --yes to confirm close.`);
+      process.exit(1);
+    }
+    const ok = await askConfirm({
+      message: `Close team "${teamName}" (${memberCount} member(s))? Members can still read history but new joins/messages will be rejected.`,
+      initialValue: true,
+    });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+  dbMod.closeTeam(teamId);
+  dbMod.appendTeamEvent(teamId, 'leave', null, { reason: 'team-close', operator: true });
+  try {
+    const sessionsMod = await import('./sessions.js');
+    await sessionsMod.notifyTeamMembers(teamId, undefined, operatorPush({
+      type: 'team-close',
+      teamId,
+      eventId: `team:${teamId}:close:${Date.now()}`,
+    }));
+  } catch { /* push best-effort */ }
+  console.log(`✅ Closed team "${teamName}" (${memberCount} member(s) notified).`);
+}
+
+async function cmdTeamReopen() {
+  const { teamId, teamName, team } = await resolveTeamArg();
+  const dbMod = await import('./db.js');
+  if (!team.closed_at) {
+    console.log(`"${teamName}" is already active. Nothing to do.`);
+    process.exit(0);
+  }
+  if (!flagYes()) {
+    if (!isInteractive()) {
+      console.error(`Re-run with --yes to confirm reopen of "${teamName}".`);
+      process.exit(1);
+    }
+    const ok = await askConfirm({
+      message: `Reopen team "${teamName}" (was closed at ${team.closed_at})?`,
+      initialValue: true,
+    });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+  dbMod.reopenTeam(teamId);
+  dbMod.appendTeamEvent(teamId, 'join', null, { reason: 'team-reopen', operator: true });
+  try {
+    const sessionsMod = await import('./sessions.js');
+    await sessionsMod.notifyTeamMembers(teamId, undefined, operatorPush({
+      type: 'team-reopen',
+      teamId,
+      eventId: `team:${teamId}:reopen:${Date.now()}`,
+    }));
+  } catch { /* push best-effort */ }
+  console.log(`✅ Reopened team "${teamName}".`);
+}
+
+async function cmdTeamDelete() {
+  const { teamId, teamName, team } = await resolveTeamArg();
+  const dbMod = await import('./db.js');
+  // Guard: require the team be soft-closed first. Forces the operator into a
+  // two-step close → delete cadence; eliminates a class of fat-finger
+  // destruction (deleting an active team with live members). If they really
+  // want one command, they can chain: `close --yes && delete --yes`.
+  if (!team.closed_at) {
+    console.error(`"${teamName}" is still active. Close it first:`);
+    console.error(`  kitty-hive team close ${teamId} --yes`);
+    console.error(`then delete:`);
+    console.error(`  kitty-hive team delete ${teamId} --yes`);
+    process.exit(1);
+  }
+  const memberCount = dbMod.countTeamMembers(teamId);
+  if (!flagYes()) {
+    if (!isInteractive()) {
+      console.error(`"${teamName}" closed at ${team.closed_at}, ${memberCount} member row(s). Re-run with --yes to confirm IRREVERSIBLE delete.`);
+      process.exit(1);
+    }
+    const ok = await askConfirm({
+      message: `IRREVERSIBLY delete team "${teamName}" (${memberCount} member row(s), all events, all read cursors)?`,
+      initialValue: false,
+    });
+    if (!ok) { console.log('Cancelled.'); process.exit(0); }
+  }
+  dbMod.deleteTeamCascade(teamId);
+  console.log(`🗑  Deleted team "${teamName}" (cascade).`);
+}
+
 // --- Peer commands ---
 
 async function cmdPeerAdd() {
@@ -2277,6 +2421,12 @@ Subcommands:
   rules <team> [show|edit|set|clear]                Manage the team's rules / charter (free-form
                                                     markdown; surfaced to all members on hive_start
                                                     + hive_team_info). Default: show.
+  close [<team>] [--yes]                            Soft-close a team. MCP join/message/rename/leave/
+                                                    set_rules will reject; history stays readable.
+  reopen [<team>] [--yes]                           Undo close — team becomes active again.
+  delete [<team>] [--yes]                           Hard-delete a team (events + members + cursors +
+                                                    team row). REQUIRES close first — guard against
+                                                    fat-finger destruction. Irreversible.
 
 Note: agents normally manage teams via the hive-team-* MCP tools.
 This group is for operator-level maintenance (e.g. before removing a host agent).`);
@@ -2396,6 +2546,9 @@ switch (command) {
       case 'transfer': run(cmdTeamTransfer); break;
       case 'kick':     run(cmdTeamKick);     break;
       case 'rules':    run(cmdTeamRules);    break;
+      case 'close':    run(cmdTeamClose);    break;
+      case 'reopen':   run(cmdTeamReopen);   break;
+      case 'delete':   run(cmdTeamDelete);   break;
       default:         showTeamHelp();        break;
     }
     break;

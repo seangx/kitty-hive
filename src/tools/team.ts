@@ -128,6 +128,9 @@ export function handleTeamEvents(actorId: string, input: { team_id: string; sinc
 // --- hive_team_message ---
 
 export function handleTeamMessage(actorId: string, input: { team_id: string; content: string }): { team_id: string; event_id: number; seq: number } {
+  const team = getTeamById(input.team_id);
+  if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  if (team.closed_at) throw new Error('Team is closed');
   if (!isTeamMember(input.team_id, actorId)) throw new Error('Not a member of this team');
   const event = appendTeamEvent(input.team_id, 'message', actorId, { content: input.content });
   return { team_id: input.team_id, event_id: event.id, seq: event.seq };
@@ -153,6 +156,7 @@ export function handleTeamRenameNickname(
 ): { team_id: string; team_name: string; previous_nickname: string | null; nickname: string | null } {
   const team = getTeamById(input.team_id);
   if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  if (team.closed_at) throw new Error('Team is closed');
   const me = getTeamMember(team.id, actorId);
   if (!me) throw new Error(`You are not a member of team "${team.name}"`);
 
@@ -198,6 +202,7 @@ export function handleTeamLeave(
 ): { team_id: string; team_name: string } {
   const team = getTeamById(input.team_id);
   if (!team) throw new Error(`Team not found: ${input.team_id}`);
+  if (team.closed_at) throw new Error('Team is closed');
   if (!isTeamMember(team.id, actorId)) {
     throw new Error(`You are not a member of team "${team.name}"`);
   }
