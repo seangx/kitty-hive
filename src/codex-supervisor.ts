@@ -52,6 +52,24 @@ interface DaemonInfo {
   wsUrl: string | null;
   threadId: string | null;
   readyAt: Date | null;
+  // Set by requestDaemonRespawn (i.e. /admin/codex-set-thread or any other
+  // operator-triggered restart) BEFORE the SIGTERM. The exit handler reads
+  // this to decide the respawn cadence: intentional restart → immediate
+  // respawn + restartCount reset to 0; unintentional crash → exponential
+  // backoff (up to 60s cap) tied to accumulated restartCount.
+  //
+  // The 2026-07-12 my-game incident (restart_count=89, kitty called
+  // set-thread on every session restart) revealed the bug: intentional
+  // respawns were sharing the crash-loop backoff table, so once the
+  // counter climbed past ~6 attempts every subsequent set-thread waited
+  // 60s to spawn — well past kitty's 10s ws-poll timeout. Kitty saw the
+  // daemon as "never ready" even though supervisor was faithfully
+  // respawning it, just slowly.
+  intentionalShutdown?: boolean;
+  // Handle for the "healthy for 30s → clear crash counter" timer scheduled
+  // by markDaemonReady. Cleared on daemon exit so we don't leak a
+  // reference to a dead DaemonInfo. See markDaemonReady() below.
+  healthTimer?: NodeJS.Timeout;
 }
 
 const daemons = new Map<string, DaemonInfo>();
@@ -154,8 +172,12 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   child.stderr?.on('data', (chunk) => process.stderr.write(`${prefix} ${chunk}`));
 
   child.on('exit', (code, signal) => {
+    const wasIntentional = info.intentionalShutdown === true;
+    // Cancel any pending health-timer — the DaemonInfo is about to be
+    // deleted and we don't want the timer firing against a stale ref.
+    if (info.healthTimer) clearTimeout(info.healthTimer);
     daemons.delete(agentId);
-    log('info', `[codex-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal})`);
+    log('info', `[codex-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal}, intentional=${wasIntentional})`);
     if (shuttingDown) return;
 
     // Refresh agent record — it may have been removed or modified
@@ -165,11 +187,20 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
       return;
     }
 
-    // Exponential backoff: 1s, 2s, 4s, 8s, ... cap 60s
-    const delayMs = Math.min(60000, 1000 * Math.pow(2, restartCount));
-    log('warn', `[codex-supervisor] restarting "${fresh.display_name}" in ${delayMs}ms (attempt ${restartCount + 1})`);
+    // Intentional restart (requestDaemonRespawn / operator SIGTERM):
+    // immediate respawn AND clear restartCount. The counter is a
+    // "unwanted crash frequency" signal — a user-driven restart is not
+    // a crash and shouldn't have inflated the backoff table anyway.
+    // Unintentional exit: exponential backoff 1s, 2s, 4s, 8s ... cap 60s
+    const delayMs = wasIntentional ? 0 : Math.min(60000, 1000 * Math.pow(2, restartCount));
+    const nextRestartCount = wasIntentional ? 0 : restartCount + 1;
+    if (wasIntentional) {
+      log('info', `[codex-supervisor] respawning "${fresh.display_name}" immediately (intentional restart, counter reset)`);
+    } else {
+      log('warn', `[codex-supervisor] restarting "${fresh.display_name}" in ${delayMs}ms (attempt ${nextRestartCount})`);
+    }
     setTimeout(() => {
-      spawnDaemon(fresh.id, fresh.display_name, restartCount + 1);
+      spawnDaemon(fresh.id, fresh.display_name, nextRestartCount);
     }, delayMs);
   });
 
@@ -302,6 +333,32 @@ export function markDaemonReady(agentId: string, wsUrl: string, threadId: string
     log('warn', `[codex-supervisor] failed to persist thread_id for ${agentId}: ${err}`);
   }
   log('info', `[codex-supervisor] daemon "${info.displayName}" ready: ws=${wsUrl} thread=${threadId.slice(0, 8)}...`);
+
+  // Crash-loop counter auto-reset: if this daemon stays alive for 30s,
+  // clear restartCount so the next unlucky crash doesn't inherit an
+  // inflated exp-backoff. Rationale: once a daemon is stably running for
+  // ≥30s it's demonstrably not in a tight crash loop; the point of the
+  // backoff table is protection against pathological respawn storms, not
+  // permanent penalty for one bad startup. Without this reset, my-game
+  // (89 crashes) would sit at 60s backoff forever even if the underlying
+  // issue self-resolved. The 30s window is comfortably longer than a
+  // healthy codex app-server startup (~5s) so we don't false-reset.
+  //
+  // Uses the DaemonInfo's own pid to guard against stale timers firing
+  // after the daemon was replaced by a new one — restartCount belongs
+  // to the *current* daemon instance identified by pid.
+  if (info.healthTimer) clearTimeout(info.healthTimer);
+  const originalPid = info.pid;
+  info.healthTimer = setTimeout(() => {
+    const current = daemons.get(agentId);
+    if (current && current.pid === originalPid && current.restartCount !== 0) {
+      log('info', `[codex-supervisor] daemon "${current.displayName}" healthy 30s → reset restartCount ${current.restartCount}→0`);
+      current.restartCount = 0;
+    }
+  }, 30_000);
+  // Don't hold the event loop hostage on shutdown just to check a counter.
+  info.healthTimer.unref?.();
+
   return true;
 }
 
@@ -343,11 +400,18 @@ export function notifyAgentRemoved(agentId: string): boolean {
  *  for a fresh thread when thread_id was cleared).
  *
  *  Two paths:
- *   - Daemon already running → SIGTERM it; supervisor's on-exit handler
- *     respawns automatically (with backoff, but immediate for the first
- *     restart). The new daemon will pick up the fresh agents.thread_id at
- *     its env-injection step.
+ *   - Daemon already running → mark intentionalShutdown, SIGTERM it;
+ *     supervisor's on-exit handler sees the flag, respawns immediately
+ *     (skipping the crash-loop exp backoff) and resets restartCount to 0.
+ *     The new daemon picks up the fresh agents.thread_id at its
+ *     env-injection step.
  *   - No daemon → call notifyAgentCreated (skips if not eligible).
+ *
+ *  The intentionalShutdown flag matters when a daemon has accumulated
+ *  restartCount from previous unrelated crashes: without it, the exit
+ *  handler would apply exp backoff (up to 60s) even though the operator
+ *  just wanted a quick thread swap. Real incident 2026-07-12 (my-game
+ *  restart_count=89) blocked kitty's set-thread flow for 60s per call.
  *
  *  After kicking, polls `daemons.get(agentId)` for readiness every 200ms.
  *  Returns the ready snapshot, or null on timeout. The caller is expected to
@@ -356,7 +420,8 @@ export function notifyAgentRemoved(agentId: string): boolean {
 export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000): Promise<DaemonSnapshot | null> {
   const existing = daemons.get(agentId);
   if (existing) {
-    log('info', `[codex-supervisor] requestDaemonRespawn: SIGTERM existing daemon for "${existing.displayName}" (${agentId.slice(-12)})`);
+    log('info', `[codex-supervisor] requestDaemonRespawn: SIGTERM existing daemon for "${existing.displayName}" (${agentId.slice(-12)}), intentional=true`);
+    existing.intentionalShutdown = true;
     try { existing.child.kill('SIGTERM'); } catch { /* ignore */ }
   } else {
     log('info', `[codex-supervisor] requestDaemonRespawn: no live daemon for ${agentId.slice(-12)}, requesting spawn`);
