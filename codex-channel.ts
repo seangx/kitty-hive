@@ -294,8 +294,15 @@ function onAppserverDeath(reason: string): void {
   appserverDeathHandled = true;
   console.error(`[codex-channel] appserver died: ${reason}`);
   console.error('[codex-channel] exiting daemon — supervisor will respawn with fresh codex app-server');
-  try { appserverWs?.close(); } catch { /* ignore */ }
-  try { appserverProc?.kill('SIGTERM'); } catch { /* ignore */ }
+  // Full group cleanup, NOT just appserverProc.kill(): this path also fires
+  // on WS-level errors while the codex app-server process tree is still
+  // alive. Killing only the direct child leaves the vendor codex binary
+  // (grandchild, same detached group) running and LISTENing forever.
+  // Real incident 2026-07-14: 60+ orphaned app-servers accumulated over a
+  // month of crash exits, drove load past 9, and every fresh app-server then
+  // timed out on thread/resume → death spiral across all 10 daemons after a
+  // serve restart. cleanupAppserver() does the process-group SIGTERM.
+  cleanupAppserver();
   // exit code 2 distinguishes "app-server crash" from "clean shutdown via SIGTERM"
   process.exit(2);
 }
