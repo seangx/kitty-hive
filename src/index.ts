@@ -791,6 +791,7 @@ async function cmdAgentRegister() {
   let tool = '';
   let agentIdOverride = '';
   let projectDir = '';
+  let switchTool = false;
   for (let i = 2; i < args.length; i++) {
     if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
     else if (args[i] === '--display-name' && args[i + 1]) { displayName = args[i + 1]; i++; }
@@ -799,11 +800,13 @@ async function cmdAgentRegister() {
     else if (args[i] === '--tool' && args[i + 1]) { tool = args[i + 1]; i++; }
     else if (args[i] === '--id' && args[i + 1]) { agentIdOverride = args[i + 1]; i++; }
     else if (args[i] === '--project-dir' && args[i + 1]) { projectDir = args[i + 1]; i++; }
+    else if (args[i] === '--switch-tool') { switchTool = true; }
   }
   if (!externalKey && !agentIdOverride && !displayName) {
-    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P]');
+    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P] [--switch-tool]');
     console.error('  All three of --key/--id/--display-name optional, but at least one required.');
     console.error('  --project-dir: working directory hint for codex agents (passed as cwd when supervisor spawns codex app-server).');
+    console.error('  --switch-tool: explicitly allow changing an existing key-matched agent\'s tool (claude⇄codex morph).');
     process.exit(1);
   }
 
@@ -818,18 +821,22 @@ async function cmdAgentRegister() {
       roles: roles || undefined,
       tool: tool || undefined,
       projectDir: projectDir || undefined,
+      switchTool: switchTool || undefined,
     });
     // Stdout: one line, just the agent_id (script-friendly)
     console.log(result.agent_id);
     // Stderr: human context
-    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}${projectDir ? ` cwd=${projectDir}` : ''}`);
+    const switched = result.previous_tool !== null && result.previous_tool !== result.tool;
+    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}${projectDir ? ` cwd=${projectDir}` : ''}${switched ? ` tool: ${result.previous_tool || '(none)'} → ${result.tool}` : ''}`);
 
-    // If serve is running and we registered a tool=codex agent, notify the
-    // supervisor so it can spawn a daemon for it on the fly (without this,
-    // dynamic spawn requires a serve restart because the in-process
-    // onAgentCreated hook lives in serve's process, not this CLI process).
-    // Best-effort: failures are silently ignored — agent row is already written.
-    if (tool === 'codex') {
+    // Supervisor daemon lifecycle follows the FINAL tool value (result.tool,
+    // not the raw --tool flag: handleStart may have refused the change).
+    // Both notifies are best-effort: failures silently ignored — the agent
+    // row is already written, and the supervisor reconciles at next serve boot.
+    //  - tool is now codex   → ensure a daemon exists (idempotent on serve side)
+    //  - tool LEFT codex     → kill the now-orphaned daemon; the supervisor's
+    //    exit handler re-checks agents.tool and won't respawn it.
+    if (result.tool === 'codex') {
       try {
         const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-created`, {
           method: 'POST',
@@ -845,6 +852,21 @@ async function cmdAgentRegister() {
       } catch {
         // serve not running, or admin endpoint not reachable — that's fine,
         // daemon will spawn at the next serve boot.
+      }
+    } else if (result.previous_tool === 'codex') {
+      try {
+        const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-removed`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ agent_id: result.agent_id }),
+          signal: AbortSignal.timeout(2000),
+        });
+        if (notifyRes.ok) {
+          const { killed } = await notifyRes.json() as { killed: boolean };
+          if (killed) console.error(`   → supervisor killed codex daemon (tool switched away)`);
+        }
+      } catch {
+        // serve not running — nothing to kill.
       }
     }
   } catch (err: any) {
@@ -2403,7 +2425,9 @@ Subcommands:
                                                       Hosted teams: pass --transfer-to <agent> to keep them,
                                                       or --cascade to delete them with all members + history.
   register --key <K> --display-name <N> [--roles R]   Idempotent upsert by external_key.
-                                                      Stdout = agent_id (one line). Designed for orchestrator scripts.`);
+                                                      Stdout = agent_id (one line). Designed for orchestrator scripts.
+                                                      --switch-tool allows changing tool on a key-matched agent
+                                                      (claude⇄codex morph); daemon is spawned/killed to match.`);
 }
 
 function showTeamHelp() {

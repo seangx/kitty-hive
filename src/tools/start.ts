@@ -13,6 +13,9 @@ interface StartInput {
   tool?: string;
   expertise?: string;
   projectDir?: string;  // working directory hint (codex agents); set as agent.project_dir
+  switchTool?: boolean; // explicit opt-in to change `tool` on a key-matched agent
+                        // (CLI --switch-tool; NOT exposed via MCP hive_start).
+                        // Unlocks tool only — display_name stays gated.
 }
 
 interface StartOutput {
@@ -20,6 +23,8 @@ interface StartOutput {
   token: string;
   display_name: string;
   teams: Team[];
+  tool: string;                 // agent.tool after this call
+  previous_tool: string | null; // agent.tool before this call; null = freshly created
 }
 
 const ADJECTIVES = ['Swift', 'Calm', 'Bold', 'Keen', 'Warm', 'Wise', 'Fair', 'True', 'Deft', 'Glad'];
@@ -89,6 +94,8 @@ export function handleStart(input: StartInput): StartOutput {
     }
   }
 
+  const previousTool: string | null = agent ? agent.tool : null;
+
   if (!agent) {
     // Create — honor caller-supplied id only if it isn't already taken by a
     // remote placeholder (which we'd otherwise PRIMARY-KEY-conflict against).
@@ -129,12 +136,16 @@ export function handleStart(input: StartInput): StartOutput {
     //                 metadata (roles, expertise) is still fair game.
     const trustIdentityUpdates = matchedVia !== 'key';
 
-    // tool / display_name — gated on trust
+    // tool / display_name — gated on trust. `switchTool` is the explicit
+    // opt-out for the tool field only: kitty's Alt+X morph flips the SAME
+    // session between claude⇄codex, so the key path legitimately carries a
+    // different tool every time. The orchestrator declares intent with
+    // --switch-tool; an accidental stale-env register never passes it.
     if (input.tool && input.tool !== agent.tool) {
-      if (trustIdentityUpdates) {
+      if (trustIdentityUpdates || input.switchTool) {
         updates.push('tool = ?'); params.push(input.tool);
       } else {
-        log('warn', `[start] refusing silent tool change via key path: agent=${agent.id} key="${input.key}" current_tool="${agent.tool}" proposed_tool="${input.tool}". Caller likely has stale env. Use hive_start with explicit id= or call dedicated mutation tools to change tool intentionally.`);
+        log('warn', `[start] refusing silent tool change via key path: agent=${agent.id} key="${input.key}" current_tool="${agent.tool}" proposed_tool="${input.tool}". Caller likely has stale env. Pass --switch-tool (CLI) or use hive_start with explicit id= to change tool intentionally.`);
       }
     }
     if (input.name && input.name !== agent.display_name) {
@@ -175,5 +186,7 @@ export function handleStart(input: StartInput): StartOutput {
     token: agent.token,
     display_name: agent.display_name,
     teams: getAgentTeams(agent.id, true),
+    tool: agent.tool,
+    previous_tool: previousTool,
   };
 }
