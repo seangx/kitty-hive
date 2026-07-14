@@ -11,7 +11,7 @@ import { join } from 'node:path';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
-import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
 
 // Per-agent serialization for /admin/codex-set-thread. Two concurrent
 // callers must not both SIGTERM the daemon — the second would race against
@@ -195,13 +195,16 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
   if (url.pathname === '/admin/codex-daemon-ready' && req.method === 'POST') {
     try {
       const body = JSON.parse(await readBody(req));
-      const { agent_id, ws_url, thread_id } = body;
+      const { agent_id, ws_url, thread_id, control_url } = body;
       if (typeof agent_id !== 'string' || typeof ws_url !== 'string' || typeof thread_id !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'agent_id, ws_url, thread_id all required (strings)' }));
         return;
       }
-      const ok = markDaemonReady(agent_id, ws_url, thread_id);
+      // control_url is optional (older daemons don't send it; a daemon whose
+      // control server failed to start sends null).
+      const controlUrl = typeof control_url === 'string' && control_url ? control_url : null;
+      const ok = markDaemonReady(agent_id, ws_url, thread_id, controlUrl);
       if (!ok) {
         // Daemon wasn't in the supervisor's map — could be a manually-started
         // codex-channel (not via supervisor). Accept the POST silently with a
@@ -306,21 +309,30 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
       }
 
       // Serialize per-agent so concurrent set_thread calls don't trample
-      // each other's SIGTERM / respawn flow.
+      // each other's switch / SIGTERM / respawn flow.
       const result = await lockPerAgent(agent_id, async () => {
         db.setAgentThreadId(agent_id, targetThreadId);
         log('info', `[admin] codex-set-thread agent=${agent_id.slice(-12)} → ${targetThreadId || '(reset)'}`);
+        // Fast path: in-process switch on the live daemon (~1-2s, ws_url
+        // stable). Falls back to the SIGTERM→respawn cycle when the daemon
+        // has no control server (older daemon / control startup failure),
+        // isn't ready, or the switch itself errors. The DB write above is
+        // shared: the respawn path's fresh daemon reads agents.thread_id at
+        // env-injection, and the in-process path passes the same target.
+        const switched = await switchDaemonThread(agent_id, targetThreadId);
+        if (switched) return { snap: switched, mode: 'in-process' as const };
         const snap = await requestDaemonRespawn(agent_id, 30_000);
-        return snap;
+        return { snap, mode: 'respawn' as const };
       });
 
-      if (!result) {
+      if (!result.snap) {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: false,
           thread_id: targetThreadId || null,
           ws_url: null,
           ready: false,
+          mode: result.mode,
           error: 'daemon did not become ready within 30s; poll hive_codex_pane_ws or GET /admin/codex-daemons',
         }));
         return;
@@ -328,9 +340,10 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
-        thread_id: result.thread_id,
-        ws_url: result.ws_url,
+        thread_id: result.snap.thread_id,
+        ws_url: result.snap.ws_url,
         ready: true,
+        mode: result.mode,
       }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });

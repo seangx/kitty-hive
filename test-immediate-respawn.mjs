@@ -196,21 +196,40 @@ async function run() {
       `elapsed ${r.elapsed}ms < 45s (would climb to 60s+ under old code once counter went past ~6)`);
   }
 
-  console.log('\n=== Test 3: DaemonInfo.ws_url updated after each respawn ===');
-  // Each respawn picks a fresh free port for codex app-server. Verify the
-  // /admin snapshot reflects the NEW url, not the stale one — regression
-  // guard against the "returned old snapshot" bug from earlier iterations
-  // (see requestDaemonRespawn's startedAt-vs-startedAt sentinel).
+  console.log('\n=== Test 3: reset via in-process switch keeps ws_url stable ===');
+  // v0.7.8 flipped this expectation: set-thread(null) on a READY daemon now
+  // takes the in-process switch path (no respawn), so ws_url must be
+  // UNCHANGED. (The original "snapshot reflects NEW url after respawn"
+  // regression is still covered implicitly by Test 1/2's fake-thread resumes:
+  // a fake thread makes the in-process resume fail → 500 → fallback respawn,
+  // and those calls' ok/ready assertions read the post-respawn snapshot.)
   {
-    const before = await getDaemon(agent.agent_id);
-    const r = await callSetThread(null);
-    const after = await getDaemon(agent.agent_id);
+    // Ensure the daemon is ready so the in-process path is eligible (test 2's
+    // last fake-resume may have left it mid-respawn). mode=respawn is legal
+    // graceful degradation (e.g. the switch raced a daemon hand-over), so
+    // retry a couple of times — a READY daemon with a control server must
+    // eventually serve the in-process path.
+    let before = null, r = null, after = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      for (let j = 0; j < 60; j++) {
+        const d = await getDaemon(agent.agent_id);
+        if (d && d.ready) break;
+        await new Promise(rr => setTimeout(rr, 500));
+      }
+      before = await getDaemon(agent.agent_id);
+      r = await callSetThread(null);
+      after = await getDaemon(agent.agent_id);
+      if (r.body.mode === 'in-process') break;
+      console.log(`  (info: attempt ${attempt + 1} degraded to respawn — retrying)`);
+    }
     ok(before && after, 'both snapshots present');
     if (before && after) {
-      ok(before.ws_url !== after.ws_url,
-        `ws_url changed (${before.ws_url} → ${after.ws_url})`);
+      ok(r.body.mode === 'in-process', `mode=in-process (got ${r.body.mode})`);
+      ok(before.ws_url === after.ws_url,
+        `ws_url unchanged (${before.ws_url})`);
+      ok(before.pid === after.pid, `pid unchanged (${before.pid})`);
       ok(r.body.ws_url === after.ws_url,
-        `set-thread response ws_url matches new daemon snapshot`);
+        `set-thread response ws_url matches daemon snapshot`);
     }
   }
 

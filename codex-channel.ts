@@ -34,6 +34,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
+import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
 import { TurnTracker, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
@@ -282,6 +283,8 @@ let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outs
 let threadId: string | null = null;
 let appserverDeathHandled = false;  // guard so multiple death signals only exit once
 let turnTracker: TurnTracker | null = null;
+let controlServer: HttpServer | null = null;
+let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
 
 /** Called when EITHER codex app-server child process dies post-ready OR the WS
  *  closes / errors. Both fire together when app-server crashes. Exits the
@@ -478,7 +481,17 @@ async function setupAppserver(): Promise<void> {
     threadId!,
   );
 
-  // 2a. Announce ready signal back to hive supervisor so kitty-kitty (or any
+  // 2a. Start the control server (in-process thread switch entry point), then
+  // announce ready — the announce carries control_url so the supervisor can
+  // drive switches. Control-server failure is non-fatal: the daemon still
+  // works, set-thread just falls back to the SIGTERM respawn path.
+  await startControlServer().catch(err => {
+    controlServer = null;
+    controlUrl = null;
+    console.error('[codex-channel] control server failed to start (set-thread falls back to respawn):', err);
+  });
+
+  // 2b. Announce ready signal back to hive supervisor so kitty-kitty (or any
   // other launcher) can query the (ws_url, thread_id) pair via
   // hive_codex_pane_ws / GET /admin/codex-daemons. Best-effort: failure here
   // just means the daemon's pane info isn't immediately discoverable; daemon
@@ -493,11 +506,7 @@ async function setupAppserver(): Promise<void> {
   // hive_start binding that the thread previously made. Inject a short
   // re-bind notice so codex calls hive_start again before the next event.
   if (resumed) {
-    const rebind = [
-      `[kitty-hive] daemon restarted — your MCP session is fresh.`,
-      `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
-      `before handling the next event. Then wait silently for the next push.`,
-    ].join('\n');
+    const rebind = buildRebindText();
     // Fire-and-forget: codex creates the turn immediately on turn/start, so
     // proceeding to listenSSE doesn't lose the intro. Awaiting was the cause
     // of the 2026-05-27 "daemon blocks for 10 min on a stuck intro turn"
@@ -516,30 +525,7 @@ async function setupAppserver(): Promise<void> {
         console.error('[codex-channel] rebind intro turn promise rejected:', err);
       });
   } else {
-    const intro = [
-      `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
-      ``,
-      `You are running inside a persistent codex thread driven by the kitty-hive`,
-      `codex-channel daemon. The daemon will inject one short message per hive`,
-      `event into this thread; you handle the event and wait for the next.`,
-      ``,
-      `FIRST ACTION: call hive_start({ id: "${agentId}" }) to bind your MCP`,
-      `session to your hive identity. This makes every hive_* tool call run`,
-      `as you (not as a new agent). Do this BEFORE handling the first event.`,
-      `NOTE: if you ever see a "[kitty-hive] daemon restarted" notice, call`,
-      `hive_start again — the daemon process restarted and the MCP binding`,
-      `was lost (but this thread's history was preserved).`,
-      ``,
-      `For each event:`,
-      `- Push notifications are id-only by design — call the fetch tool the`,
-      `  daemon points to (hive_dm_read / hive_check / hive_team_events /`,
-      `  hive_team_info) BEFORE acting on the event content.`,
-      `- Handle per type (DM, task-propose, step-start, awaiting_approval,`,
-      `  team-message, ...) using the matching hive_* tools.`,
-      `- When done, just stop. The next event will arrive as a new turn.`,
-      ``,
-      `Acknowledge readiness briefly, then wait for the first event.`,
-    ].join('\n');
+    const intro = buildIntroText();
     // Same fire-and-forget pattern as the rebind branch above — daemon must
     // not block on intro turn completion. See the rebind comment for why.
     void sendTurn(intro, { eventId: `daemon-intro:${threadId}:${Date.now()}` })
@@ -552,6 +538,145 @@ async function setupAppserver(): Promise<void> {
         console.error('[codex-channel] startup intro turn promise rejected:', err);
       });
   }
+}
+
+/** Full agent brief injected into a brand-new thread (first spawn, or an
+ *  in-process reset to a fresh thread). */
+function buildIntroText(): string {
+  return [
+    `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
+    ``,
+    `You are running inside a persistent codex thread driven by the kitty-hive`,
+    `codex-channel daemon. The daemon will inject one short message per hive`,
+    `event into this thread; you handle the event and wait for the next.`,
+    ``,
+    `FIRST ACTION: call hive_start({ id: "${agentId}" }) to bind your MCP`,
+    `session to your hive identity. This makes every hive_* tool call run`,
+    `as you (not as a new agent). Do this BEFORE handling the first event.`,
+    `NOTE: if you ever see a "[kitty-hive] daemon restarted" notice, call`,
+    `hive_start again — the daemon process restarted and the MCP binding`,
+    `was lost (but this thread's history was preserved).`,
+    ``,
+    `For each event:`,
+    `- Push notifications are id-only by design — call the fetch tool the`,
+    `  daemon points to (hive_dm_read / hive_check / hive_team_events /`,
+    `  hive_team_info) BEFORE acting on the event content.`,
+    `- Handle per type (DM, task-propose, step-start, awaiting_approval,`,
+    `  team-message, ...) using the matching hive_* tools.`,
+    `- When done, just stop. The next event will arrive as a new turn.`,
+    ``,
+    `Acknowledge readiness briefly, then wait for the first event.`,
+  ].join('\n');
+}
+
+/** Short re-bind notice injected when an existing thread is (re)attached —
+ *  daemon respawn resume, or in-process switch to a historical thread. The
+ *  thread's history has the full brief already; it just needs to re-assert
+ *  its hive identity in case the MCP session binding was lost. */
+function buildRebindText(): string {
+  return [
+    `[kitty-hive] daemon restarted — your MCP session is fresh.`,
+    `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
+    `before handling the next event. Then wait silently for the next push.`,
+  ].join('\n');
+}
+
+// ===== In-process thread switch (control server) =====
+// The supervisor drives clear-conversation / thread-pin via
+// POST <controlUrl>/switch-thread { thread_id: string | "" } — the daemon
+// swaps threads on the SAME codex app-server instead of dying for a full
+// SIGTERM→respawn cycle (~9s incl. codex startup; in-process is ~1-2s).
+// ws_url stays stable across switches, so an attached pane survives.
+//
+// Serialized with a promise chain: two concurrent switches would race
+// threadId/turnTracker updates. The supervisor also serializes per-agent
+// upstream, but the daemon defends itself regardless of caller discipline.
+
+let switchChain: Promise<unknown> = Promise.resolve();
+
+async function performThreadSwitch(target: string): Promise<{ ok: boolean; thread_id?: string; error?: string }> {
+  if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1) {
+    return { ok: false, error: 'daemon not in appserver mode (or WS not open)' };
+  }
+  try {
+    if (target) {
+      const resp = await rpcCall('thread/resume', { threadId: target });
+      const resumedId = resp?.thread?.id;
+      if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
+      threadId = resumedId;
+      console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (${resp?.thread?.turns?.length ?? 0} turns)`);
+    } else {
+      const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
+      const newId = resp?.thread?.id;
+      if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
+      threadId = newId;
+      console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
+    }
+    turnTracker?.setThreadId(threadId!);
+    // Re-announce so the supervisor snapshot + agents.thread_id pick up the
+    // new thread (same ws_url). Await it: the caller (set-thread endpoint)
+    // reads the snapshot right after we respond.
+    await announceReady().catch(err => {
+      console.error('[codex-channel] switch: failed to re-announce ready:', err);
+    });
+    // Brief the thread (fire-and-forget, same policy as boot): fresh thread
+    // gets the full intro; resumed thread gets the short re-bind notice.
+    const briefText = target ? buildRebindText() : buildIntroText();
+    const briefKind = target ? 'switch-rebind' : 'switch-intro';
+    void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
+      .then((outcome) => {
+        if (outcome.kind !== 'completed') {
+          console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind}`);
+        }
+      })
+      .catch((err) => console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err));
+    return { ok: true, thread_id: threadId! };
+  } catch (err: any) {
+    return { ok: false, error: String(err?.message || err) };
+  }
+}
+
+async function startControlServer(): Promise<void> {
+  const port = await pickFreePort();
+  controlServer = createHttpServer((req, res) => {
+    // Loopback-only by bind address (127.0.0.1); no auth needed beyond that —
+    // same trust model as the hive admin endpoints.
+    if (req.method === 'POST' && req.url === '/switch-thread') {
+      const chunks: Buffer[] = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        let target = '';
+        try {
+          const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+          if (!('thread_id' in body)) throw new Error('thread_id required (use "" or null to reset)');
+          if (body.thread_id !== null && typeof body.thread_id !== 'string') throw new Error('thread_id must be string or null');
+          target = (body.thread_id ?? '').trim();
+        } catch (err: any) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
+          return;
+        }
+        const run = switchChain.catch(() => undefined).then(() => performThreadSwitch(target));
+        switchChain = run;
+        run.then((result) => {
+          res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        }).catch((err) => {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
+        });
+      });
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'unknown control endpoint' }));
+  });
+  await new Promise<void>((resolve, reject) => {
+    controlServer!.on('error', reject);
+    controlServer!.listen(port, '127.0.0.1', () => resolve());
+  });
+  controlUrl = `http://127.0.0.1:${port}`;
+  console.error(`[codex-channel] control server listening at ${controlUrl}`);
 }
 
 /** Tell the hive supervisor (the parent process that spawned us) that we have
@@ -568,6 +693,7 @@ async function announceReady(): Promise<void> {
       agent_id: agentId,
       ws_url: appserverWsUrl,
       thread_id: threadId,
+      control_url: controlUrl,
     }),
   });
   if (!res.ok) {
@@ -832,6 +958,11 @@ async function setupPushMode() {
 }
 
 function cleanupAppserver() {
+  if (controlServer) {
+    try { controlServer.close(); } catch { /* ignore */ }
+    controlServer = null;
+    controlUrl = null;
+  }
   if (appserverWs) {
     try { appserverWs.close(); } catch { /* ignore */ }
     appserverWs = null;
