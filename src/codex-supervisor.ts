@@ -98,6 +98,16 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   if (shuttingDown) return;
   if (daemons.has(agentId)) return; // already running
 
+  // Re-check eligibility at spawn time, not just at scheduling time. A crash
+  // backoff setTimeout can be pending for up to 60s; if the agent's tool was
+  // switched away from codex in that window (claude⇄codex morph via
+  // `agent register --switch-tool`), the deferred spawn must not fire.
+  const eligible = getAgentById(agentId);
+  if (!eligible || eligible.tool !== 'codex' || eligible.origin_peer !== '') {
+    log('info', `[codex-supervisor] skip spawn for "${displayName}" (${agentId.slice(-12)}): agent deleted / tool changed / now remote`);
+    return;
+  }
+
   let scriptPath: string;
   try {
     scriptPath = locateCodexChannelScript();
