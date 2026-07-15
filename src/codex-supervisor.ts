@@ -426,7 +426,12 @@ export function notifyAgentRemoved(agentId: string): boolean {
  *  codex-daemon-ready during the switch (updating info.threadId +
  *  agents.thread_id via markDaemonReady) before its control response returns,
  *  so the snapshot we build afterwards is already fresh. */
-export async function switchDaemonThread(agentId: string, threadId: string, timeoutMs = 15_000): Promise<DaemonSnapshot | null> {
+// Default generously sized: codex 0.144's thread/start//resume can block
+// ~30s+ on its models-refresh hang (see THREAD_RPC_TIMEOUT_MS in
+// codex-channel.ts). A timeout here falls back to the SIGTERM respawn path,
+// which pays the SAME slow thread call again plus a full codex boot — so
+// waiting longer is strictly cheaper than timing out early.
+export async function switchDaemonThread(agentId: string, threadId: string, timeoutMs = 150_000): Promise<DaemonSnapshot | null> {
   const info = daemons.get(agentId);
   if (!info || !info.readyAt || !info.controlUrl) {
     log('info', `[codex-supervisor] switchDaemonThread: no in-process path for ${agentId.slice(-12)} (daemon=${!!info} ready=${!!info?.readyAt} control=${!!info?.controlUrl})`);

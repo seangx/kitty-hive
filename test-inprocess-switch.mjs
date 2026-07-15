@@ -196,10 +196,13 @@ async function run() {
   ok(r1.body.ws_url === d0.ws_url, `ws_url UNCHANGED (${r1.body.ws_url})`);
   ok(typeof r1.body.thread_id === 'string' && r1.body.thread_id !== firstThread,
     `thread_id changed (${firstThread?.slice(0, 8)}… → ${r1.body.thread_id?.slice(0, 8)}…)`);
-  // Loose budget: under suite load (multiple concurrent codex spawns) the
-  // observed range is 2-12s. Speed proof is secondary — mode=in-process +
-  // unchanged pid below are the hard no-respawn evidence.
-  ok(r1.elapsed < 15_000, `elapsed ${r1.elapsed}ms < 15s (respawn path was ~9-20s + loses the pane)`);
+  // Loose budget: codex 0.144's thread/start blocks ~30s on its
+  // models-refresh hang (openai/codex#14795-family; measured 27-37s on this
+  // machine regardless of cache state), so in-process elapsed = vendor hang
+  // + our overhead. Speed proof is secondary — mode=in-process + unchanged
+  // pid below are the hard no-respawn evidence. Tighten back to ~15s once
+  // the vendor bug is fixed.
+  ok(r1.elapsed < 60_000, `elapsed ${r1.elapsed}ms < 60s (vendor thread/start hang dominates; respawn path pays it twice)`);
   const d1 = await getDaemon(agent.agent_id);
   ok(d1.pid === d0.pid, `daemon pid UNCHANGED (${d0.pid}) — no respawn happened`);
   ok(d1.restart_count === 0, `restart_count still 0 (got ${d1.restart_count})`);
