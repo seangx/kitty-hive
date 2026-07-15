@@ -98,11 +98,21 @@ export class TurnTracker {
 
   constructor(
     private readonly transport: RpcTransport,
-    private readonly threadId: string,
+    private threadId: string,
     opts: TurnTrackerOptions = {},
   ) {
     this.turnTimeoutMs = opts.turnTimeoutMs ?? 600_000;
     this.onOutcome = opts.onOutcome;
+  }
+
+  /** Retarget future `turn/start` calls at a different codex thread. Used by
+   *  the in-process thread switch (daemon stays alive, thread changes).
+   *  In-flight waiters are unaffected: notifications route by turnId, so a
+   *  turn started on the old thread still resolves normally. The
+   *  injectedEventIds set is intentionally kept — event ids are globally
+   *  unique, and a switch must not reopen the duplicate-inject window. */
+  setThreadId(threadId: string): void {
+    this.threadId = threadId;
   }
 
   /** Issue `turn/start` and resolve when codex reports the turn's terminal

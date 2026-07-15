@@ -52,6 +52,10 @@ interface DaemonInfo {
   wsUrl: string | null;
   threadId: string | null;
   readyAt: Date | null;
+  // Daemon's local control-server base URL (http://127.0.0.1:<port>), used
+  // for in-process thread switches. null when the daemon predates the
+  // control server or it failed to start — switch falls back to respawn.
+  controlUrl: string | null;
   // Set by requestDaemonRespawn (i.e. /admin/codex-set-thread or any other
   // operator-triggered restart) BEFORE the SIGTERM. The exit handler reads
   // this to decide the respawn cadence: intentional restart → immediate
@@ -170,7 +174,7 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   const info: DaemonInfo = {
     agentId, displayName, child, pid: child.pid,
     startedAt: new Date(), restartCount,
-    wsUrl: null, threadId: null, readyAt: null,
+    wsUrl: null, threadId: null, readyAt: null, controlUrl: null,
   };
   daemons.set(agentId, info);
 
@@ -284,6 +288,7 @@ export interface DaemonSnapshot {
   ws_url: string | null;
   thread_id: string | null;
   ready: boolean;
+  control_url: string | null;
 }
 
 export function getDaemonSnapshots(): DaemonSnapshot[] {
@@ -297,6 +302,7 @@ export function getDaemonSnapshots(): DaemonSnapshot[] {
     ws_url: info.wsUrl,
     thread_id: info.threadId,
     ready: !!info.readyAt,
+    control_url: info.controlUrl,
   }));
 }
 
@@ -324,18 +330,20 @@ export function getDaemonForAgent(
     ws_url: info.wsUrl,
     thread_id: info.threadId,
     ready: !!info.readyAt,
+    control_url: info.controlUrl,
   };
 }
 
 /** Called by /admin/codex-daemon-ready when a daemon's codex app-server is up
  *  and its thread is created. Stores ws_url + thread_id on the DaemonInfo so
  *  outside callers can attach via `codex --remote <ws_url>`. */
-export function markDaemonReady(agentId: string, wsUrl: string, threadId: string): boolean {
+export function markDaemonReady(agentId: string, wsUrl: string, threadId: string, controlUrl?: string | null): boolean {
   const info = daemons.get(agentId);
   if (!info) return false;
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
+  if (controlUrl !== undefined) info.controlUrl = controlUrl;
   // Persist thread_id so next spawn (after daemon kill / serve restart) can
   // resume the same codex thread instead of starting fresh. Idempotent —
   // setting the same id is a cheap UPDATE.
@@ -403,6 +411,50 @@ export function notifyAgentRemoved(agentId: string): boolean {
   return true;
 }
 
+/** Try an IN-PROCESS thread switch: POST to the daemon's control server so it
+ *  swaps threads on its live codex app-server (thread/resume or thread/start)
+ *  without dying. ~1-2s vs ~9s for the SIGTERM→respawn cycle, and ws_url
+ *  stays stable so an attached pane survives.
+ *
+ *  Returns the updated snapshot on success, or null when the in-process path
+ *  is unavailable/failed — caller falls back to requestDaemonRespawn. Reasons
+ *  for null: no live daemon, daemon not ready yet, daemon predates the
+ *  control server (no controlUrl), control request errored or timed out.
+ *
+ *  `threadId` semantics mirror /admin/codex-set-thread: non-empty → resume
+ *  that thread; empty string → reset to a fresh thread. The daemon re-POSTs
+ *  codex-daemon-ready during the switch (updating info.threadId +
+ *  agents.thread_id via markDaemonReady) before its control response returns,
+ *  so the snapshot we build afterwards is already fresh. */
+export async function switchDaemonThread(agentId: string, threadId: string, timeoutMs = 15_000): Promise<DaemonSnapshot | null> {
+  const info = daemons.get(agentId);
+  if (!info || !info.readyAt || !info.controlUrl) {
+    log('info', `[codex-supervisor] switchDaemonThread: no in-process path for ${agentId.slice(-12)} (daemon=${!!info} ready=${!!info?.readyAt} control=${!!info?.controlUrl})`);
+    return null;
+  }
+  try {
+    const res = await fetch(`${info.controlUrl}/switch-thread`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ thread_id: threadId }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await res.json().catch(() => null) as { ok?: boolean; thread_id?: string; error?: string } | null;
+    if (!res.ok || !body?.ok || !body.thread_id) {
+      log('warn', `[codex-supervisor] switchDaemonThread failed for "${info.displayName}": ${body?.error || `http ${res.status}`} — falling back to respawn`);
+      return null;
+    }
+    // markDaemonReady normally already ran via the daemon's re-announce, but
+    // don't depend on that ordering — set the authoritative value here too.
+    info.threadId = body.thread_id;
+    log('info', `[codex-supervisor] in-process thread switch for "${info.displayName}": → ${body.thread_id.slice(0, 8)}... (ws unchanged)`);
+    return getDaemonForAgent({ agentId });
+  } catch (err: any) {
+    log('warn', `[codex-supervisor] switchDaemonThread error for "${info.displayName}": ${err?.message || err} — falling back to respawn`);
+    return null;
+  }
+}
+
 /** Force a daemon to (re)spawn for an agent, then wait up to `timeoutMs` for
  *  it to reach ready state. Used by /admin/codex-set-thread when the caller
  *  has just mutated agents.thread_id and needs the daemon to pick up the
@@ -463,6 +515,7 @@ export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000):
       ws_url: snap.wsUrl,
       thread_id: snap.threadId,
       ready: true,
+      control_url: snap.controlUrl,
     };
   }
   return null;

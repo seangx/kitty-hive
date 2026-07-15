@@ -2397,6 +2397,7 @@ Top-level commands:
   init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|codex|antigravity|all)
   codex-channel [--name X] [--profile P]     Run a long-lived codex agent that receives hive push events
   status [--port 4123]                       Server & agent status
+  version | --version | -V                   Print version (bare semver on stdout)
 
 Command groups:
   agent      Manage local agents       (list, rename, remove, register)
@@ -2619,6 +2620,20 @@ switch (command) {
       case 'team': run(cmdLogTeam); break;
       case 'task': run(cmdLogTask); break;
       default:     showLogHelp();   break;
+    }
+    break;
+  case 'version':
+  case '--version':
+  case '-V':
+    // Bare semver on stdout — orchestrators (kitty) gate feature flags on
+    // this. Read from the installed package.json so npm-linked dev checkouts
+    // report their working-tree version.
+    try {
+      const pkg = JSON.parse(readFileSync(join(__dirname, '..', 'package.json'), 'utf8'));
+      console.log(pkg.version);
+    } catch (err: any) {
+      console.error(`failed to read package.json: ${err?.message ?? err}`);
+      process.exit(1);
     }
     break;
   case 'help':
