@@ -10,6 +10,15 @@ const TRANSITIONS: Record<string, TaskStatus> = {
   'in_progress:task-fail': 'failed',
   'created:task-cancel': 'canceled',
   'in_progress:task-cancel': 'canceled',
+  // 'proposing' is NOT workflow-only: handleTaskCreate/handleTaskClaim put
+  // every assigned/claimed task into 'proposing' ("workflow proposal
+  // expected"), but for simple tasks that proposal never comes. Without
+  // these entries a plain assigned task could neither complete nor cancel —
+  // real incident 2026-07-15: an agent's task stuck in 'proposing' returning
+  // "Invalid task transition" on every cancel attempt.
+  'proposing:task-complete': 'completed',
+  'proposing:task-fail': 'failed',
+  'proposing:task-cancel': 'canceled',
 };
 
 const TERMINAL: Set<TaskStatus> = new Set(['completed', 'failed', 'canceled']);

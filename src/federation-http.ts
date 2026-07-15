@@ -11,6 +11,7 @@ import { storeFileFromBuffer } from './files.js';
 import {
   handleTaskCreate, handleWorkflowPropose, handleWorkflowApprove,
   handleStepComplete, handleStepApprove, handleWorkflowReject, handleTaskClaim, handleTaskCancel,
+  handleTaskComplete,
 } from './tools/task.js';
 import { notifyAgents, notifyTaskParticipants } from './sessions.js';
 import { buildPushMessage } from './preview.js';
@@ -337,6 +338,10 @@ export async function handleFederation(req: IncomingMessage, res: ServerResponse
         case 'task-cancel':
           handleTaskCancel(task_id, remoteAgent.id, reason);
           action = { type: 'task-cancel' };
+          break;
+        case 'task-complete':
+          handleTaskComplete(task_id, remoteAgent.id, stepResult);
+          action = { type: 'task-complete' };
           break;
         default:
           res.writeHead(400, { 'Content-Type': 'application/json' });
