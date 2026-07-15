@@ -258,3 +258,65 @@ export class TurnTracker {
     this.waiters.clear();
   }
 }
+
+// ===== Headless server→client request policy =====
+// codex app-server sends JSON-RPC REQUESTS to its client (approval
+// elicitations, exec approvals, permission grants) and BLOCKS the turn until
+// answered. A headless daemon has no human to ask, so every request must get
+// a deterministic answer — silence hangs the turn for the full tracker
+// timeout and the event is lost (2026-07-15 incident: codex 0.144 update
+// made every event turn dead at the first approval-gated hive tool call).
+//
+// Pure function so the policy is unit-testable; codex-channel.ts just sends
+// whatever this returns.
+
+export type ServerRequestAnswer =
+  | { kind: 'result'; payload: unknown }
+  | { kind: 'error'; payload: { code: number; message: string } };
+
+/** Best-effort form fill for approval elicitations we ACCEPT: prefer the
+ *  affirmative enum option per field; persist choices prefer 'session' (never
+ *  'always' — a headless daemon must not permanently rewrite user config). */
+export function synthesizeElicitationContent(schema: unknown): Record<string, unknown> {
+  const props = (schema as any)?.properties;
+  if (!props || typeof props !== 'object') return {};
+  const PRIORITY = ['approve', 'accept', 'allow', 'yes', 'session', 'true'];
+  const out: Record<string, unknown> = {};
+  for (const [key, spec] of Object.entries<any>(props)) {
+    if (Array.isArray(spec?.enum) && spec.enum.length > 0) {
+      const pick = PRIORITY.map(pref => spec.enum.find((e: any) => String(e).toLowerCase() === pref)).find(v => v !== undefined);
+      out[key] = pick ?? spec.enum[0];
+    } else if (spec?.type === 'boolean') {
+      out[key] = true;
+    } else if (spec?.default !== undefined) {
+      out[key] = spec.default;
+    } else if (spec?.type === 'number' || spec?.type === 'integer') {
+      out[key] = 0;
+    } else {
+      out[key] = 'approve';
+    }
+  }
+  return out;
+}
+
+/** Decide the answer for a server→client request. Policy:
+ *   - hive MCP elicitations → accept (spawn-time approval_mode=auto overrides
+ *     should prevent these entirely; this is the net under the net)
+ *   - everything else → decline/refuse. Failing one tool call lets the turn
+ *     FINISH; a headless daemon must never self-grant shell or fs access. */
+export function answerServerRequest(method: string, params: any): ServerRequestAnswer {
+  const p = params ?? {};
+  if (method === 'mcpServer/elicitation/request') {
+    if (p.serverName === 'hive') {
+      return { kind: 'result', payload: { action: 'accept', content: synthesizeElicitationContent(p.requestedSchema) } };
+    }
+    return { kind: 'result', payload: { action: 'decline', content: null } };
+  }
+  if (method === 'item/commandExecution/requestApproval' || method === 'execCommandApproval' || method === 'applyPatchApproval') {
+    return { kind: 'result', payload: { decision: 'decline' } };
+  }
+  if (method === 'item/permissions/requestApproval') {
+    return { kind: 'result', payload: { scope: 'turn', permissions: {} } };
+  }
+  return { kind: 'error', payload: { code: -32601, message: `codex-channel daemon cannot handle ${method} (headless)` } };
+}

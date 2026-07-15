@@ -35,7 +35,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { TurnTracker, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { TurnTracker, answerServerRequest, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -326,6 +326,32 @@ function pickFreePort(): Promise<number> {
   });
 }
 
+/** Hive tool names, fetched live from the hive MCP server (tools/list) so
+ *  new tools automatically get the headless approval override. Static
+ *  fallback covers "hive briefly unreachable" — better a possibly-stale
+ *  list than spawning with zero overrides and hanging every turn. */
+const HIVE_TOOLS_FALLBACK = [
+  'hive_start', 'hive_whoami', 'hive_rename', 'hive_update_role', 'hive_agents',
+  'hive_dm', 'hive_dm_read', 'hive_inbox', 'hive_file_fetch',
+  'hive_task', 'hive_tasks', 'hive_task_claim', 'hive_task_cancel', 'hive_task_complete', 'hive_check',
+  'hive_workflow_propose', 'hive_workflow_approve', 'hive_workflow_reject',
+  'hive_workflow_step_complete', 'hive_workflow_step_approve',
+  'hive_team_create', 'hive_team_join', 'hive_team_leave', 'hive_team_list', 'hive_teams',
+  'hive_team_info', 'hive_team_events', 'hive_team_message', 'hive_team_set_rules', 'hive_team_rename_nickname',
+  'hive_peers', 'hive_remote_agents', 'hive_codex_pane_ws',
+];
+
+async function listHiveToolNames(): Promise<string[]> {
+  try {
+    const result = await hivePost('tools/list', {});
+    const names = (result?.tools ?? []).map((t: any) => t.name).filter((n: any) => typeof n === 'string' && /^[a-z0-9_]+$/.test(n));
+    if (names.length > 0) return names;
+  } catch (err) {
+    console.error(`[codex-channel] tools/list failed, using static hive tool list: ${err}`);
+  }
+  return HIVE_TOOLS_FALLBACK;
+}
+
 async function setupAppserver(): Promise<void> {
   if (typeof (globalThis as any).WebSocket !== 'function') {
     throw new Error('global WebSocket not available (need Node 22+); set CODEX_CHANNEL_MODE=exec');
@@ -343,18 +369,27 @@ async function setupAppserver(): Promise<void> {
   // (which auto-calls hive_start to bind the codex thread's MCP session)
   // doesn't hang waiting for an approval dialog that has no human attached.
   //
-  // Background: users typically set `[mcp_servers.hive.tools.hive_start]
-  // approval_mode = "approve"` in ~/.codex/config.toml so a Claude or codex
-  // they're interacting with prompts before identifying. But the headless
-  // daemon's intro turn fires before any user attaches to the pane — there's
-  // no UI to click approve, so the tool call hangs (real incident 2026-05-27,
-  // monkeys-tester pane saw "Working (16m12s)" because hive_start never
-  // completed). Overriding via `-c` is per-spawn and doesn't touch the
-  // user's other codex sessions.
+  // Background: users typically set `approval_mode = "approve"` per hive
+  // tool in ~/.codex/config.toml so a codex they're INTERACTING with prompts
+  // before acting. But the headless daemon has no human to click approve —
+  // any approval-gated tool call hangs the turn forever (real incidents:
+  // 2026-05-27 hive_start "Working (16m12s)"; 2026-07-15 codex 0.144 update
+  // → EVERY event turn dead at first hive tool call, all pushes looked
+  // broken). Per-tool `-c` overrides are the deterministic fix: explicit
+  // tool-level entries beat the user's, and they're per-spawn — the user's
+  // interactive codex sessions keep their approval prompts.
+  //
+  // NOTE codex config precedence: tool-level > server default. A single
+  // `default_tools_approval_mode` override would LOSE to the user's explicit
+  // per-tool "approve" entries, so we must override every tool by name.
+  const approvalOverrides: string[] = [];
+  for (const t of await listHiveToolNames()) {
+    approvalOverrides.push('-c', `mcp_servers.hive.tools.${t}.approval_mode="auto"`);
+  }
   appserverProc = spawn(CODEX_CMD, [
     'app-server',
     '--listen', `ws://127.0.0.1:${port}`,
-    '-c', 'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
+    ...approvalOverrides,
   ], {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
@@ -426,6 +461,15 @@ async function setupAppserver(): Promise<void> {
         if (msg.error) pending.reject(new Error(`codex rpc error: ${JSON.stringify(msg.error)}`));
         else pending.resolve(msg.result);
       }
+      return;
+    }
+    // Server→client REQUEST (has both id and method): codex is waiting for
+    // an answer and the turn is BLOCKED until one arrives. A headless daemon
+    // that stays silent hangs the turn until our 10-min tracker timeout and
+    // the event is lost (2026-07-15 incident: codex 0.144 routes approval
+    // elicitations here; every push looked dead). Always answer.
+    if (msg.id != null && msg.method) {
+      handleServerRequest(msg);
       return;
     }
     // Notification — let the tracker route turn-related ones by turn id.
@@ -712,6 +756,29 @@ async function announceReady(): Promise<void> {
     throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
   }
   console.error(`[codex-channel] announced ready: ws=${appserverWsUrl} thread=${threadId.slice(0, 8)}...`);
+}
+
+/** Answer a server→client JSON-RPC request from codex app-server. The
+ *  decision policy lives in codex-channel-runtime's answerServerRequest()
+ *  (pure, unit-tested); this wrapper just logs and sends. */
+function handleServerRequest(msg: { id: number; method: string; params?: any }): void {
+  const answer = answerServerRequest(msg.method, msg.params);
+  const p = msg.params ?? {};
+  const detail = (p.message || p.reason || p.command || '').toString().slice(0, 120);
+  if (answer.kind === 'result') {
+    const verb = JSON.stringify(answer.payload).includes('"accept"') ? 'auto-accepting' : 'declining';
+    console.error(`[codex-channel] ${verb} server request ${msg.method}${p.serverName ? ` (server=${p.serverName})` : ''}: ${detail}`);
+  } else {
+    console.error(`[codex-channel] unknown server request "${msg.method}" — answering method-not-found to avoid hanging the turn`);
+  }
+  try {
+    const frame = answer.kind === 'result'
+      ? { jsonrpc: '2.0', id: msg.id, result: answer.payload }
+      : { jsonrpc: '2.0', id: msg.id, error: answer.payload };
+    appserverWs?.send(JSON.stringify(frame));
+  } catch (err) {
+    console.error(`[codex-channel] failed to answer server request ${msg.method}:`, err);
+  }
 }
 
 async function rpcCall(method: string, params: any, timeoutMs = 30000): Promise<any> {
