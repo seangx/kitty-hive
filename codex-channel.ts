@@ -53,6 +53,13 @@ const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || '').trim();
 // spawn-per-event mode (works on any codex version, no shared context).
 const CODEX_CHANNEL_MODE = (process.env.CODEX_CHANNEL_MODE || 'auto') as 'auto' | 'appserver' | 'exec';
 const CODEX_APPSERVER_CWD = process.env.CODEX_APPSERVER_CWD || process.cwd();
+// Timeout for thread/start + thread/resume. codex 0.144 blocks these ~30s on
+// a models-refresh child-process hang (vendor bug, openai/codex#14795-family:
+// "failed to refresh available models: timeout waiting for child process to
+// exit"), so the old 30s default made every daemon boot a coin flip and
+// crash-looped the whole fleet on 2026-07-15. Resume of a large rollout jsonl
+// under boot-storm load can also legitimately exceed 30s.
+const THREAD_RPC_TIMEOUT_MS = 120_000;
 
 // Allow CLI flags to override env
 for (let i = 2; i < process.argv.length; i++) {
@@ -504,7 +511,7 @@ async function setupAppserver(): Promise<void> {
   let resumed = false;
   if (persistedThreadId) {
     try {
-      const resumeResp = await rpcCall('thread/resume', { threadId: persistedThreadId });
+      const resumeResp = await rpcCall('thread/resume', { threadId: persistedThreadId }, THREAD_RPC_TIMEOUT_MS);
       const resumedId = resumeResp?.thread?.id;
       if (!resumedId) throw new Error(`thread/resume returned no thread.id: ${JSON.stringify(resumeResp)}`);
       threadId = resumedId;
@@ -519,7 +526,7 @@ async function setupAppserver(): Promise<void> {
     }
   }
   if (!resumed) {
-    const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
+    const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
     threadId = threadResp?.thread?.id;
     if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
     console.error(`[codex-channel] appserver thread started: ${threadId}`);
@@ -656,13 +663,13 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
   }
   try {
     if (target) {
-      const resp = await rpcCall('thread/resume', { threadId: target });
+      const resp = await rpcCall('thread/resume', { threadId: target }, THREAD_RPC_TIMEOUT_MS);
       const resumedId = resp?.thread?.id;
       if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = resumedId;
       console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (${resp?.thread?.turns?.length ?? 0} turns)`);
     } else {
-      const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD });
+      const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
       const newId = resp?.thread?.id;
       if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = newId;
