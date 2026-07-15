@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import {
   handleTaskCreateAsync, handleCheck,
-  handleTaskClaimAsync, handleTaskCancelAsync,
+  handleTaskClaimAsync, handleTaskCancelAsync, handleTaskCompleteAsync,
   handleWorkflowProposeAsync, handleWorkflowApproveAsync,
   handleStepCompleteAsync, handleStepApproveAsync, handleWorkflowRejectAsync,
 } from '../tools/task.js';
@@ -57,6 +57,7 @@ export function registerTaskTools(mcp: McpServer) {
   mcp.tool(
     'hive_task',
     'Create a task and (optionally) delegate. Omit `to` to create an unassigned task that anyone can claim. ' +
+    'Most tasks are simple: the assignee just does the work and calls hive_task_complete — no workflow needed. ' +
     'Pass `source_team_id` to bind the task to a team — team members can then see it via hive_tasks(team=X), and `role:xxx` routing prefers team members. The binding is set once at create and cannot be changed later.',
     {
       as: asParam,
@@ -134,6 +135,31 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
+    'hive_task_complete',
+    'Mark a simple (no-workflow) task as completed. Assignee-only. This is the normal way to finish most tasks — do the work, then call this with a short result. ' +
+    'If the task has a workflow, this errors — use hive_workflow_step_complete for the current step instead.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Task id'),
+      result: z.string().optional().describe('Short result description (visible in task events and to the creator).'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = await handleTaskCompleteAsync(params.task_id, agent.id, params.result);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
+      await notifyTaskParticipants(params.task_id, agent.id, buildPushMessage({
+        type: 'task-complete',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, 'task-complete', seq),
+        task_id: params.task_id,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
     'hive_tasks',
     'List tasks. Without `team`: tasks you created or are assigned to. With `team`: all tasks bound to that team via source_team_id (you must be a current team member; non-members get a 403). Use this before creating a task to avoid duplicating in-flight work in the team.',
     {
@@ -177,7 +203,9 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_workflow_propose',
-    'Propose a workflow for a task. Creator must approve before steps start. ' +
+    'Propose a workflow for a task. ONLY for genuinely complex work: multiple steps, multiple agents, or review gates between phases. ' +
+    'Most tasks do NOT need a workflow — just do the work and call hive_task_complete; proposing a workflow forces a creator-approval round-trip before you can even start. ' +
+    'Creator must approve before steps start. ' +
     'For multi-phase workflows where the user (creator) will want to review the output between phases, ' +
     'set `gate: true` on each phase — the task then pauses in status `awaiting_approval` after each gated step ' +
     'until the creator calls hive-workflow-step-approve. Default (no gate) auto-advances to the next step.',

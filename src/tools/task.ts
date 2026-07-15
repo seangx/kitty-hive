@@ -470,3 +470,36 @@ export function handleTaskCancel(taskId: string, agentId: string, reason?: strin
   updateTaskStatus(taskId, 'canceled', { completed_at: new Date().toISOString() });
   appendTaskEvent(taskId, 'task-cancel', agentId, { reason });
 }
+
+// --- Task: complete (simple, no-workflow path) ---
+
+/** Complete a task that has NO workflow. This is the lightweight lane: an
+ *  assigned/claimed task sits in 'proposing' ("workflow proposal expected"),
+ *  but most tasks are single-step and never need one — the assignee just
+ *  does the work and calls this. Tasks WITH a workflow must go through
+ *  hive_workflow_step_complete so gates/steps stay authoritative. */
+export function handleTaskComplete(taskId: string, agentId: string, result?: string): void {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  if (task.assignee_agent_id !== agentId) {
+    throw new Error('Only the task assignee can complete a task');
+  }
+  if (task.workflow_json) {
+    throw new Error('This task has a workflow — use hive_workflow_step_complete for the current step instead');
+  }
+  if (TERMINAL_STATUSES.has(task.status as TaskStatus)) {
+    throw new Error(`Task already in terminal state: ${task.status}`);
+  }
+
+  validateTransition(task.status as TaskStatus, 'task-complete');
+
+  updateTaskStatus(taskId, 'completed', { completed_at: new Date().toISOString() });
+  appendTaskEvent(taskId, 'task-complete', agentId, { result });
+}
+
+export async function handleTaskCompleteAsync(taskId: string, agentId: string, result?: string): Promise<{ task_id: string; status: 'completed' }> {
+  handleTaskComplete(taskId, agentId, result);
+  const task = getTaskById(taskId);
+  if (task) await forwardTaskEvent(task, agentId, 'task-complete', { result });
+  return { task_id: taskId, status: 'completed' };
+}
