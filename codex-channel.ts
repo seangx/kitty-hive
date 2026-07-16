@@ -781,14 +781,22 @@ async function announceReady(): Promise<void> {
  *  decision policy lives in codex-channel-runtime's answerServerRequest()
  *  (pure, unit-tested); this wrapper just logs and sends. */
 function handleServerRequest(msg: { id: number; method: string; params?: any }): void {
-  const answer = answerServerRequest(msg.method, msg.params);
+  const answer = answerServerRequest(msg.method, msg.params, (turnId) => turnTracker?.isActiveTurn(turnId) ?? false);
   const p = msg.params ?? {};
   const detail = (p.message || p.reason || p.command || '').toString().slice(0, 120);
+  if (answer.kind === 'ignore') {
+    // A human pane attached to this app-server owns the turn — their TUI
+    // shows the dialog; the daemon answering would hijack it (2026-07-16
+    // monkeys-cli incident: every shell approval auto-declined under the
+    // user's cursor).
+    console.error(`[codex-channel] ignoring server request ${msg.method} (${answer.reason}): ${detail}`);
+    return;
+  }
   if (answer.kind === 'result') {
     const verb = JSON.stringify(answer.payload).includes('"accept"') ? 'auto-accepting' : 'declining';
     console.error(`[codex-channel] ${verb} server request ${msg.method}${p.serverName ? ` (server=${p.serverName})` : ''}: ${detail}`);
   } else {
-    console.error(`[codex-channel] unknown server request "${msg.method}" — answering method-not-found to avoid hanging the turn`);
+    console.error(`[codex-channel] unknown server request "${msg.method}" on OUR turn — answering method-not-found to avoid hanging it`);
   }
   try {
     const frame = answer.kind === 'result'

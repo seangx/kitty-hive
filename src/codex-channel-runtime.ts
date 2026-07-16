@@ -242,6 +242,14 @@ export class TurnTracker {
     return false;
   }
 
+  /** True when `turnId` belongs to a turn THIS tracker started and is still
+   *  waiting on. Used as the ownership gate for server→client approval
+   *  requests: the daemon must never answer approvals for turns a human
+   *  pane started on the shared app-server. */
+  isActiveTurn(turnId: string | undefined): boolean {
+    return !!turnId && this.waiters.has(turnId);
+  }
+
   /** Diagnostic snapshot of in-flight turns. Not used at runtime; exposed
    *  for the optional `/admin/codex-daemons` extension and tests. */
   snapshot(): { activeTurns: string[]; injectedEventIds: number } {
@@ -272,7 +280,13 @@ export class TurnTracker {
 
 export type ServerRequestAnswer =
   | { kind: 'result'; payload: unknown }
-  | { kind: 'error'; payload: { code: number; message: string } };
+  | { kind: 'error'; payload: { code: number; message: string } }
+  // Deliberately stay silent: the request belongs to a turn some OTHER
+  // client started (a human pane attached to the same app-server). Answering
+  // would hijack their approval dialog — real incident 2026-07-16: the
+  // daemon auto-declined every shell approval of a user actively working in
+  // the monkeys-cli pane, making the session unusable.
+  | { kind: 'ignore'; reason: string };
 
 /** Best-effort form fill for approval elicitations we ACCEPT: prefer the
  *  affirmative enum option per field; persist choices prefer 'session' (never
@@ -299,24 +313,46 @@ export function synthesizeElicitationContent(schema: unknown): Record<string, un
   return out;
 }
 
-/** Decide the answer for a server→client request. Policy:
- *   - hive MCP elicitations → accept (spawn-time approval_mode=auto overrides
- *     should prevent these entirely; this is the net under the net)
+/** Decide the answer for a server→client request.
+ *
+ *  Turn OWNERSHIP is the first gate. The daemon shares its codex app-server
+ *  (and often the very thread) with human panes attached via
+ *  `codex resume <thread> --remote <ws_url>`; approval requests reach every
+ *  connected client. The daemon may only answer requests for turns IT
+ *  started (`isOwnTurn(turnId)` — the TurnTracker's active-waiter set).
+ *  Requests for other turns are the attached human's to answer.
+ *
+ *  Policy for OWN turns (headless, nobody to ask):
+ *   - hive MCP elicitations → accept (spawn-time approval_mode=auto
+ *     overrides should prevent these entirely; net under the net)
  *   - everything else → decline/refuse. Failing one tool call lets the turn
- *     FINISH; a headless daemon must never self-grant shell or fs access. */
-export function answerServerRequest(method: string, params: any): ServerRequestAnswer {
+ *     FINISH; a headless daemon must never self-grant shell or fs access.
+ *
+ *  Exception: hive elicitations are accepted regardless of ownership — hive
+ *  is OUR server, the spawn overrides already made its tools auto on this
+ *  app-server, and accepting is what the pane user wants ~always (identity
+ *  bind, dm read...). Everything non-hive without proven ownership is left
+ *  alone. */
+export function answerServerRequest(method: string, params: any, isOwnTurn: (turnId: string | undefined) => boolean): ServerRequestAnswer {
   const p = params ?? {};
+  const turnId: string | undefined = p.turnId ?? p.turn_id ?? undefined;
   if (method === 'mcpServer/elicitation/request') {
     if (p.serverName === 'hive') {
       return { kind: 'result', payload: { action: 'accept', content: synthesizeElicitationContent(p.requestedSchema) } };
     }
+    if (!isOwnTurn(turnId)) return { kind: 'ignore', reason: `turn ${turnId ?? '(none)'} not started by daemon — leaving for attached client` };
     return { kind: 'result', payload: { action: 'decline', content: null } };
   }
   if (method === 'item/commandExecution/requestApproval' || method === 'execCommandApproval' || method === 'applyPatchApproval') {
+    if (!isOwnTurn(turnId)) return { kind: 'ignore', reason: `turn ${turnId ?? '(none)'} not started by daemon — leaving for attached client` };
     return { kind: 'result', payload: { decision: 'decline' } };
   }
   if (method === 'item/permissions/requestApproval') {
+    if (!isOwnTurn(turnId)) return { kind: 'ignore', reason: `turn ${turnId ?? '(none)'} not started by daemon — leaving for attached client` };
     return { kind: 'result', payload: { scope: 'turn', permissions: {} } };
   }
+  // Unknown request types: only answer (with an error, to unblock the await)
+  // when the turn is provably ours; otherwise stay out of the way.
+  if (!isOwnTurn(turnId)) return { kind: 'ignore', reason: `unknown method ${method}, turn ${turnId ?? '(none)'} not ours` };
   return { kind: 'error', payload: { code: -32601, message: `codex-channel daemon cannot handle ${method} (headless)` } };
 }

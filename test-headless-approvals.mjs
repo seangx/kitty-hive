@@ -21,6 +21,9 @@
 
 import { answerServerRequest, synthesizeElicitationContent } from './dist/codex-channel-runtime.js';
 
+const OWN = () => true;          // daemon started this turn
+const NOT_OWN = () => false;     // pane/human turn — daemon must stay silent
+
 let pass = 0, fail = 0;
 function ok(cond, msg) {
   if (cond) { console.log(`  ✓ ${msg}`); pass++; }
@@ -32,7 +35,7 @@ console.log('=== 1. hive elicitation → accept ===');
   const a = answerServerRequest('mcpServer/elicitation/request', {
     serverName: 'hive', mode: 'form', message: 'Allow hive_dm_read?',
     requestedSchema: { type: 'object', properties: { decision: { enum: ['approve', 'deny'] } } },
-  });
+  }, NOT_OWN); // hive accepts regardless of ownership
   ok(a.kind === 'result', 'kind=result');
   ok(a.payload.action === 'accept', `action=accept (got ${a.payload.action})`);
   ok(a.payload.content.decision === 'approve', `content.decision=approve (got ${a.payload.content.decision})`);
@@ -40,28 +43,47 @@ console.log('=== 1. hive elicitation → accept ===');
 
 console.log('=== 2. non-hive elicitation → decline ===');
 {
-  const a = answerServerRequest('mcpServer/elicitation/request', { serverName: 'context7', mode: 'form', message: 'x' });
+  const a = answerServerRequest('mcpServer/elicitation/request', { serverName: 'context7', mode: 'form', message: 'x', turnId: 't1' }, OWN);
   ok(a.kind === 'result' && a.payload.action === 'decline' && a.payload.content === null,
     `declined with null content (got ${JSON.stringify(a.payload)})`);
 }
 
 console.log('=== 3. exec/patch approvals → decline ===');
 for (const m of ['item/commandExecution/requestApproval', 'execCommandApproval', 'applyPatchApproval']) {
-  const a = answerServerRequest(m, { reason: 'wants shell', command: 'rm -rf /' });
+  const a = answerServerRequest(m, { reason: 'wants shell', command: 'rm -rf /', turnId: 't1' }, OWN);
   ok(a.kind === 'result' && a.payload.decision === 'decline', `${m} → decision=decline`);
 }
 
 console.log('=== 4. permissions request → empty turn-scoped grant ===');
 {
-  const a = answerServerRequest('item/permissions/requestApproval', { reason: 'fs write' });
+  const a = answerServerRequest('item/permissions/requestApproval', { reason: 'fs write', turnId: 't1' }, OWN);
   ok(a.kind === 'result' && a.payload.scope === 'turn' && JSON.stringify(a.payload.permissions) === '{}',
     `empty grant (got ${JSON.stringify(a.payload)})`);
 }
 
 console.log('=== 5. unknown request → JSON-RPC error, never silence ===');
 {
-  const a = answerServerRequest('some/future/method', {});
+  const a = answerServerRequest('some/future/method', { turnId: 't1' }, OWN);
   ok(a.kind === 'error' && a.payload.code === -32601, `error -32601 (got ${JSON.stringify(a.payload)})`);
+}
+
+
+console.log('=== 5b. OWNERSHIP GATE: pane turns are never answered ===');
+// 2026-07-16 monkeys-cli incident: a human pane attached to the daemon's
+// app-server had every shell approval auto-declined out from under them.
+{
+  for (const m of ['item/commandExecution/requestApproval', 'execCommandApproval', 'applyPatchApproval', 'item/permissions/requestApproval']) {
+    const a = answerServerRequest(m, { reason: 'user working in pane', turnId: 'pane-turn' }, NOT_OWN);
+    ok(a.kind === 'ignore', `${m} on pane turn → ignore (got ${a.kind})`);
+  }
+  const e = answerServerRequest('mcpServer/elicitation/request', { serverName: 'context7', turnId: 'pane-turn' }, NOT_OWN);
+  ok(e.kind === 'ignore', `non-hive elicitation on pane turn → ignore (got ${e.kind})`);
+  const h = answerServerRequest('mcpServer/elicitation/request', { serverName: 'hive', turnId: 'pane-turn' }, NOT_OWN);
+  ok(h.kind === 'result' && h.payload.action === 'accept', 'hive elicitation accepted even on pane turn (our server)');
+  const u = answerServerRequest('some/future/method', { turnId: 'pane-turn' }, NOT_OWN);
+  ok(u.kind === 'ignore', `unknown method on pane turn → ignore (got ${u.kind})`);
+  const noTurn = answerServerRequest('item/commandExecution/requestApproval', { reason: 'no turn id' }, NOT_OWN);
+  ok(noTurn.kind === 'ignore', 'missing turnId treated as not-ours (conservative)');
 }
 
 console.log('=== 6. content synthesis details ===');
