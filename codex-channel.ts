@@ -221,6 +221,13 @@ interface ParsedEvent {
   title?: string;
   event_id?: string;
   raw?: string;
+  /** Daemon-side arrival timestamp (ISO), stamped at enqueue. Injected into
+   *  the turn text so codex can spot stale deliveries: a turn that hung
+   *  in-flight (e.g. the 2026-07-15 approval-freeze incident) may only
+   *  EXECUTE hours later, after a thread resume — without this stamp the
+   *  overnight event looks exactly like a fresh push (bug reported by 管家,
+   *  DM #1978). */
+  received_at?: string;
 }
 
 // NO daemon-side retry. Earlier versions retried failed `sendTurn`s up to 3×;
@@ -640,7 +647,12 @@ function buildRebindText(): string {
   return [
     `[kitty-hive] daemon restarted — your MCP session is fresh.`,
     `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
-    `before handling the next event. Then wait silently for the next push.`,
+    `before handling the next event.`,
+    `STALENESS WARNING: any turns completing around this restart may have been`,
+    `stuck in-flight since long before it (each event carries a "received:"`,
+    `timestamp — compare against the current time). For stale events, catch up`,
+    `via hive_inbox and respond to the CURRENT state; do not reply to an old`,
+    `message as if it just arrived. Then wait silently for the next push.`,
   ].join('\n');
 }
 
@@ -837,6 +849,10 @@ function buildEventTurnText(ev: ParsedEvent): string {
     `[hive event] type=${ev.type} from=${senderLabel}`,
     `summary: ${summary}`,
     `fetch:   ${fetchHint}`,
+    // received: arrival time at THIS daemon. If you are reading this long
+    // after that time (thread resumed with a backlog, turn was stuck), treat
+    // the event as stale — do not reply as if it just happened.
+    `received: ${ev.received_at || new Date().toISOString()}`,
   ].join('\n');
 }
 
@@ -947,6 +963,7 @@ async function processNextEvent() {
 }
 
 function enqueue(ev: ParsedEvent) {
+  ev.received_at = new Date().toISOString();
   eventQueue.push(ev);
   setImmediate(processNextEvent);
 }
