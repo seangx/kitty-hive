@@ -44,14 +44,32 @@ export function registerDMTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_dm_read',
-    'Fetch a single DM in full by message_id. Use whenever a preview contains a `[hive note]` paragraph mentioning hive-dm-read — the visible text is only the first 200/2000 characters. Returns the full content, attachments, sender, and timestamp.',
-    { message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications') },
-    async (params) => {
+    'Fetch a single DM in full by message_id. Use whenever a preview contains a `[hive note]` paragraph mentioning hive-dm-read — the visible text is only the first 200/2000 characters. Returns the full content, attachments, sender, and timestamp. ' +
+    'When YOU are the recipient, this also marks the message as read (read-up-to: older messages from the same sender count as read too, same semantics as hive_inbox), so unread counts stay accurate without a separate inbox call.',
+    {
+      as: asParam,
+      message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications'),
+    },
+    async (params, extra) => {
       const msg = db.getDMById(params.message_id);
       if (!msg) return { content: [{ type: 'text', text: JSON.stringify({ error: `Message not found: ${params.message_id}` }) }], isError: true };
       const sender = db.getAgentById(msg.from_agent_id);
       let attachments: any[] = [];
       try { attachments = JSON.parse(msg.attachments || '[]'); } catch { /* ignore */ }
+
+      // Advance the recipient's per-sender read cursor (forward-only) so
+      // reading via dm_read doesn't leave a stale unread count that only
+      // hive_inbox could clear (reported by 管家, DM #1978 side note).
+      // Only the RECIPIENT's cursor moves — a sender re-reading their own
+      // sent message, or a third party fetching by id, changes nothing.
+      let markedRead = false;
+      const reader = resolveAgent(extra, params.as);
+      if (reader && reader.id === msg.to_agent_id) {
+        const cursor = db.getReadCursor(reader.id, 'dm', msg.from_agent_id);
+        if (msg.id > cursor) setReadCursor(reader.id, 'dm', msg.from_agent_id, msg.id);
+        markedRead = true;
+      }
+
       return {
         content: [{
           type: 'text',
@@ -63,6 +81,7 @@ export function registerDMTools(mcp: McpServer) {
             content: msg.content,
             attachments,
             ts: msg.ts,
+            marked_read: markedRead,
           }),
         }],
       };
