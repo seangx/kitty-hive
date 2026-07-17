@@ -35,7 +35,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { TurnTracker, answerServerRequest, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { TurnTracker, answerServerRequest, checkDmDeliveryBeforeInject, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -80,6 +80,7 @@ const ENV_NAME = process.env.HIVE_AGENT_NAME || HIVE_AGENT_NAME;
 const ENV_ID = process.env.HIVE_AGENT_ID || HIVE_AGENT_ID;
 const ENV_KEY = process.env.HIVE_AGENT_KEY || HIVE_AGENT_KEY;
 const ENV_URL = process.env.HIVE_URL || HIVE_URL;
+const DM_DELIVERY_STATUS_URL = new URL('/admin/codex-dm-delivery-status', ENV_URL).toString();
 
 function preflight() {
   // Check codex is in PATH (warn, don't fail — user might have CODEX_CMD set)
@@ -907,13 +908,34 @@ function eventDedupKey(ev: ParsedEvent): string {
   return `raw:${ev.from_agent_id || 'unknown'}:${ev.type || 'unknown'}:${(ev.raw || ev.preview || '').slice(0, 80)}`;
 }
 
+async function shouldInjectQueuedEvent(ev: ParsedEvent): Promise<boolean> {
+  if (ev.message_id == null || !agentId) return true;
+  const decision = await checkDmDeliveryBeforeInject(
+    DM_DELIVERY_STATUS_URL,
+    agentId,
+    ev.message_id,
+  );
+  if (!decision.deliver) {
+    console.error(`[codex-channel] skipped already-consumed DM message_id=${ev.message_id} reason=${decision.reason} cursor=${decision.cursor ?? 'n/a'}`);
+    return false;
+  }
+  if (decision.reason === 'preflight_error') {
+    console.error(`[codex-channel] DM delivery preflight failed for message_id=${ev.message_id}; fail-open inject: ${decision.error}`);
+  }
+  return true;
+}
+
 async function processNextEvent() {
   if (codexBusy) return;
   const next = eventQueue.shift();
   if (!next) return;
   codexBusy = true;
   try {
-    if (pushMode === 'appserver') {
+    const shouldInject = await shouldInjectQueuedEvent(next);
+    if (!shouldInject) {
+      // Consumed through hive_inbox / hive_dm_read while this push waited in
+      // eventQueue. Do not start a duplicate Codex turn.
+    } else if (pushMode === 'appserver') {
       const text = buildEventTurnText(next);
       const eventId = eventDedupKey(next);
       console.error(`[codex-channel] inject turn (${text.length} chars) eventId=${eventId} into thread ${threadId?.slice(-8)}`);

@@ -21,7 +21,7 @@
 //      second turn/start ever issued
 //   9. Timer is cleaned up on every terminal outcome (no leaked handles)
 
-import { TurnTracker } from './dist/codex-channel-runtime.js';
+import { TurnTracker, checkDmDeliveryBeforeInject } from './dist/codex-channel-runtime.js';
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {
@@ -190,6 +190,41 @@ async function test10_handleNotificationUnknownType() {
   ok(matched === false, 'unknown method returns false');
 }
 
+async function test11_dmDeliveryPreflight() {
+  console.log('\n=== Test 11: DM delivery preflight suppresses consumed events and fails open ===');
+  const alreadyRead = await checkDmDeliveryBeforeInject(
+    'http://hive.test/admin/codex-dm-delivery-status',
+    'agent-1',
+    42,
+    async () => new Response(JSON.stringify({ deliver: false, reason: 'already_read', message_id: 42, cursor: 42 }), { status: 200 }),
+  );
+  ok(alreadyRead.deliver === false && alreadyRead.reason === 'already_read', 'already-read decision suppresses injection');
+
+  const unread = await checkDmDeliveryBeforeInject(
+    'http://hive.test/admin/codex-dm-delivery-status',
+    'agent-1',
+    43,
+    async () => new Response(JSON.stringify({ deliver: true, reason: 'unread', message_id: 43, cursor: 42 }), { status: 200 }),
+  );
+  ok(unread.deliver === true && unread.reason === 'unread', 'unread decision permits injection');
+
+  const httpFailure = await checkDmDeliveryBeforeInject(
+    'http://hive.test/admin/codex-dm-delivery-status',
+    'agent-1',
+    44,
+    async () => new Response('down', { status: 503 }),
+  );
+  ok(httpFailure.deliver === true && httpFailure.reason === 'preflight_error', 'HTTP failure fails open');
+
+  const networkFailure = await checkDmDeliveryBeforeInject(
+    'http://hive.test/admin/codex-dm-delivery-status',
+    'agent-1',
+    45,
+    async () => { throw new Error('connection reset'); },
+  );
+  ok(networkFailure.deliver === true && networkFailure.reason === 'preflight_error', 'network failure fails open');
+}
+
 async function run() {
   await test1_happyPath();
   await test2_timeoutNoRetry();
@@ -201,6 +236,7 @@ async function run() {
   await test8_idempotencyAcrossTimeout();
   await test9_lateCompletionAfterTimeoutIgnored();
   await test10_handleNotificationUnknownType();
+  await test11_dmDeliveryPreflight();
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

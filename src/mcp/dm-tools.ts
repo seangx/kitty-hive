@@ -45,7 +45,9 @@ export function registerDMTools(mcp: McpServer) {
   mcp.tool(
     'hive_dm_read',
     'Fetch a single DM in full by message_id. Use whenever a preview contains a `[hive note]` paragraph mentioning hive-dm-read — the visible text is only the first 200/2000 characters. Returns the full content, attachments, sender, and timestamp. ' +
-    'When YOU are the recipient, this also marks the message as read (read-up-to: older messages from the same sender count as read too, same semantics as hive_inbox), so unread counts stay accurate without a separate inbox call.',
+    'When YOU are the recipient, this also marks the message as read (read-up-to: older messages from the same sender count as read too, same semantics as hive_inbox), so unread counts stay accurate without a separate inbox call. ' +
+    '`marked_read` is true only when this call advances the read cursor; historical re-reads return `already_read: true` and `read_state: "already_read"`. ' +
+    'This is not an unread-listing tool: use hive_inbox to check unread items, and if inbox returns `[]`, do not bulk re-read remembered message ids merely to check unread state.',
     {
       as: asParam,
       message_id: z.number().describe('Message id — the integer N from the truncation hint, from `message_id` in hive-inbox latest entries, or from the `message_id` meta field on channel notifications'),
@@ -63,11 +65,19 @@ export function registerDMTools(mcp: McpServer) {
       // Only the RECIPIENT's cursor moves — a sender re-reading their own
       // sent message, or a third party fetching by id, changes nothing.
       let markedRead = false;
+      let alreadyRead = false;
+      let readState: 'marked_read' | 'already_read' | 'not_recipient' = 'not_recipient';
       const reader = resolveAgent(extra, params.as);
       if (reader && reader.id === msg.to_agent_id) {
         const cursor = db.getReadCursor(reader.id, 'dm', msg.from_agent_id);
-        if (msg.id > cursor) setReadCursor(reader.id, 'dm', msg.from_agent_id, msg.id);
-        markedRead = true;
+        if (msg.id > cursor) {
+          setReadCursor(reader.id, 'dm', msg.from_agent_id, msg.id);
+          markedRead = true;
+          readState = 'marked_read';
+        } else {
+          alreadyRead = true;
+          readState = 'already_read';
+        }
       }
 
       return {
@@ -82,6 +92,8 @@ export function registerDMTools(mcp: McpServer) {
             attachments,
             ts: msg.ts,
             marked_read: markedRead,
+            already_read: alreadyRead,
+            read_state: readState,
           }),
         }],
       };

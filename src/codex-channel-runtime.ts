@@ -90,6 +90,49 @@ export interface TurnTrackerOptions {
   onOutcome?: (outcome: TurnOutcome, eventId?: string) => void;
 }
 
+export interface DmDeliveryDecision {
+  deliver: boolean;
+  reason: 'unread' | 'already_read' | 'not_recipient' | 'not_found' | 'preflight_error';
+  message_id?: number;
+  cursor?: number;
+  error?: string;
+}
+
+type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
+
+/**
+ * Ask hive whether a queued DM is still unread immediately before injection.
+ * Fail open on transport/protocol errors: a duplicate notification is safer
+ * than silently dropping a genuinely unread message during a hive restart.
+ */
+export async function checkDmDeliveryBeforeInject(
+  adminUrl: string,
+  agentId: string,
+  messageId: number,
+  fetchImpl: FetchLike = fetch,
+): Promise<DmDeliveryDecision> {
+  try {
+    const res = await fetchImpl(adminUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId, message_id: messageId }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json() as Partial<DmDeliveryDecision>;
+    if (typeof data.deliver !== 'boolean' || typeof data.reason !== 'string') {
+      throw new Error('invalid delivery-status response');
+    }
+    return data as DmDeliveryDecision;
+  } catch (err: any) {
+    return {
+      deliver: true,
+      reason: 'preflight_error',
+      message_id: messageId,
+      error: String(err?.message || err),
+    };
+  }
+}
+
 export class TurnTracker {
   private waiters = new Map<string, Waiter>();
   private injectedEventIds = new Set<string>();

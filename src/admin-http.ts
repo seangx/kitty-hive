@@ -223,6 +223,49 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
+  // POST /admin/codex-dm-delivery-status — read-only preflight used by the
+  // codex-channel daemon immediately before it injects a queued DM event.
+  // A DM may have been read through hive_inbox in a pane while its original
+  // push was waiting behind another Codex turn. Without this second check the
+  // stale queue entry starts a duplicate turn minutes later.
+  if (url.pathname === '/admin/codex-dm-delivery-status' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id, message_id } = body;
+      if (typeof agent_id !== 'string' || !agent_id || !Number.isInteger(message_id) || message_id <= 0) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) and message_id (positive integer) required' }));
+        return;
+      }
+
+      const msg = db.getDMById(message_id);
+      if (!msg) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ deliver: false, reason: 'not_found', message_id }));
+        return;
+      }
+      if (msg.to_agent_id !== agent_id) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ deliver: false, reason: 'not_recipient', message_id }));
+        return;
+      }
+
+      const cursor = db.getReadCursor(agent_id, 'dm', msg.from_agent_id);
+      const deliver = msg.id > cursor;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        deliver,
+        reason: deliver ? 'unread' : 'already_read',
+        message_id: msg.id,
+        cursor,
+      }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
   // POST /admin/codex-set-thread — switch the daemon for a codex agent to a
   // specific thread (resume) or to a fresh thread (reset).
   //
