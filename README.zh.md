@@ -416,6 +416,11 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 2. **清理时**：调 `npx kitty-hive agent remove --key <你的稳定 id> --yes`（幂等 — agent 不存在也 exit 0；`--yes` 跳过确认）。
 3. **不带 channel plugin**：脚本可直接 `npx kitty-hive agent register --key <K> --display-name <N>`；stdout 输出 `agent_id` 给调用方 pipe。
 
+在 CLI `agent register` 入口里，只要提供了 `--key`，它就是唯一身份查询条件；
+`--display-name` 只是可变展示信息，不会按同名旧 row 回退复用；同时提供的
+`--id` 会被忽略。MCP/channel 的 `hive_start` 仍保留通用的 ID → KEY → NAME
+优先级和 key 路径防静默改名保护。
+
 契约：hive **永不**抛出 orchestrator 需要处理的错——所有路径要么返回 agent_id 要么 exit 0。`external_key` UNIQUE 冲突在 server 侧 log warn，调用照样成功，只是冲突的 key 没附上。
 
 | 场景 | 行为 |

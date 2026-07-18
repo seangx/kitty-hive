@@ -417,6 +417,12 @@ Session managers, terminal multiplexers, CI runners, or any tool that spawns lon
 2. **At cleanup**: invoke `npx kitty-hive agent remove --key <your-stable-id> --yes` (idempotent — exits 0 even if no such agent; `--yes` skips the confirmation prompt).
 3. **Without a hive plugin**: scripts can also call `npx kitty-hive agent register --key <K> --display-name <N>`; stdout prints the `agent_id` so a caller can pipe it.
 
+For the CLI `agent register` entry point, a provided `--key` is the sole
+identity lookup. `--display-name` is mutable presentation metadata and never
+falls back to an existing same-name row; `--id` is ignored when `--key` is
+present. MCP/channel `hive_start` keeps the general ID → KEY → NAME priority
+and its key-path silent-rename guard.
+
 Contract: hive **never** raises errors that orchestrators have to catch — every code path either returns the agent_id or exits 0. UNIQUE conflicts on `external_key` are logged warn server-side and the call still succeeds; the conflicting key just isn't attached.
 
 | Scenario | Behavior |

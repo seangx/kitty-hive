@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents, renameAgent } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
@@ -938,15 +938,28 @@ async function cmdAgentRegister() {
   initDB(dbPath);
   const { handleStart } = await import('./tools/start.js');
   try {
+    // `agent register --key` is a trusted orchestrator entry point. A key is
+    // the stable pane/session identity; --display-name is mutable presentation
+    // metadata and must never participate in handleStart's name fallback.
+    // Otherwise two Kitty sessions opened in the same directory (same default
+    // title) collapse onto one row and the second key replaces the first.
+    //
+    // Keep handleStart's key-path rename guard unchanged for MCP callers. The
+    // CLI applies its explicitly supplied title after the strict key upsert.
+    const strictKeyIdentity = externalKey !== '';
     const result = handleStart({
       key: externalKey || undefined,
-      id: agentIdOverride || undefined,
-      name: displayName || undefined,
+      id: strictKeyIdentity ? undefined : agentIdOverride || undefined,
+      name: strictKeyIdentity ? undefined : displayName || undefined,
       roles: roles || undefined,
       tool: tool || undefined,
       projectDir: projectDir || undefined,
       switchTool: switchTool || undefined,
     });
+    if (strictKeyIdentity && displayName && result.display_name !== displayName) {
+      renameAgent(result.agent_id, displayName);
+      result.display_name = displayName;
+    }
     // Stdout: one line, just the agent_id (script-friendly)
     console.log(result.agent_id);
     // Stderr: human context
