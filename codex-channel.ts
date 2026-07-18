@@ -26,6 +26,7 @@
  *   HIVE_AGENT_KEY    external orchestrator key (idempotent register)
  *   HIVE_AGENT_NAME   display_name to register as
  *   HIVE_AGENT_ROLES  comma-separated initial roles
+ *   HIVE_EVENT_MODE   auto (daemon handles events) or foreground (default auto)
  *   CODEX_CMD         path to codex binary (default: `codex` from PATH)
  *   CODEX_PROFILE     codex profile name to pass via --profile (optional)
  *   CODEX_EXTRA_ARGS  extra space-separated args before the prompt
@@ -35,7 +36,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { TurnTracker, answerServerRequest, checkDmDeliveryBeforeInject, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { HistoryItemInjector, TurnTracker, answerServerRequest, checkDmDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -69,9 +70,10 @@ for (let i = 2; i < process.argv.length; i++) {
   else if (a === '--key' && process.argv[i + 1]) { (process.env as any).HIVE_AGENT_KEY = process.argv[++i]; }
   else if (a === '--url' && process.argv[i + 1]) { (process.env as any).HIVE_URL = process.argv[++i]; }
   else if (a === '--profile' && process.argv[i + 1]) { (process.env as any).CODEX_PROFILE = process.argv[++i]; }
+  else if (a === '--event-mode' && process.argv[i + 1]) { (process.env as any).HIVE_EVENT_MODE = process.argv[++i]; }
   else if (a === '--help' || a === '-h') {
-    console.log('Usage: kitty-hive codex-channel [--name <n>] [--id <id>] [--key <k>] [--url <u>] [--profile <p>]');
-    console.log('Env: HIVE_URL, HIVE_AGENT_ID|KEY|NAME|ROLES, CODEX_CMD, CODEX_PROFILE, CODEX_EXTRA_ARGS');
+    console.log('Usage: kitty-hive codex-channel [--name <n>] [--id <id>] [--key <k>] [--url <u>] [--profile <p>] [--event-mode auto|foreground]');
+    console.log('Env: HIVE_URL, HIVE_AGENT_ID|KEY|NAME|ROLES, HIVE_EVENT_MODE, CODEX_CMD, CODEX_PROFILE, CODEX_EXTRA_ARGS');
     process.exit(0);
   }
 }
@@ -80,9 +82,15 @@ const ENV_NAME = process.env.HIVE_AGENT_NAME || HIVE_AGENT_NAME;
 const ENV_ID = process.env.HIVE_AGENT_ID || HIVE_AGENT_ID;
 const ENV_KEY = process.env.HIVE_AGENT_KEY || HIVE_AGENT_KEY;
 const ENV_URL = process.env.HIVE_URL || HIVE_URL;
+const HIVE_EVENT_MODE = process.env.HIVE_EVENT_MODE === 'foreground' ? 'foreground' : 'auto';
 const DM_DELIVERY_STATUS_URL = new URL('/admin/codex-dm-delivery-status', ENV_URL).toString();
 
 function preflight() {
+  const rawEventMode = process.env.HIVE_EVENT_MODE;
+  if (rawEventMode && rawEventMode !== 'auto' && rawEventMode !== 'foreground') {
+    console.error(`[codex-channel] FATAL: HIVE_EVENT_MODE must be "auto" or "foreground" (got ${JSON.stringify(rawEventMode)})`);
+    process.exit(1);
+  }
   // Check codex is in PATH (warn, don't fail — user might have CODEX_CMD set)
   try {
     execSync(`${CODEX_CMD} --version`, { stdio: 'pipe' });
@@ -289,9 +297,10 @@ function buildPrompt(ev: ParsedEvent): string {
 
 // ===== Appserver mode (codex ≥ 0.124) =====
 // Long-lived codex via `codex app-server --listen ws://127.0.0.1:<port>`.
-// One JSON-RPC WebSocket connection, one persistent thread, one turn per
-// hive event injected via turn/start. Thread context survives across events
-// — no codex startup overhead, no fresh-context loss.
+// One JSON-RPC WebSocket connection and one persistent thread. Auto-mode
+// events start turns; foreground-mode events only append model-visible
+// history via thread/inject_items, so no background inference can consume
+// Hive messages. Thread context survives daemon restarts.
 
 let pushMode: 'appserver' | 'exec' | null = null;
 let appserverProc: ChildProcess | null = null;
@@ -300,6 +309,7 @@ let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outs
 let threadId: string | null = null;
 let appserverDeathHandled = false;  // guard so multiple death signals only exit once
 let turnTracker: TurnTracker | null = null;
+let historyInjector: HistoryItemInjector | null = null;
 let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
 
@@ -548,6 +558,10 @@ async function setupAppserver(): Promise<void> {
     { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
     threadId!,
   );
+  historyInjector = new HistoryItemInjector(
+    { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+    threadId!,
+  );
 
   // 2a. Start the control server (in-process thread switch entry point), then
   // announce ready — the announce carries control_url so the supervisor can
@@ -559,51 +573,38 @@ async function setupAppserver(): Promise<void> {
     console.error('[codex-channel] control server failed to start (set-thread falls back to respawn):', err);
   });
 
-  // 2b. Announce ready signal back to hive supervisor so kitty-kitty (or any
-  // other launcher) can query the (ws_url, thread_id) pair via
-  // hive_codex_pane_ws / GET /admin/codex-daemons. Best-effort: failure here
-  // just means the daemon's pane info isn't immediately discoverable; daemon
-  // still processes pushes normally. Also persists thread_id for next spawn.
+  // 2b. In foreground mode the brief itself must not start a model turn.
+  // Persist it before ready is announced so an attached foreground cannot
+  // race its first user turn ahead of the ownership policy.
+  const briefText = resumed ? buildRebindText() : buildIntroText();
+  const briefKind = resumed ? 'daemon-rebind' : 'daemon-intro';
+  if (HIVE_EVENT_MODE === 'foreground') {
+    const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
+    if (outcome.kind === 'rpc_send_error') {
+      throw new Error(`foreground brief injection failed: ${outcome.error.message}`);
+    }
+    console.error(`[codex-channel] foreground policy persisted without model turn (${briefKind})`);
+  }
+
+  // Announce ready signal back to hive supervisor so kitty-kitty (or any
+  // other launcher) can query the (ws_url, thread_id) pair. Also persists
+  // thread_id for next spawn.
   await announceReady().catch(err => {
     console.error('[codex-channel] failed to announce ready to supervisor:', err);
   });
 
-  // 3. intro turn. On thread/start (first-time spawn), inject the full agent
-  // brief. On thread/resume, the brief is already in thread history — but the
-  // daemon process is brand new, so its MCP client session lost the
-  // hive_start binding that the thread previously made. Inject a short
-  // re-bind notice so codex calls hive_start again before the next event.
-  if (resumed) {
-    const rebind = buildRebindText();
-    // Fire-and-forget: codex creates the turn immediately on turn/start, so
-    // proceeding to listenSSE doesn't lose the intro. Awaiting was the cause
-    // of the 2026-05-27 "daemon blocks for 10 min on a stuck intro turn"
-    // path — if codex's intro processing hangs (e.g., on an MCP tool waiting
-    // for human approval), the daemon was sitting idle the entire time
-    // before falling through after the 10-min sendTurn timeout. With this
-    // change the daemon listens to SSE events from the moment it announces
-    // ready; the intro turn runs in the background and we log its outcome.
-    void sendTurn(rebind, { eventId: `daemon-rebind:${threadId}:${Date.now()}` })
+  // Auto mode preserves the autonomous worker behavior: the startup brief is
+  // a fire-and-forget model turn. Foreground mode already persisted the same
+  // policy above and deliberately creates no turn.
+  if (HIVE_EVENT_MODE === 'auto') {
+    void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
       .then((outcome) => {
         if (outcome.kind !== 'completed') {
-          console.error(`[codex-channel] rebind intro turn outcome: ${outcome.kind} — daemon already proceeded`);
+          console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind} — daemon already proceeded`);
         }
       })
       .catch((err) => {
-        console.error('[codex-channel] rebind intro turn promise rejected:', err);
-      });
-  } else {
-    const intro = buildIntroText();
-    // Same fire-and-forget pattern as the rebind branch above — daemon must
-    // not block on intro turn completion. See the rebind comment for why.
-    void sendTurn(intro, { eventId: `daemon-intro:${threadId}:${Date.now()}` })
-      .then((outcome) => {
-        if (outcome.kind !== 'completed') {
-          console.error(`[codex-channel] startup intro turn outcome: ${outcome.kind} — daemon already proceeded`);
-        }
-      })
-      .catch((err) => {
-        console.error('[codex-channel] startup intro turn promise rejected:', err);
+        console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err);
       });
   }
 }
@@ -611,6 +612,23 @@ async function setupAppserver(): Promise<void> {
 /** Full agent brief injected into a brand-new thread (first spawn, or an
  *  in-process reset to a fresh thread). */
 function buildIntroText(): string {
+  if (HIVE_EVENT_MODE === 'foreground') {
+    return [
+      `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
+      ``,
+      `HIVE EVENT POLICY: foreground-only. The daemon may append pending Hive`,
+      `event notices to this thread, but it must never start a model turn. A`,
+      `notice is not a read receipt and must not be acted on by itself.`,
+      ``,
+      `When the next real user-authored foreground turn sees pending notices:`,
+      `1. Call hive_start({ id: "${agentId}" }) if this MCP session is fresh.`,
+      `2. Call hive_inbox() to obtain the authoritative CURRENT unread state.`,
+      `3. Fetch and handle only items still returned by Hive. Ignore stale`,
+      `   injected notices whose item is no longer unread.`,
+      ``,
+      `Only foreground user turns may call Hive read/action tools.`,
+    ].join('\n');
+  }
   return [
     `You are kitty-hive agent "${agentName}" (id: ${agentId}).`,
     ``,
@@ -645,6 +663,15 @@ function buildIntroText(): string {
  *  thread's history has the full brief already; it just needs to re-assert
  *  its hive identity in case the MCP session binding was lost. */
 function buildRebindText(): string {
+  if (HIVE_EVENT_MODE === 'foreground') {
+    return [
+      `[kitty-hive] daemon restarted in foreground-only event mode.`,
+      `No background model turn was started and no Hive message was consumed.`,
+      `The MCP session is fresh. On the next real user-authored foreground turn`,
+      `that sees pending Hive notices, call hive_start({ id: "${agentId}" })`,
+      `and then hive_inbox() to reconcile the CURRENT unread state.`,
+    ].join('\n');
+  }
   return [
     `[kitty-hive] daemon restarted — your MCP session is fresh.`,
     `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
@@ -689,23 +716,29 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
     }
     turnTracker?.setThreadId(threadId!);
-    // Re-announce so the supervisor snapshot + agents.thread_id pick up the
-    // new thread (same ws_url). Await it: the caller (set-thread endpoint)
-    // reads the snapshot right after we respond.
+    historyInjector?.setThreadId(threadId!);
+    const briefText = target ? buildRebindText() : buildIntroText();
+    const briefKind = target ? 'switch-rebind' : 'switch-intro';
+    if (HIVE_EVENT_MODE === 'foreground') {
+      const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
+      if (outcome.kind === 'rpc_send_error') {
+        return { ok: false, error: `foreground policy injection failed: ${outcome.error.message}` };
+      }
+    }
+    // Re-announce only after the foreground policy is persisted, so the
+    // supervisor snapshot cannot expose a thread that lacks the safety rule.
     await announceReady().catch(err => {
       console.error('[codex-channel] switch: failed to re-announce ready:', err);
     });
-    // Brief the thread (fire-and-forget, same policy as boot): fresh thread
-    // gets the full intro; resumed thread gets the short re-bind notice.
-    const briefText = target ? buildRebindText() : buildIntroText();
-    const briefKind = target ? 'switch-rebind' : 'switch-intro';
-    void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
-      .then((outcome) => {
-        if (outcome.kind !== 'completed') {
-          console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind}`);
-        }
-      })
-      .catch((err) => console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err));
+    if (HIVE_EVENT_MODE === 'auto') {
+      void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
+        .then((outcome) => {
+          if (outcome.kind !== 'completed') {
+            console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind}`);
+          }
+        })
+        .catch((err) => console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err));
+    }
     return { ok: true, thread_id: threadId! };
   } catch (err: any) {
     return { ok: false, error: String(err?.message || err) };
@@ -837,6 +870,11 @@ async function sendTurn(text: string, opts: { eventId?: string } = {}): Promise<
   return turnTracker.sendTurn(text, opts);
 }
 
+async function injectHistory(text: string, opts: { eventId?: string } = {}) {
+  if (!historyInjector) throw new Error('HistoryItemInjector not initialized — did setupAppserver run?');
+  return historyInjector.injectDeveloperText(text, opts);
+}
+
 /** Short prompt for appserver mode — context is persistent, so each event is
  *  just "here's what arrived + how to fetch full content". */
 function buildEventTurnText(ev: ParsedEvent): string {
@@ -862,6 +900,29 @@ function buildEventTurnText(ev: ParsedEvent): string {
     // after that time (thread resumed with a backlog, turn was stuck), treat
     // the event as stale — do not reply as if it just happened.
     `received: ${ev.received_at || new Date().toISOString()}`,
+  ].join('\n');
+}
+
+/** Model-visible notification for foreground mode. It is history only: the
+ *  app-server does not start inference, and Hive remains unread. The next
+ *  real user turn reconciles against hive_inbox instead of trusting a stale
+ *  notification captured earlier. */
+function buildPendingEventHistoryText(ev: ParsedEvent): string {
+  const senderLabel = ev.from || ev.from_agent_id || 'unknown';
+  const summary = ev.title || ev.preview || ev.raw || `(no summary)`;
+  return [
+    `[kitty-hive pending event — foreground-only]`,
+    `type: ${ev.type || 'unknown'}`,
+    `from: ${senderLabel}`,
+    `summary: ${summary}`,
+    `event_id: ${eventDedupKey(ev)}`,
+    `received: ${ev.received_at || new Date().toISOString()}`,
+    ``,
+    `This notice was persisted without starting a model turn. It is not a`,
+    `read receipt and Hive read cursors were not advanced. On the next real`,
+    `user-authored foreground turn, call hive_start({ id: "${agentId}" }) if`,
+    `needed, then hive_inbox() for the authoritative CURRENT unread state.`,
+    `Fetch/handle only items still returned there; ignore stale notices.`,
   ].join('\n');
 }
 
@@ -932,9 +993,25 @@ async function processNextEvent() {
   codexBusy = true;
   try {
     const shouldInject = await shouldInjectQueuedEvent(next);
+    const deliveryPath = decideEventDelivery(HIVE_EVENT_MODE, pushMode);
     if (!shouldInject) {
       // Consumed through hive_inbox / hive_dm_read while this push waited in
       // eventQueue. Do not start a duplicate Codex turn.
+    } else if (deliveryPath !== 'background_turn') {
+      if (deliveryPath === 'foreground_unavailable') {
+        console.error(`[codex-channel] foreground event left unread: appserver unavailable (type=${next.type}, eventId=${eventDedupKey(next)})`);
+      } else {
+        const eventId = eventDedupKey(next);
+        const text = buildPendingEventHistoryText(next);
+        const outcome = await injectHistory(text, { eventId });
+        if (outcome.kind === 'injected') {
+          console.error(`[codex-channel] foreground event persisted without model turn (eventId=${eventId})`);
+        } else if (outcome.kind === 'skipped_duplicate') {
+          console.error(`[codex-channel] skipped duplicate foreground history item (eventId=${eventId})`);
+        } else {
+          console.error(`[codex-channel] foreground history injection failed; Hive remains unread (eventId=${eventId}): ${outcome.error.message}`);
+        }
+      }
     } else if (pushMode === 'appserver') {
       const text = buildEventTurnText(next);
       const eventId = eventDedupKey(next);
@@ -1069,6 +1146,9 @@ async function listenSSE() {
 
 async function setupPushMode() {
   if (CODEX_CHANNEL_MODE === 'exec') {
+    if (HIVE_EVENT_MODE === 'foreground') {
+      throw new Error('foreground event mode requires codex app-server; legacy exec mode starts background model turns');
+    }
     pushMode = 'exec';
     console.error(`[codex-channel] mode: exec (per-event codex spawn; forced via CODEX_CHANNEL_MODE=exec)`);
     return;
@@ -1079,10 +1159,10 @@ async function setupPushMode() {
     pushMode = 'appserver';
     console.error(`[codex-channel] mode: appserver (long-lived codex thread; context persists across events)`);
   } catch (err) {
-    if (CODEX_CHANNEL_MODE === 'appserver') {
-      console.error(`[codex-channel] appserver mode forced but setup failed: ${err}`);
+    if (CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground') {
+      console.error(`[codex-channel] appserver is required but setup failed: ${err}`);
       cleanupAppserver();
-      process.exit(1);
+      throw err;
     }
     console.error(`[codex-channel] appserver setup failed, falling back to exec mode: ${err}`);
     cleanupAppserver();
@@ -1111,6 +1191,8 @@ function cleanupAppserver() {
     try { appserverProc.kill('SIGTERM'); } catch { /* ignore */ }
     appserverProc = null;
   }
+  turnTracker = null;
+  historyInjector = null;
   threadId = null;
 }
 

@@ -135,10 +135,12 @@ async function run() {
     const cols = db.prepare("PRAGMA table_info('agents')").all();
     db.close();
     const tc = cols.find(c => c.name === 'thread_id');
+    const eventMode = cols.find(c => c.name === 'event_mode');
     ok(!!tc, 'agents.thread_id column exists');
     ok(tc && tc.type === 'TEXT', `thread_id type is TEXT (got ${tc?.type})`);
     ok(tc && tc.notnull === 1, `thread_id NOT NULL (got notnull=${tc?.notnull})`);
     ok(tc && tc.dflt_value === "''", `thread_id default is '' (got ${tc?.dflt_value})`);
+    ok(!!eventMode && eventMode.dflt_value === "'auto'", `event_mode exists with auto default (got ${eventMode?.dflt_value})`);
   }
 
   console.log('\n=== Test 2: createAgent leaves thread_id empty ===');
@@ -150,9 +152,10 @@ async function run() {
   ok(!!a.agent_id, `hive_start returned agent_id (${a.agent_id})`);
   {
     const db = readDbDirect();
-    const row = db.prepare("SELECT thread_id FROM agents WHERE id = ?").get(a.agent_id);
+    const row = db.prepare("SELECT thread_id, event_mode FROM agents WHERE id = ?").get(a.agent_id);
     db.close();
     ok(row && row.thread_id === '', `new agent row has thread_id = '' (got ${JSON.stringify(row?.thread_id)})`);
+    ok(row && row.event_mode === 'auto', `new agent row defaults event_mode to auto (got ${JSON.stringify(row?.event_mode)})`);
   }
 
   console.log('\n=== Test 3: /admin/codex-daemon-ready contract ===');
@@ -232,10 +235,13 @@ async function run() {
     const migrated = new Database(legacyDbPath, { readonly: true });
     const cols2 = migrated.prepare("PRAGMA table_info('agents')").all();
     const tc2 = cols2.find(c => c.name === 'thread_id');
-    const legacyRow = migrated.prepare('SELECT thread_id FROM agents WHERE id = ?').get('legacyagent01');
+    const eventMode2 = cols2.find(c => c.name === 'event_mode');
+    const legacyRow = migrated.prepare('SELECT thread_id, event_mode FROM agents WHERE id = ?').get('legacyagent01');
     migrated.close();
     ok(!!tc2, 'legacy DB gained thread_id column after migration');
     ok(legacyRow && legacyRow.thread_id === '', `existing rows back-filled to '' (got ${JSON.stringify(legacyRow?.thread_id)})`);
+    ok(!!eventMode2, 'legacy DB gained event_mode column after migration');
+    ok(legacyRow && legacyRow.event_mode === 'auto', `existing rows back-filled to auto (got ${JSON.stringify(legacyRow?.event_mode)})`);
   } finally {
     for (const ext of ['', '-wal', '-shm']) {
       const p = legacyDbPath + ext;

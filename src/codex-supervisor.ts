@@ -152,6 +152,9 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // serve's own cwd.
   const fresh = getAgentById(agentId);
   if (fresh?.project_dir) cleanEnv.CODEX_APPSERVER_CWD = fresh.project_dir;
+  // Foreground mode is a hard ownership boundary: the channel may persist
+  // notifications into the shared thread but must never start model turns.
+  cleanEnv.HIVE_EVENT_MODE = fresh?.event_mode || 'auto';
   // HIVE_AGENT_THREAD_ID: presence tells codex-channel to `thread/resume` an
   // existing codex thread (jsonl already on disk in ~/.codex/sessions/)
   // instead of `thread/start`. Set on every spawn after the first ready

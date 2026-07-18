@@ -3,7 +3,7 @@ import {
   getAgentByExternalKey, trySetAgentExternalKey, setAgentProjectDir,
 } from '../db.js';
 import { log } from '../log.js';
-import type { Agent, Team } from '../models.js';
+import type { Agent, AgentEventMode, Team } from '../models.js';
 
 interface StartInput {
   id?: string;
@@ -13,6 +13,7 @@ interface StartInput {
   tool?: string;
   expertise?: string;
   projectDir?: string;  // working directory hint (persistent Codex/OpenCode agents)
+  eventMode?: AgentEventMode; // daemon event handling policy (operator CLI only)
   switchTool?: boolean; // explicit opt-in to change `tool` on a key-matched agent
                         // (CLI --switch-tool; NOT exposed via MCP hive_start).
                         // Unlocks tool only — display_name stays gated.
@@ -25,6 +26,7 @@ interface StartOutput {
   teams: Team[];
   tool: string;                 // agent.tool after this call
   previous_tool: string | null; // agent.tool before this call; null = freshly created
+  event_mode: AgentEventMode;
 }
 
 const ADJECTIVES = ['Swift', 'Calm', 'Bold', 'Keen', 'Warm', 'Wise', 'Fair', 'True', 'Deft', 'Glad'];
@@ -115,7 +117,7 @@ export function handleStart(input: StartInput): StartOutput {
       input.tool ?? '',
       input.roles ?? '',
       input.expertise ?? '',
-      { id: createId, externalKey: input.key, projectDir: input.projectDir },
+      { id: createId, externalKey: input.key, projectDir: input.projectDir, eventMode: input.eventMode },
     );
   } else {
     touchAgent(agent.id);
@@ -159,6 +161,9 @@ export function handleStart(input: StartInput): StartOutput {
     // roles / expertise — cheap descriptive metadata, silent update always OK
     if (input.roles) { updates.push('roles = ?'); params.push(input.roles); }
     if (input.expertise) { updates.push('expertise = ?'); params.push(input.expertise); }
+    if (input.eventMode && input.eventMode !== agent.event_mode) {
+      updates.push('event_mode = ?'); params.push(input.eventMode);
+    }
 
     if (updates.length > 0) {
       params.push(agent.id);
@@ -188,5 +193,6 @@ export function handleStart(input: StartInput): StartOutput {
     teams: getAgentTeams(agent.id, true),
     tool: agent.tool,
     previous_tool: previousTool,
+    event_mode: agent.event_mode,
   };
 }

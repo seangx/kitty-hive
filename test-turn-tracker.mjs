@@ -21,7 +21,7 @@
 //      second turn/start ever issued
 //   9. Timer is cleaned up on every terminal outcome (no leaked handles)
 
-import { TurnTracker, checkDmDeliveryBeforeInject } from './dist/codex-channel-runtime.js';
+import { HistoryItemInjector, TurnTracker, checkDmDeliveryBeforeInject, decideEventDelivery } from './dist/codex-channel-runtime.js';
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {
@@ -225,6 +225,52 @@ async function test11_dmDeliveryPreflight() {
   ok(networkFailure.deliver === true && networkFailure.reason === 'preflight_error', 'network failure fails open');
 }
 
+async function test12_foregroundHistoryInjectionStartsNoTurn() {
+  console.log('\n=== Test 12: foreground history injection persists context without turn/start ===');
+  const calls = [];
+  const transport = {
+    async call(method, params) {
+      calls.push({ method, params });
+      if (method !== 'thread/inject_items') throw new Error(`unexpected method: ${method}`);
+      return {};
+    },
+  };
+  const injector = new HistoryItemInjector(transport, 'thread-fg');
+  const outcome = await injector.injectDeveloperText('pending hive event', { eventId: 'dm:2194' });
+  ok(outcome.kind === 'injected', `outcome.kind = ${outcome.kind}`);
+  ok(calls.length === 1 && calls[0].method === 'thread/inject_items', 'exactly one thread/inject_items RPC issued');
+  ok(calls.every(c => c.method !== 'turn/start'), 'zero turn/start RPCs issued');
+  const params = calls[0].params;
+  ok(params.threadId === 'thread-fg', 'injection targets the foreground thread');
+  ok(params.items?.[0]?.role === 'developer', 'pending notice is a developer history item');
+  ok(params.items?.[0]?.content?.[0]?.text === 'pending hive event', 'pending notice text is preserved');
+}
+
+async function test13_foregroundHistoryDedupAndSwitch() {
+  console.log('\n=== Test 13: foreground history dedups events and follows thread switches ===');
+  const calls = [];
+  const transport = { async call(method, params) { calls.push({ method, params }); return {}; } };
+  const injector = new HistoryItemInjector(transport, 'thread-old');
+  const first = await injector.injectDeveloperText('first', { eventId: 'evid:1' });
+  const duplicate = await injector.injectDeveloperText('duplicate', { eventId: 'evid:1' });
+  injector.setThreadId('thread-new');
+  const second = await injector.injectDeveloperText('second', { eventId: 'evid:2' });
+  ok(first.kind === 'injected', 'first event injected');
+  ok(duplicate.kind === 'skipped_duplicate', 'duplicate event skipped');
+  ok(second.kind === 'injected', 'new event injected after thread switch');
+  ok(calls.length === 2, `only two RPCs for three attempts (got ${calls.length})`);
+  ok(calls[0].params.threadId === 'thread-old' && calls[1].params.threadId === 'thread-new', 'injector retargets the switched thread');
+}
+
+async function test14_foregroundOwnershipDecision() {
+  console.log('\n=== Test 14: foreground ownership decision never selects a background turn ===');
+  ok(decideEventDelivery('foreground', 'appserver') === 'foreground_history', 'foreground + appserver uses history injection');
+  ok(decideEventDelivery('foreground', 'exec') === 'foreground_unavailable', 'foreground + exec leaves event unread');
+  ok(decideEventDelivery('foreground', null) === 'foreground_unavailable', 'foreground + no backend leaves event unread');
+  ok(decideEventDelivery('auto', 'appserver') === 'background_turn', 'auto mode preserves autonomous model turns');
+  ok(decideEventDelivery('auto', 'exec') === 'background_turn', 'auto exec path remains autonomous');
+}
+
 async function run() {
   await test1_happyPath();
   await test2_timeoutNoRetry();
@@ -237,6 +283,9 @@ async function run() {
   await test9_lateCompletionAfterTimeoutIgnored();
   await test10_handleNotificationUnknownType();
   await test11_dmDeliveryPreflight();
+  await test12_foregroundHistoryInjectionStartsNoTurn();
+  await test13_foregroundHistoryDedupAndSwitch();
+  await test14_foregroundOwnershipDecision();
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

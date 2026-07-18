@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
-import type { Agent, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
+import type { Agent, AgentEventMode, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
 import { ulid, generateToken, nowISO } from './utils.js';
 import { buildDMPreview, INBOX_PREVIEW_LEN } from './preview.js';
 
@@ -29,7 +29,8 @@ export function initDB(dbPath?: string): Database.Database {
       status        TEXT DEFAULT 'active'
                     CHECK(status IN ('active','idle','busy','offline')),
       created_at    TEXT NOT NULL,
-      last_seen     TEXT NOT NULL
+      last_seen     TEXT NOT NULL,
+      event_mode   TEXT NOT NULL DEFAULT 'auto'
     );
     CREATE INDEX IF NOT EXISTS idx_agents_token ON agents(token);
     CREATE INDEX IF NOT EXISTS idx_agents_roles ON agents(roles);
@@ -182,6 +183,11 @@ export function initDB(dbPath?: string): Database.Database {
   // UUID or OpenCode session id, disambiguated by agent.tool). Supervisors use
   // it to preserve conversation history across daemon and hive restarts.
   addColumnIfMissing('agents', 'thread_id', "TEXT NOT NULL DEFAULT ''");
+  // event_mode controls whether a supervised Codex daemon may start model
+  // turns for Hive pushes. `foreground` stores notifications in the thread
+  // history without inference, leaving read cursors untouched until the next
+  // user-authored foreground turn handles them.
+  addColumnIfMissing('agents', 'event_mode', "TEXT NOT NULL DEFAULT 'auto'");
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
@@ -361,6 +367,7 @@ export interface CreateAgentOpts {
   originPeer?: string;
   remoteId?: string;
   projectDir?: string;    // working directory hint for codex agents (supervisor cwd)
+  eventMode?: AgentEventMode;
 }
 
 // Hook: subscribers (e.g. codex-supervisor) get notified after a new agent
@@ -403,10 +410,11 @@ export function createAgent(
     external_key: opts.externalKey || '',
     project_dir: opts.projectDir || '',
     thread_id: '',
+    event_mode: opts.eventMode || 'auto',
   };
   getDB().prepare(`
-    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir)
-    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key, @project_dir)
+    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir, event_mode)
+    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key, @project_dir, @event_mode)
   `).run(agent);
   emitAgentCreated(agent);
   return agent;
@@ -428,6 +436,12 @@ export function setAgentProjectDir(agentId: string, projectDir: string): void {
  *  Empty string clears the persisted conversation. */
 export function setAgentThreadId(agentId: string, threadId: string): void {
   getDB().prepare('UPDATE agents SET thread_id = ? WHERE id = ?').run(threadId || '', agentId);
+}
+
+/** Set how a supervised agent receives Hive events. The caller validates the
+ *  closed value set; keeping this narrow avoids free-form daemon behavior. */
+export function setAgentEventMode(agentId: string, eventMode: AgentEventMode): void {
+  getDB().prepare('UPDATE agents SET event_mode = ? WHERE id = ?').run(eventMode, agentId);
 }
 
 /** Try to set agent.external_key. Silently no-ops on UNIQUE conflict (another

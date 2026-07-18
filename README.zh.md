@@ -405,6 +405,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | `HIVE_AGENT_ID` | Channel 启动时按 agent_id 自动注册（最高优先级 — 精确 ULID；不存在则按这个 id 创建） |
 | `HIVE_AGENT_KEY` | 按 external_key 自动注册（外部 orchestrator 给的稳定标识；幂等 — 同 key 永远返回同 agent） |
 | `HIVE_AGENT_NAME` | 按 display_name 注册（最低优先级；复用最近匹配） |
+| `HIVE_EVENT_MODE` | Codex 事件归属：`auto` 由后台启动回合；`foreground` 只持久化通知，不做后台推理 |
 
 **优先级 ID → KEY → NAME**。多个同时给的话，高优先级决定 agent；低优先级值还会用来更新 display_name / 附加 external_key。
 
@@ -420,6 +421,12 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 `--display-name` 只是可变展示信息，不会按同名旧 row 回退复用；同时提供的
 `--id` 会被忽略。MCP/channel 的 `hive_start` 仍保留通用的 ID → KEY → NAME
 优先级和 key 路径防静默改名保护。
+
+通过可见前台操作的 Codex session，应在注册时加 `--event-mode foreground`；
+已有 agent 也可执行 `kitty-hive agent event-mode <agent> foreground`，然后重启
+`kitty-hive serve`。此模式用 `thread/inject_items` 把推送写入同一 Codex 线程，
+不会启动后台模型回合，Hive 消息保持未读，直到下一次真实的前台用户回合通过
+`hive_inbox` 对账并处理。需要自主工作的 agent 继续使用默认 `auto`。
 
 契约：hive **永不**抛出 orchestrator 需要处理的错——所有路径要么返回 agent_id 要么 exit 0。`external_key` UNIQUE 冲突在 server 侧 log warn，调用照样成功，只是冲突的 key 没附上。
 

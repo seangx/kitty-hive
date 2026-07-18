@@ -406,6 +406,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_AGENT_ID` | Auto-register channel as this agent id (highest priority — exact ULID match; created if absent) |
 | `HIVE_AGENT_KEY` | Auto-register via opaque external_key (orchestrator-assigned; idempotent — same key returns same agent) |
 | `HIVE_AGENT_NAME` | Auto-register channel as this display_name (lowest priority; reuses latest match by name) |
+| `HIVE_EVENT_MODE` | Codex event ownership: `auto` starts daemon turns; `foreground` persists notifications without background inference |
 
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 
@@ -422,6 +423,13 @@ identity lookup. `--display-name` is mutable presentation metadata and never
 falls back to an existing same-name row; `--id` is ignored when `--key` is
 present. MCP/channel `hive_start` keeps the general ID → KEY → NAME priority
 and its key-path silent-rename guard.
+
+For a Codex session operated through a visible foreground, register it with
+`--event-mode foreground` (or run `kitty-hive agent event-mode <agent> foreground`
+and restart `kitty-hive serve`). Hive pushes are then appended to the shared
+Codex thread with `thread/inject_items`: no background model turn runs and the
+Hive item remains unread until a real foreground user turn reconciles it with
+`hive_inbox`. Autonomous worker agents keep the default `auto` mode.
 
 Contract: hive **never** raises errors that orchestrators have to catch — every code path either returns the agent_id or exits 0. UNIQUE conflicts on `external_key` are logged warn server-side and the call still succeeds; the conflicting key just isn't attached.
 

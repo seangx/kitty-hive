@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents, renameAgent } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents, renameAgent, setAgentEventMode } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
@@ -15,6 +15,7 @@ import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execSync } from 'node:child_process';
 import { buildPushMessage } from './preview.js';
+import { AGENT_EVENT_MODES, type AgentEventMode } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -915,6 +916,7 @@ async function cmdAgentRegister() {
   let tool = '';
   let agentIdOverride = '';
   let projectDir = '';
+  let eventMode = '';
   let switchTool = false;
   for (let i = 2; i < args.length; i++) {
     if (args[i] === '--key' && args[i + 1]) { externalKey = args[i + 1]; i++; }
@@ -924,13 +926,18 @@ async function cmdAgentRegister() {
     else if (args[i] === '--tool' && args[i + 1]) { tool = args[i + 1]; i++; }
     else if (args[i] === '--id' && args[i + 1]) { agentIdOverride = args[i + 1]; i++; }
     else if (args[i] === '--project-dir' && args[i + 1]) { projectDir = args[i + 1]; i++; }
+    else if (args[i] === '--event-mode' && args[i + 1]) { eventMode = args[i + 1]; i++; }
     else if (args[i] === '--switch-tool') { switchTool = true; }
   }
   if (!externalKey && !agentIdOverride && !displayName) {
-    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P] [--switch-tool]');
+    console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P] [--event-mode auto|foreground] [--switch-tool]');
     console.error('  All three of --key/--id/--display-name optional, but at least one required.');
     console.error('  --project-dir: working directory hint for persistent Codex/OpenCode backends.');
     console.error('  --switch-tool: explicitly allow changing an existing key-matched agent\'s tool.');
+    process.exit(1);
+  }
+  if (eventMode && !AGENT_EVENT_MODES.includes(eventMode as AgentEventMode)) {
+    console.error(`Invalid --event-mode ${JSON.stringify(eventMode)}. Expected: ${AGENT_EVENT_MODES.join(' | ')}`);
     process.exit(1);
   }
 
@@ -954,6 +961,7 @@ async function cmdAgentRegister() {
       roles: roles || undefined,
       tool: tool || undefined,
       projectDir: projectDir || undefined,
+      eventMode: eventMode ? eventMode as AgentEventMode : undefined,
       switchTool: switchTool || undefined,
     });
     if (strictKeyIdentity && displayName && result.display_name !== displayName) {
@@ -964,7 +972,7 @@ async function cmdAgentRegister() {
     console.log(result.agent_id);
     // Stderr: human context
     const switched = result.previous_tool !== null && result.previous_tool !== result.tool;
-    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}${projectDir ? ` cwd=${projectDir}` : ''}${switched ? ` tool: ${result.previous_tool || '(none)'} → ${result.tool}` : ''}`);
+    console.error(`✅ ${result.display_name} (${result.agent_id})${externalKey ? ` key=${externalKey}` : ''}${projectDir ? ` cwd=${projectDir}` : ''}${eventMode ? ` event-mode=${result.event_mode}` : ''}${switched ? ` tool: ${result.previous_tool || '(none)'} → ${result.tool}` : ''}`);
 
     // Supervisor daemon lifecycle follows the FINAL tool value (result.tool,
     // not the raw --tool flag: handleStart may have refused the change).
@@ -1011,6 +1019,36 @@ async function cmdAgentRegister() {
     console.error(`Failed: ${err.message ?? err}`);
     process.exit(1);
   }
+}
+
+async function cmdAgentEventMode() {
+  const { dbPath } = parseFlags(1);
+  const target = args[2];
+  const rawMode = args[3];
+  if (!target || !rawMode || !AGENT_EVENT_MODES.includes(rawMode as AgentEventMode)) {
+    console.error('Usage: kitty-hive agent event-mode <name-or-id> <auto|foreground>');
+    process.exit(1);
+  }
+  const db = initDB(dbPath);
+  const byId = db.prepare("SELECT * FROM agents WHERE id = ? AND origin_peer = ''").get(target) as any;
+  const matches = byId ? [byId] : db.prepare("SELECT * FROM agents WHERE display_name = ? AND origin_peer = ''").all(target) as any[];
+  if (matches.length === 0) {
+    console.error(`Agent ${JSON.stringify(target)} not found.`);
+    process.exit(1);
+  }
+  if (matches.length > 1) {
+    console.error(`${JSON.stringify(target)} matches ${matches.length} agents. Use agent id to disambiguate.`);
+    process.exit(1);
+  }
+  const agent = matches[0];
+  if (agent.tool !== 'codex') {
+    console.error(`Agent ${JSON.stringify(agent.display_name)} uses tool=${JSON.stringify(agent.tool)}; foreground event mode currently requires codex.`);
+    process.exit(1);
+  }
+  setAgentEventMode(agent.id, rawMode as AgentEventMode);
+  const saved = db.prepare('SELECT event_mode FROM agents WHERE id = ?').get(agent.id) as { event_mode: AgentEventMode };
+  console.log(`${agent.display_name} (${agent.id}) event-mode=${saved.event_mode}`);
+  console.error('Restart kitty-hive serve to apply the mode to its persistent daemon.');
 }
 
 async function cmdAgentRename() {
@@ -2541,7 +2579,7 @@ Top-level commands:
   version | --version | -V                   Print version (bare semver on stdout)
 
 Command groups:
-  agent      Manage local agents       (list, rename, remove, register)
+  agent      Manage local agents       (list, rename, remove, register, event-mode)
   team       Inspect/maintain teams    (list, transfer)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
   log        Inspect message history   (dm, team, task)
@@ -2569,7 +2607,9 @@ Subcommands:
   register --key <K> --display-name <N> [--roles R]   Idempotent upsert by external_key.
                                                       Stdout = agent_id (one line). Designed for orchestrator scripts.
                                                       --switch-tool allows changing tool on a key-matched agent
-                                                      (claude/codex/opencode morph); daemon is spawned/killed to match.`);
+                                                      (claude/codex/opencode morph); daemon is spawned/killed to match.
+  event-mode <agent> <auto|foreground>                Choose background handling or foreground-only unread delivery.
+                                                      Restart serve after changing an existing daemon.`);
 }
 
 function showTeamHelp() {
@@ -2706,6 +2746,7 @@ switch (command) {
   case 'agent':
     switch (args[1]) {
       case 'register': run(cmdAgentRegister); break;
+      case 'event-mode': run(cmdAgentEventMode); break;
       case 'remove':   run(cmdAgentRemove);   break;
       case 'rename':   run(cmdAgentRename);   break;
       case 'list':     run(cmdAgentList);     break;

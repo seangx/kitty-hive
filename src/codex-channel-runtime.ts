@@ -90,6 +90,67 @@ export interface TurnTrackerOptions {
   onOutcome?: (outcome: TurnOutcome, eventId?: string) => void;
 }
 
+export type HistoryInjectOutcome =
+  | { kind: 'injected'; eventId?: string }
+  | { kind: 'rpc_send_error'; error: Error }
+  | { kind: 'skipped_duplicate'; eventId: string };
+
+export type HiveEventMode = 'auto' | 'foreground';
+export type ChannelPushMode = 'appserver' | 'exec' | null;
+export type EventDeliveryPath = 'background_turn' | 'foreground_history' | 'foreground_unavailable';
+
+/** Pure ownership decision used before any model-capable operation. */
+export function decideEventDelivery(eventMode: HiveEventMode, pushMode: ChannelPushMode): EventDeliveryPath {
+  if (eventMode === 'foreground') {
+    return pushMode === 'appserver' ? 'foreground_history' : 'foreground_unavailable';
+  }
+  return 'background_turn';
+}
+
+/** Persist model-visible context without starting a Codex turn. This is the
+ *  safety boundary for foreground-owned Hive agents: only the next real
+ *  user-authored turn can run tools and advance Hive read cursors. */
+export class HistoryItemInjector {
+  private injectedEventIds = new Set<string>();
+
+  constructor(
+    private readonly transport: RpcTransport,
+    private threadId: string,
+  ) {}
+
+  setThreadId(threadId: string): void {
+    this.threadId = threadId;
+  }
+
+  async injectDeveloperText(text: string, opts: { eventId?: string } = {}): Promise<HistoryInjectOutcome> {
+    const { eventId } = opts;
+    if (eventId && this.injectedEventIds.has(eventId)) {
+      return { kind: 'skipped_duplicate', eventId };
+    }
+    if (eventId) this.injectedEventIds.add(eventId);
+
+    try {
+      await this.transport.call('thread/inject_items', {
+        threadId: this.threadId,
+        items: [{
+          type: 'message',
+          role: 'developer',
+          content: [{ type: 'input_text', text }],
+        }],
+      });
+      return { kind: 'injected', eventId };
+    } catch (err) {
+      // The RPC may have reached app-server even if the response was lost.
+      // Keep the id reserved and never retry in-process; Hive remains unread
+      // and the next foreground hive_inbox call is the authoritative recovery.
+      return {
+        kind: 'rpc_send_error',
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+  }
+}
+
 export interface DmDeliveryDecision {
   deliver: boolean;
   reason: 'unread' | 'already_read' | 'not_recipient' | 'not_found' | 'preflight_error';

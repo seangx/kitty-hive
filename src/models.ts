@@ -1,3 +1,6 @@
+export const AGENT_EVENT_MODES = ['auto', 'foreground'] as const;
+export type AgentEventMode = typeof AGENT_EVENT_MODES[number];
+
 export interface Agent {
   id: string;
   display_name: string;
@@ -13,6 +16,7 @@ export interface Agent {
   external_key: string;  // opaque key from an external orchestrator (kitty session id, tmux pane, CI runner, ...). Empty when unmanaged. Unique when set.
   project_dir: string;   // working directory hint (operator-supplied). Persistent Codex/OpenCode supervisors use it as the backend cwd. Empty falls back to serve's cwd.
   thread_id: string;     // persisted conversation id. Codex stores a thread UUID; OpenCode stores a session id. agent.tool disambiguates the value. Empty = first-time spawn.
+  event_mode: AgentEventMode; // auto = daemon starts model turns; foreground = persist notifications without background inference.
 }
 
 export interface Team {
