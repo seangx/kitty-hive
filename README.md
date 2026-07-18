@@ -32,6 +32,34 @@ claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 On first use, ask the agent to call `hive-whoami(name=<your-name>)` to register.
 Set `HIVE_AGENT_NAME=<name>` (or `HIVE_AGENT_ID=<id>`) in the env to skip this and auto-register on launch.
 
+### OpenCode (persistent push)
+
+```bash
+# 1. Add the hive remote MCP server to OpenCode (one-time)
+npx kitty-hive init opencode
+
+# 2. Start hive, then register a persistent OpenCode agent
+npx kitty-hive serve
+npx kitty-hive agent register --key my-opencode --display-name my-opencode \
+  --tool opencode --project-dir "$PWD"
+
+# 3. Get the loopback server/session tuple for a visible TUI
+npx kitty-hive opencode-pane server --key my-opencode
+```
+
+The last command returns JSON containing `server_url`, `session_id`, and
+loopback-only Basic Auth credentials. A launcher attaches with:
+
+```bash
+opencode attach <server_url> --session <session_id> \
+  --username <server_username> --password <server_password>
+```
+
+`kitty-hive serve` owns one password-protected `opencode serve` backend per
+local `tool=opencode` agent. Hive pushes are serialized into that same session,
+and the session id survives hive restarts. Launchers may use the equivalent
+`hive_opencode_pane_server` MCP tool instead of the CLI lookup.
+
 ### Other IDEs (Antigravity, Cursor, VS Code, etc.)
 
 ```bash
@@ -72,6 +100,8 @@ Each machine runs its **own** `kitty-hive serve` — there is no central hub. Lo
 ```
 
 **Claude Code** — Messages arrive automatically in your conversation via the channel plugin (SSE push).
+
+**OpenCode** — Messages are pushed into a persistent supervised OpenCode session; a visible TUI attaches to the same backend/session.
 
 **Other IDEs (Cursor / VS Code / Antigravity / …)** — Pull with `hive-inbox` when your agent wants to check.
 
@@ -408,7 +438,7 @@ Contract: hive **never** raises errors that orchestrators have to catch — ever
 | Server | Node.js HTTP, stateful sessions + stateless fallback |
 | Database | SQLite WAL — `agents` (with `external_key` for orchestrator binding), `teams`, `team_members`, `team_events`, `dm_messages` (with `attachments` JSON), `tasks` (with federation link fields), `task_events`, `read_cursors`, `peers`, `pending_invites` (auth tokens), `pending_pushes` (durable push queue), `node_state` |
 | Transport | MCP Streamable HTTP (POST + GET SSE) |
-| Push | Channel plugin → `notifications/claude/channel`. Live SSE tracking; warns when push is dropped |
+| Push | Claude channel plugin, plus persistent Codex/OpenCode bridges backed by live SSE |
 | Auth | Session binding · `as` param · Bearer token · peer secret |
 | Federation | HTTP peering, `id@node` addressing, file transfer |
 

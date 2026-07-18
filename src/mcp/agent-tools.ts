@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { handleStart } from '../tools/start.js';
 import { renameAgent, listAllAgents, getAgentsByName, updateAgentRoles, getAgentById, getAgentByExternalKey } from '../db.js';
 import { getDaemonForAgent } from '../codex-supervisor.js';
+import { getOpenCodeDaemonForAgent } from '../opencode-supervisor.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { bindSession } from '../sessions.js';
 
@@ -17,7 +18,7 @@ export function registerAgentTools(mcp: McpServer) {
       key: z.string().optional().describe('External orchestrator key. Idempotent: same key always returns the same agent_id. UNIQUE on populated values.'),
       name: z.string().optional().describe('Display name (random if omitted). When the agent already exists, display_name is silently refreshed to this value.'),
       roles: z.string().optional().describe('Comma-separated roles: ux,frontend,backend'),
-      tool: z.string().optional().describe('Agent tool: claude, codex, shell'),
+      tool: z.string().optional().describe('Agent tool: claude, codex, opencode, shell'),
       expertise: z.string().optional().describe('Free-text expertise description'),
     },
     async (params, extra) => {
@@ -156,6 +157,65 @@ export function registerAgentTools(mcp: McpServer) {
         display_name: agent.display_name,
         ws_url: snap.ws_url,
         thread_id: snap.thread_id,
+        pid: snap.pid,
+        uptime_ms: snap.uptime_ms,
+      }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_opencode_pane_server',
+    'Look up the authenticated loopback OpenCode server + session for a tool=opencode agent. ' +
+    'Launchers attach a visible TUI to the SAME persistent session receiving hive pushes with ' +
+    '`opencode attach <server_url> --session <session_id> --username <server_username> --password <server_password>`. ' +
+    'Returns status="starting" while the supervised OpenCode server is booting and status="not_supervised" for missing/non-opencode agents.',
+    {
+      agent_id: z.string().optional().describe('Hive agent id (ULID).'),
+      agent_key: z.string().optional().describe('Agent external_key (alternative to agent_id).'),
+    },
+    async (params) => {
+      if (!params.agent_id && !params.agent_key) {
+        return { content: [{ type: 'text', text: JSON.stringify({ error: 'agent_id or agent_key required' }) }], isError: true };
+      }
+      const agent = params.agent_id
+        ? getAgentById(params.agent_id)
+        : getAgentByExternalKey(params.agent_key!);
+      if (!agent || agent.tool !== 'opencode') {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'not_supervised',
+          agent_id: agent?.id,
+          display_name: agent?.display_name,
+          error: agent ? `agent.tool="${agent.tool}", not "opencode"` : 'agent not found',
+        }) }] };
+      }
+      const snap = getOpenCodeDaemonForAgent(agent.id);
+      if (!snap) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'not_supervised',
+          agent_id: agent.id,
+          display_name: agent.display_name,
+          error: 'no OpenCode daemon running; ensure hive serve is running and OpenCode is installed',
+        }) }] };
+      }
+      if (!snap.ready) {
+        return { content: [{ type: 'text', text: JSON.stringify({
+          status: 'starting',
+          agent_id: agent.id,
+          display_name: agent.display_name,
+          pid: snap.pid,
+          uptime_ms: snap.uptime_ms,
+          restart_count: snap.restart_count,
+        }) }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify({
+        status: 'ready',
+        agent_id: agent.id,
+        display_name: agent.display_name,
+        server_url: snap.server_url,
+        session_id: snap.session_id,
+        server_username: snap.server_username,
+        server_password: snap.server_password,
+        version: snap.version,
         pid: snap.pid,
         uptime_ms: snap.uptime_ms,
       }) }] };

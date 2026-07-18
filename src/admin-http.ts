@@ -12,11 +12,18 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
 import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
+import {
+  getOpenCodeDaemonForAgent,
+  getOpenCodeDaemonSnapshots,
+  markOpenCodeDaemonReady,
+  notifyOpenCodeAgentCreated,
+  notifyOpenCodeAgentRemoved,
+  requestOpenCodeDaemonRespawn,
+  switchOpenCodeSession,
+} from './opencode-supervisor.js';
 
-// Per-agent serialization for /admin/codex-set-thread. Two concurrent
-// callers must not both SIGTERM the daemon — the second would race against
-// the supervisor's respawn from the first. A simple promise-chain per
-// agent_id is enough; calls await the previous chain head before starting.
+// Per-agent serialization for persistent conversation changes. Concurrent
+// Codex respawns or OpenCode session switches must not race each other.
 const setThreadLocks = new Map<string, Promise<unknown>>();
 function lockPerAgent<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
   const prev = setThreadLocks.get(agentId) ?? Promise.resolve();
@@ -138,6 +145,13 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
+  // GET /admin/opencode-daemons — includes loopback attach credentials.
+  if (url.pathname === '/admin/opencode-daemons' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ daemons: getOpenCodeDaemonSnapshots() }));
+    return;
+  }
+
   // POST /admin/notify-agent-created — the CLI `agent register` calls this
   // after it writes a new agent row, so the codex-supervisor (in serve's
   // process) can dynamically spawn a daemon for new tool=codex agents without
@@ -153,9 +167,17 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         res.end(JSON.stringify({ error: 'agent_id (string) required' }));
         return;
       }
-      const spawned = notifyAgentCreated(agent_id);
+      // Reconcile both supervisors, not just spawn the requested one. This
+      // endpoint is also used for tool morphs (codex <-> opencode): kill the
+      // now-ineligible old daemon before ensuring the new one exists.
+      const agent = db.getAgentById(agent_id);
+      if (agent?.tool !== 'codex') notifyAgentRemoved(agent_id);
+      if (agent?.tool !== 'opencode') notifyOpenCodeAgentRemoved(agent_id);
+      const codex = agent?.tool === 'codex' ? notifyAgentCreated(agent_id) : false;
+      const opencode = agent?.tool === 'opencode' ? notifyOpenCodeAgentCreated(agent_id) : false;
+      const spawned = codex || opencode;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, spawned }));
+      res.end(JSON.stringify({ ok: true, spawned, supervisor: codex ? 'codex' : opencode ? 'opencode' : null }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));
@@ -178,9 +200,11 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         res.end(JSON.stringify({ error: 'agent_id (string) required' }));
         return;
       }
-      const killed = notifyAgentRemoved(agent_id);
+      const codex = notifyAgentRemoved(agent_id);
+      const opencode = notifyOpenCodeAgentRemoved(agent_id);
+      const killed = codex || opencode;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, killed }));
+      res.end(JSON.stringify({ ok: true, killed, supervisor: codex ? 'codex' : opencode ? 'opencode' : null }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));
@@ -223,12 +247,51 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
+  // POST /admin/opencode-daemon-ready — bridge announces the authenticated
+  // loopback server and the persistent session shared with `opencode attach`.
+  if (url.pathname === '/admin/opencode-daemon-ready' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const {
+        agent_id, server_url, session_id,
+        server_username, server_password, control_url, version,
+      } = body;
+      if (
+        typeof agent_id !== 'string' || typeof server_url !== 'string' ||
+        typeof session_id !== 'string' || typeof server_username !== 'string' ||
+        typeof server_password !== 'string'
+      ) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id, server_url, session_id, server_username, server_password required (strings)' }));
+        return;
+      }
+      const ok = markOpenCodeDaemonReady({
+        agentId: agent_id,
+        serverUrl: server_url,
+        sessionId: session_id,
+        serverUsername: server_username,
+        serverPassword: server_password,
+        controlUrl: typeof control_url === 'string' ? control_url : null,
+        version: typeof version === 'string' ? version : null,
+      });
+      res.writeHead(ok ? 200 : 202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, tracked: ok }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
   // POST /admin/codex-dm-delivery-status — read-only preflight used by the
   // codex-channel daemon immediately before it injects a queued DM event.
   // A DM may have been read through hive_inbox in a pane while its original
   // push was waiting behind another Codex turn. Without this second check the
   // stale queue entry starts a duplicate turn minutes later.
-  if (url.pathname === '/admin/codex-dm-delivery-status' && req.method === 'POST') {
+  if (
+    ['/admin/dm-delivery-status', '/admin/codex-dm-delivery-status', '/admin/opencode-dm-delivery-status'].includes(url.pathname)
+    && req.method === 'POST'
+  ) {
     try {
       const body = JSON.parse(await readBody(req));
       const { agent_id, message_id } = body;
@@ -387,6 +450,89 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         ws_url: result.snap.ws_url,
         ready: true,
         mode: result.mode,
+      }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
+  // POST /admin/opencode-set-session
+  // body: { agent_id, session_id: string | null }. null/"" creates a fresh
+  // session. A live bridge switches in-process and asks attached TUIs to
+  // select the new session; server_url stays stable.
+  if (url.pathname === '/admin/opencode-set-session' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string' || !agent_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) required' }));
+        return;
+      }
+      if (!Object.prototype.hasOwnProperty.call(body, 'session_id')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'session_id required (pass null explicitly to create fresh)' }));
+        return;
+      }
+      if (body.session_id !== null && typeof body.session_id !== 'string') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'session_id must be string or null' }));
+        return;
+      }
+      const target = typeof body.session_id === 'string' && body.session_id.trim()
+        ? body.session_id.trim()
+        : null;
+      if (target && !target.startsWith('ses')) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'OpenCode session_id must start with "ses"' }));
+        return;
+      }
+      const agent = db.getAgentById(agent_id);
+      if (!agent) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `agent not found: ${agent_id}` }));
+        return;
+      }
+      if (agent.tool !== 'opencode' || agent.origin_peer !== '') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `expected a local tool=opencode agent (got tool="${agent.tool}")` }));
+        return;
+      }
+
+      const result = await lockPerAgent(agent_id, async () => {
+        const live = getOpenCodeDaemonForAgent(agent_id);
+        if (live?.ready && live.control_url) {
+          const switched = await switchOpenCodeSession(agent_id, target);
+          return { snap: switched, mode: 'in-process' as const, hadLiveControl: true };
+        }
+        db.setAgentThreadId(agent_id, target || '');
+        const snap = await requestOpenCodeDaemonRespawn(agent_id);
+        return { snap, mode: 'respawn' as const, hadLiveControl: false };
+      });
+
+      if (!result.snap) {
+        res.writeHead(result.hadLiveControl ? 409 : 200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          ready: false,
+          mode: result.mode,
+          error: result.hadLiveControl
+            ? 'OpenCode session is busy or the requested session does not exist; current daemon was left untouched'
+            : 'OpenCode daemon did not become ready within 45s',
+        }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        ready: true,
+        mode: result.mode,
+        session_id: result.snap.session_id,
+        server_url: result.snap.server_url,
+        server_username: result.snap.server_username,
+        server_password: result.snap.server_password,
       }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });

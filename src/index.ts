@@ -92,6 +92,28 @@ async function cmdCodexChannel() {
   await new Promise(() => { /* never resolves; child.on('exit') terminates */ });
 }
 
+// Persistent OpenCode bridge. The daemon owns `opencode serve`; a visible
+// TUI attaches to the same server/session rather than starting another
+// backend.
+async function cmdOpenCodeChannel() {
+  const scriptPath = join(__dirname, '..', 'opencode-channel.ts');
+  if (!existsSync(scriptPath)) {
+    console.error(`[opencode-channel] cannot locate opencode-channel.ts at ${scriptPath}`);
+    process.exit(1);
+  }
+  const { spawn } = await import('node:child_process');
+  const child = spawn(findNpx(), ['-y', 'tsx', scriptPath, ...args.slice(1)], { stdio: 'inherit' });
+  child.on('exit', code => process.exit(code ?? 0));
+  child.on('error', err => {
+    console.error('[opencode-channel] failed to spawn tsx:', err);
+    process.exit(1);
+  });
+  for (const sig of ['SIGINT', 'SIGTERM'] as const) {
+    process.on(sig, () => { try { child.kill(sig); } catch { /* ignore */ } });
+  }
+  await new Promise(() => { /* child exit terminates this wrapper */ });
+}
+
 // codex-pane <subcommand>: launcher-facing utilities for path B (visible codex
 // via `codex --remote`). Currently has one subcommand:
 //   ws --key <K> | --id <I>   Print the daemon's ws_url + thread_id as JSON,
@@ -190,12 +212,81 @@ async function cmdCodexPane() {
   process.exit(1);
 }
 
+// opencode-pane server --key/--id: return the authenticated server/session
+// tuple a launcher needs for `opencode attach`.
+async function cmdOpenCodePane() {
+  const sub = args[1];
+  if (sub !== 'server') {
+    console.error('Usage: kitty-hive opencode-pane server --key <K> | --id <I> [--port 4123] [--timeout-ms 5000]');
+    process.exit(2);
+  }
+  const { port, dbPath } = parseFlags(1);
+  let agentKey = '';
+  let agentId = '';
+  let timeoutMs = 5000;
+  for (let i = 2; i < args.length; i++) {
+    if (args[i] === '--key' && args[i + 1]) { agentKey = args[++i]; }
+    else if (args[i] === '--id' && args[i + 1]) { agentId = args[++i]; }
+    else if (args[i] === '--timeout-ms' && args[i + 1]) { timeoutMs = parseInt(args[++i], 10) || 5000; }
+    else if (args[i] === '--port' || args[i] === '-p' || args[i] === '--db') { i++; }
+  }
+  if (!agentKey && !agentId) {
+    console.error('Usage: kitty-hive opencode-pane server --key <K> | --id <I>');
+    process.exit(2);
+  }
+  if (!agentId && agentKey) {
+    const db = initDB(dbPath);
+    const row = db.prepare('SELECT id FROM agents WHERE external_key = ?').get(agentKey) as { id: string } | undefined;
+    agentId = row?.id || '';
+  }
+
+  const started = Date.now();
+  let delay = 200;
+  let last: any = { status: 'not_supervised', error: 'agent not found or no OpenCode daemon' };
+  while (Date.now() - started <= timeoutMs) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${port}/admin/opencode-daemons`);
+      if (res.ok) {
+        const { daemons } = await res.json() as { daemons: Array<any> };
+        const daemon = daemons.find(item => item.agent_id === agentId);
+        if (daemon?.ready && daemon.server_url && daemon.session_id && daemon.server_password) {
+          console.log(JSON.stringify({
+            status: 'ready',
+            agent_id: daemon.agent_id,
+            display_name: daemon.display_name,
+            server_url: daemon.server_url,
+            session_id: daemon.session_id,
+            server_username: daemon.server_username,
+            server_password: daemon.server_password,
+            version: daemon.version,
+            pid: daemon.pid,
+          }));
+          process.exit(0);
+        }
+        if (daemon) {
+          last = {
+            status: 'starting', agent_id: daemon.agent_id,
+            display_name: daemon.display_name, pid: daemon.pid,
+            uptime_ms: daemon.uptime_ms, restart_count: daemon.restart_count,
+          };
+        }
+      }
+    } catch (err) {
+      last = { status: 'error', error: String((err as any)?.message || err) };
+    }
+    await new Promise(resolve => setTimeout(resolve, Math.min(delay, Math.max(50, timeoutMs - (Date.now() - started)))));
+    delay = Math.min(3200, delay * 2);
+  }
+  console.log(JSON.stringify(last));
+  process.exit(1);
+}
+
 const INIT_TOOLS = ['claude', 'cursor', 'vscode'] as const;
 type InitTool = typeof INIT_TOOLS[number];
 // codex is config'd via its own CLI (`codex mcp add ... --url ...`) writing
 // to ~/.codex/config.toml — we shell out instead of editing toml ourselves.
 // antigravity has no on-disk path; we print a snippet for the user to paste.
-const ALL_INIT_TARGETS = ['claude', 'cursor', 'vscode', 'antigravity', 'codex'] as const;
+const ALL_INIT_TARGETS = ['claude', 'cursor', 'vscode', 'antigravity', 'codex', 'opencode'] as const;
 
 function findNpx(): string {
   const probe = process.platform === 'win32' ? 'where npx' : 'command -v npx';
@@ -283,6 +374,34 @@ function configureCodex(port: number): { ok: boolean; message: string } {
   };
 }
 
+function configureOpenCode(port: number): { ok: boolean; message: string } {
+  const dir = join(homedir(), '.config', 'opencode');
+  const path = join(dir, 'opencode.json');
+  const jsoncPath = join(dir, 'opencode.jsonc');
+  let data: any = {};
+  if (existsSync(path)) {
+    try {
+      data = JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+      return { ok: false, message: `${path} is not valid JSON; not modified. Add mcp.hive manually.` };
+    }
+  } else if (existsSync(jsoncPath)) {
+    return {
+      ok: false,
+      message: `${jsoncPath} exists; not modified because JSONC comments cannot be safely round-tripped. Add mcp.hive manually.`,
+    };
+  }
+  if (!data.mcp || typeof data.mcp !== 'object' || Array.isArray(data.mcp)) data.mcp = {};
+  data.$schema ||= 'https://opencode.ai/config.json';
+  data.mcp.hive = {
+    type: 'remote',
+    url: `http://localhost:${port}/mcp`,
+    enabled: true,
+  };
+  writeJson(path, data);
+  return { ok: true, message: `${path}  (mcp.hive remote server enabled)` };
+}
+
 function antigravitySnippet(port: number): string {
   // Antigravity has no public on-disk config path — users edit via
   // "..." → MCP Store → Manage MCP Servers → View raw config.
@@ -318,6 +437,7 @@ function showInitUsage() {
   console.log('  cursor        .cursor/mcp.json');
   console.log('  vscode        .vscode/mcp.json   (VS Code Copilot)');
   console.log('  codex         shells out to `codex mcp add` (writes ~/.codex/config.toml)');
+  console.log('  opencode      ~/.config/opencode/opencode.json (remote MCP server)');
   console.log('  antigravity   prints snippet to paste via MCP Store UI');
   console.log('  all           run all of the above');
 }
@@ -345,6 +465,7 @@ async function cmdInit() {
         { value: 'cursor', label: 'Cursor', hint: '.cursor/mcp.json' },
         { value: 'vscode', label: 'VS Code Copilot', hint: '.vscode/mcp.json' },
         { value: 'codex', label: 'Codex CLI', hint: 'codex mcp add → ~/.codex/config.toml' },
+        { value: 'opencode', label: 'OpenCode', hint: '~/.config/opencode/opencode.json' },
         { value: 'antigravity', label: 'Antigravity', hint: 'snippet — paste via MCP Store UI' },
         { value: 'all', label: 'All of the above' },
       ],
@@ -374,6 +495,9 @@ async function cmdInit() {
     } else if (t === 'codex') {
       const res = configureCodex(port);
       console.log(`  ${t.padEnd(12)} ${res.message}`);
+    } else if (t === 'opencode') {
+      const result = configureOpenCode(port);
+      console.log(`  ${t.padEnd(12)} ${result.message}`);
     } else {
       const path = writeForTool(t as InitTool, port);
       console.log(`  ${t.padEnd(12)} ${path}`);
@@ -759,8 +883,8 @@ async function cmdAgentRemove() {
   console.log(`✅ Removed agent "${name}".`);
 
   // Tell the live supervisor (if any) to kill the daemon for this agent.
-  // Without this, a deleted tool=codex agent's daemon keeps running on its
-  // old ws_url, causing routing schisms when another agent later self-
+  // Without this, a deleted supervised agent's daemon keeps running on its
+  // old backend, causing routing schisms when another agent later self-
   // registers with the same name. Mirrors the agent-register notify path.
   // Best-effort: failures silently ignored — agent row is already gone.
   try {
@@ -772,7 +896,7 @@ async function cmdAgentRemove() {
     });
     if (notifyRes.ok) {
       const { killed } = await notifyRes.json() as { killed: boolean };
-      if (killed) console.error(`   → supervisor killed codex daemon`);
+      if (killed) console.error('   → supervisor killed persistent daemon');
     }
   } catch {
     // serve not running, or admin endpoint not reachable — fine, no daemon to kill anyway
@@ -805,8 +929,8 @@ async function cmdAgentRegister() {
   if (!externalKey && !agentIdOverride && !displayName) {
     console.error('Usage: kitty-hive agent register --key <K> --display-name <N> [--roles R] [--tool T] [--project-dir P] [--switch-tool]');
     console.error('  All three of --key/--id/--display-name optional, but at least one required.');
-    console.error('  --project-dir: working directory hint for codex agents (passed as cwd when supervisor spawns codex app-server).');
-    console.error('  --switch-tool: explicitly allow changing an existing key-matched agent\'s tool (claude⇄codex morph).');
+    console.error('  --project-dir: working directory hint for persistent Codex/OpenCode backends.');
+    console.error('  --switch-tool: explicitly allow changing an existing key-matched agent\'s tool.');
     process.exit(1);
   }
 
@@ -833,10 +957,11 @@ async function cmdAgentRegister() {
     // not the raw --tool flag: handleStart may have refused the change).
     // Both notifies are best-effort: failures silently ignored — the agent
     // row is already written, and the supervisor reconciles at next serve boot.
-    //  - tool is now codex   → ensure a daemon exists (idempotent on serve side)
-    //  - tool LEFT codex     → kill the now-orphaned daemon; the supervisor's
-    //    exit handler re-checks agents.tool and won't respawn it.
-    if (result.tool === 'codex') {
+    // Codex and OpenCode both have persistent supervised backends. The admin
+    // endpoint reconciles the two supervisors, so tool morphs kill the old
+    // daemon and spawn the new one atomically from the final DB value.
+    const supervisedTools = new Set(['codex', 'opencode']);
+    if (supervisedTools.has(result.tool)) {
       try {
         const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-created`, {
           method: 'POST',
@@ -847,13 +972,13 @@ async function cmdAgentRegister() {
         });
         if (notifyRes.ok) {
           const { spawned } = await notifyRes.json() as { spawned: boolean };
-          if (spawned) console.error(`   → supervisor spawning codex daemon`);
+          if (spawned) console.error(`   → supervisor spawning ${result.tool} daemon`);
         }
       } catch {
         // serve not running, or admin endpoint not reachable — that's fine,
         // daemon will spawn at the next serve boot.
       }
-    } else if (result.previous_tool === 'codex') {
+    } else if (result.previous_tool && supervisedTools.has(result.previous_tool)) {
       try {
         const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-removed`, {
           method: 'POST',
@@ -863,7 +988,7 @@ async function cmdAgentRegister() {
         });
         if (notifyRes.ok) {
           const { killed } = await notifyRes.json() as { killed: boolean };
-          if (killed) console.error(`   → supervisor killed codex daemon (tool switched away)`);
+          if (killed) console.error(`   → supervisor killed ${result.previous_tool} daemon (tool switched away)`);
         }
       } catch {
         // serve not running — nothing to kill.
@@ -2394,8 +2519,11 @@ Usage:
 
 Top-level commands:
   serve [--port 4123] [--db path] [-v|-q]    Start the MCP server
-  init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|codex|antigravity|all)
+  init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|codex|opencode|antigravity|all)
   codex-channel [--name X] [--profile P]     Run a long-lived codex agent that receives hive push events
+  opencode-channel [--name X]                Run a persistent OpenCode agent that receives hive pushes
+  codex-pane ws --id ID                      Get Codex app-server attach coordinates
+  opencode-pane server --id ID               Get OpenCode server/session attach coordinates
   status [--port 4123]                       Server & agent status
   version | --version | -V                   Print version (bare semver on stdout)
 
@@ -2428,7 +2556,7 @@ Subcommands:
   register --key <K> --display-name <N> [--roles R]   Idempotent upsert by external_key.
                                                       Stdout = agent_id (one line). Designed for orchestrator scripts.
                                                       --switch-tool allows changing tool on a key-matched agent
-                                                      (claude⇄codex morph); daemon is spawned/killed to match.`);
+                                                      (claude/codex/opencode morph); daemon is spawned/killed to match.`);
 }
 
 function showTeamHelp() {
@@ -2552,6 +2680,12 @@ switch (command) {
     break;
   case 'codex-pane':
     run(cmdCodexPane);
+    break;
+  case 'opencode-channel':
+    run(cmdOpenCodeChannel);
+    break;
+  case 'opencode-pane':
+    run(cmdOpenCodePane);
     break;
   case 'status':
     run(cmdStatus);

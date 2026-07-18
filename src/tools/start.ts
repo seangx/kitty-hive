@@ -12,7 +12,7 @@ interface StartInput {
   roles?: string;
   tool?: string;
   expertise?: string;
-  projectDir?: string;  // working directory hint (codex agents); set as agent.project_dir
+  projectDir?: string;  // working directory hint (persistent Codex/OpenCode agents)
   switchTool?: boolean; // explicit opt-in to change `tool` on a key-matched agent
                         // (CLI --switch-tool; NOT exposed via MCP hive_start).
                         // Unlocks tool only — display_name stays gated.

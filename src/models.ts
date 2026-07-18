@@ -11,8 +11,8 @@ export interface Agent {
   origin_peer: string;   // empty for local agents; peer name for placeholders
   remote_id: string;     // empty for local agents; original agent_id on the peer
   external_key: string;  // opaque key from an external orchestrator (kitty session id, tmux pane, CI runner, ...). Empty when unmanaged. Unique when set.
-  project_dir: string;   // working directory hint (operator-supplied). codex-supervisor uses this as cwd when spawning the daemon's codex app-server, so the TUI a user later opens via `codex --remote` lands in the right project. Empty falls back to serve's cwd.
-  thread_id: string;     // persisted codex thread/session uuid for the agent's daemon. Supervisor injects via HIVE_AGENT_THREAD_ID so daemon calls `thread/resume` (instead of `thread/start`), preserving jsonl history across daemon restart. Empty = first-time spawn.
+  project_dir: string;   // working directory hint (operator-supplied). Persistent Codex/OpenCode supervisors use it as the backend cwd. Empty falls back to serve's cwd.
+  thread_id: string;     // persisted conversation id. Codex stores a thread UUID; OpenCode stores a session id. agent.tool disambiguates the value. Empty = first-time spawn.
 }
 
 export interface Team {

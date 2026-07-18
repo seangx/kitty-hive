@@ -174,16 +174,13 @@ export function initDB(dbPath?: string): Database.Database {
     CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_external_key
       ON agents(external_key) WHERE external_key != '';
   `);
-  // project_dir: operator-supplied working directory hint. codex-supervisor
-  // uses it as cwd when spawning the daemon's codex app-server, so the TUI
-  // user attaches via `codex --remote` lands in the right project — without
-  // it, codex sees serve's cwd and the user sees the wrong files.
+  // project_dir: operator-supplied working directory hint. Persistent
+  // Codex/OpenCode supervisors pass it as the backend cwd, so an attached
+  // TUI lands in the intended project instead of kitty-hive serve's cwd.
   addColumnIfMissing('agents', 'project_dir', "TEXT NOT NULL DEFAULT ''");
-  // thread_id: persisted codex thread/session uuid for the agent's daemon.
-  // When the daemon respawns, supervisor injects this as HIVE_AGENT_THREAD_ID;
-  // daemon then calls `thread/resume {threadId}` instead of `thread/start`,
-  // so conversation history (stored as jsonl by codex app-server) survives
-  // daemon kill / serve restart / machine reboot.
+  // thread_id: persisted conversation id for the agent's daemon (Codex thread
+  // UUID or OpenCode session id, disambiguated by agent.tool). Supervisors use
+  // it to preserve conversation history across daemon and hive restarts.
   addColumnIfMissing('agents', 'thread_id', "TEXT NOT NULL DEFAULT ''");
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
@@ -420,18 +417,15 @@ export function getAgentByExternalKey(key: string): Agent | undefined {
   return getDB().prepare('SELECT * FROM agents WHERE external_key = ?').get(key) as Agent | undefined;
 }
 
-/** Update an agent's project_dir hint (used by codex-supervisor as cwd when
- *  spawning the daemon's codex app-server). Idempotent; empty string = clear.
- *  No-op for unknown ids. */
+/** Update an agent's project_dir hint for persistent Codex/OpenCode backends.
+ *  Idempotent; empty string = clear. No-op for unknown ids. */
 export function setAgentProjectDir(agentId: string, projectDir: string): void {
   getDB().prepare('UPDATE agents SET project_dir = ? WHERE id = ?').run(projectDir || '', agentId);
 }
 
-/** Persist the codex thread/session uuid for a codex agent. Supervisor reads
- *  this on daemon (re)spawn and injects via HIVE_AGENT_THREAD_ID env, so the
- *  daemon calls `thread/resume` instead of `thread/start` — preserving the
- *  jsonl-backed conversation history across daemon kill / serve restart.
- *  Empty string clears (used as fallback when resume fails on a stale id). */
+/** Persist a supervised agent's conversation id. Codex stores a thread UUID;
+ *  OpenCode stores a session id. agent.tool disambiguates the shared column.
+ *  Empty string clears the persisted conversation. */
 export function setAgentThreadId(agentId: string, threadId: string): void {
   getDB().prepare('UPDATE agents SET thread_id = ? WHERE id = ?').run(threadId || '', agentId);
 }
@@ -500,6 +494,13 @@ export function listAllAgents(activeOnly: boolean = false): Agent[] {
 export function listLocalCodexAgents(): Agent[] {
   return getDB().prepare(
     "SELECT * FROM agents WHERE tool = 'codex' AND origin_peer = '' ORDER BY display_name"
+  ).all() as Agent[];
+}
+
+/** Local agents whose persistent runtime is an OpenCode server/session. */
+export function listLocalOpenCodeAgents(): Agent[] {
+  return getDB().prepare(
+    "SELECT * FROM agents WHERE tool = 'opencode' AND origin_peer = '' ORDER BY display_name"
   ).all() as Agent[];
 }
 

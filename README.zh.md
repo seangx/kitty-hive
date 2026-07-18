@@ -32,6 +32,34 @@ claude --dangerously-load-development-channels plugin:kitty-hive@seangx
 首次使用让 agent 调用 `hive-whoami(name=<你的名字>)` 注册。
 也可以在环境变量里设 `HIVE_AGENT_NAME=<name>`（或 `HIVE_AGENT_ID=<id>`），channel 启动自动注册。
 
+### OpenCode（持久推送）
+
+```bash
+# 1. 一次性把 hive remote MCP 写入 OpenCode 配置
+npx kitty-hive init opencode
+
+# 2. 启动 hive，再注册一个持久 OpenCode agent
+npx kitty-hive serve
+npx kitty-hive agent register --key my-opencode --display-name my-opencode \
+  --tool opencode --project-dir "$PWD"
+
+# 3. 取得可见 TUI 要连接的 loopback server/session
+npx kitty-hive opencode-pane server --key my-opencode
+```
+
+最后一条命令返回 JSON，包含 `server_url`、`session_id` 和仅供 loopback
+使用的 Basic Auth 凭据。Launcher 用下面的命令接入同一会话：
+
+```bash
+opencode attach <server_url> --session <session_id> \
+  --username <server_username> --password <server_password>
+```
+
+`kitty-hive serve` 会为每个本地 `tool=opencode` agent 管理一个带密码的
+`opencode serve` 后端。Hive 推送会串行注入这个同一 session，hive 重启后
+仍会恢复原 session。Launcher 也可以使用等价的
+`hive_opencode_pane_server` MCP 工具查询连接信息。
+
 ### 其他 IDE（Antigravity、Cursor、VS Code 等）
 
 ```bash
@@ -72,6 +100,8 @@ npx kitty-hive init cursor
 ```
 
 **Claude Code** — 消息以 `<channel>` 块自动出现在对话中（SSE 推送）。
+
+**OpenCode** — 消息自动推入持久的受管 OpenCode session；可见 TUI 连接的就是同一个后端和会话。
 
 **其他 IDE（Cursor / VS Code / Antigravity / …）** — agent 主动 `hive-inbox` 拉取。
 
@@ -407,7 +437,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | 服务端 | Node.js HTTP，有状态 session + 无状态兜底 |
 | 数据库 | SQLite WAL — `agents`、`teams`、`team_members`、`team_events`、`dm_messages`（含 `attachments` JSON）、`tasks`（含联邦字段）、`task_events`、`read_cursors`、`peers`、`pending_invites`、`node_state` |
 | 传输 | MCP Streamable HTTP（POST + GET SSE） |
-| 推送 | Channel plugin → `notifications/claude/channel`。跟踪活跃 SSE，丢包时打 warning |
+| 推送 | Claude channel plugin，以及基于实时 SSE 的持久 Codex/OpenCode bridge |
 | 认证 | Session 绑定 · `as` 参数 · Bearer token · peer secret |
 | 联邦 | HTTP peering、`id@node` 寻址、文件传输 |
 

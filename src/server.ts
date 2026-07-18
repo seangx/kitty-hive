@@ -10,6 +10,7 @@ import { handleFederation, cleanupOldFiles, getNodeName } from './federation-htt
 import { handleAdmin } from './admin-http.js';
 import { startHeartbeat } from './federation-heartbeat.js';
 import { startCodexSupervisor, stopCodexSupervisor } from './codex-supervisor.js';
+import { startOpenCodeSupervisor, stopOpenCodeSupervisor } from './opencode-supervisor.js';
 
 export { setLogLevel };
 
@@ -160,17 +161,18 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
     console.log(`   Node: ${getNodeName()}`);
     console.log(`   Database: ${dbPath || '~/.kitty-hive/hive.db'}`);
     console.log(`   Mode: stateful (SSE push enabled)`);
-    // Spawn codex daemons for every local tool='codex' agent. Cheap if zero;
+    // Spawn persistent daemons for local Codex/OpenCode agents. Cheap if zero;
     // each daemon is a child process that survives until serve exits.
     // Pass the bound port so daemons HIVE_URL → this serve, not a stale default.
     startCodexSupervisor(port);
+    startOpenCodeSupervisor(port);
   });
 
-  // Stop codex daemons on serve shutdown. Without this, child processes
-  // become orphans and their codex app-server subprocesses leak.
+  // Stop persistent daemons on serve shutdown. Without this, child processes
+  // become orphans and their backend subprocesses leak.
   const shutdown = async (signal: NodeJS.Signals) => {
-    log('info', `[server] received ${signal}, stopping codex daemons before exit`);
-    await stopCodexSupervisor();
+    log('info', `[server] received ${signal}, stopping persistent agent daemons before exit`);
+    await Promise.all([stopCodexSupervisor(), stopOpenCodeSupervisor()]);
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);

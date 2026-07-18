@@ -11,6 +11,9 @@
     "dist/",
     "channel.ts",
     "codex-channel.ts",
+    "opencode-channel.ts",
+    "src/codex-channel-runtime.ts",
+    "src/opencode-channel-runtime.ts",
     "README.md",
     "README.zh.md"
   ],
