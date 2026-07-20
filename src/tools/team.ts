@@ -21,7 +21,7 @@ export function handleTeamCreate(actorId: string, input: { name: string; nicknam
 
 // --- hive_team_join ---
 
-export function handleTeamJoin(actorId: string, input: { team_id?: string; name?: string; nickname?: string }): { team_id: string; name: string } {
+export function handleTeamJoin(actorId: string, input: { team_id?: string; name?: string; nickname?: string }): { team_id: string; name: string; event_id: number; seq: number } {
   let team: Team | undefined;
   if (input.team_id) team = getTeamById(input.team_id);
   else if (input.name) team = getTeamByName(input.name);
@@ -35,8 +35,8 @@ export function handleTeamJoin(actorId: string, input: { team_id?: string; name?
     if (conflict) throw new Error(`Nickname "${input.nickname}" already taken in this team`);
   }
   addTeamMember(team.id, actorId, input.nickname ?? null);
-  appendTeamEvent(team.id, 'join', actorId, { nickname: input.nickname ?? null });
-  return { team_id: team.id, name: team.name };
+  const event = appendTeamEvent(team.id, 'join', actorId, { nickname: input.nickname ?? null });
+  return { team_id: team.id, name: team.name, event_id: event.id, seq: event.seq };
 }
 
 // --- hive_team_list ---
@@ -153,7 +153,7 @@ export function handleTeamMessage(actorId: string, input: { team_id: string; con
 export function handleTeamRenameNickname(
   actorId: string,
   input: { team_id: string; nickname: string },
-): { team_id: string; team_name: string; previous_nickname: string | null; nickname: string | null } {
+): { team_id: string; team_name: string; previous_nickname: string | null; nickname: string | null; event_id: number; seq: number } {
   const team = getTeamById(input.team_id);
   if (!team) throw new Error(`Team not found: ${input.team_id}`);
   if (team.closed_at) throw new Error('Team is closed');
@@ -171,7 +171,7 @@ export function handleTeamRenameNickname(
   const ok = renameTeamMember(team.id, actorId, normalized);
   if (!ok) throw new Error('Failed to update nickname (member row missing)');
 
-  appendTeamEvent(team.id, 'rename', actorId, {
+  const event = appendTeamEvent(team.id, 'rename', actorId, {
     previous: me.nickname,
     nickname: normalized || null,
   });
@@ -181,6 +181,8 @@ export function handleTeamRenameNickname(
     team_name: team.name,
     previous_nickname: me.nickname,
     nickname: normalized || null,
+    event_id: event.id,
+    seq: event.seq,
   };
 }
 
@@ -199,7 +201,7 @@ export function handleTeamRenameNickname(
 export function handleTeamLeave(
   actorId: string,
   input: { team_id: string },
-): { team_id: string; team_name: string } {
+): { team_id: string; team_name: string; event_id: number; seq: number } {
   const team = getTeamById(input.team_id);
   if (!team) throw new Error(`Team not found: ${input.team_id}`);
   if (team.closed_at) throw new Error('Team is closed');
@@ -215,9 +217,9 @@ export function handleTeamLeave(
   // Append event BEFORE removing — once the member row is gone, this still
   // references the actor by agent_id (team_events.actor_agent_id is the
   // agents.id, not team_members.id), so display lookups still work.
-  appendTeamEvent(team.id, 'leave', actorId, {});
+  const event = appendTeamEvent(team.id, 'leave', actorId, {});
   removeTeamMember(team.id, actorId);
-  return { team_id: team.id, team_name: team.name };
+  return { team_id: team.id, team_name: team.name, event_id: event.id, seq: event.seq };
 }
 
 // --- hive_team_list (mine) ---

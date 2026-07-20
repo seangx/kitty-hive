@@ -21,7 +21,14 @@
 //      second turn/start ever issued
 //   9. Timer is cleaned up on every terminal outcome (no leaked handles)
 
-import { HistoryItemInjector, TurnTracker, checkDmDeliveryBeforeInject, decideEventDelivery } from './dist/codex-channel-runtime.js';
+import {
+  HistoryItemInjector,
+  TurnTracker,
+  buildEventTimingLines,
+  checkDmDeliveryBeforeInject,
+  checkEventDeliveryBeforeInject,
+  decideEventDelivery,
+} from './dist/codex-channel-runtime.js';
 
 let pass = 0, fail = 0;
 function ok(cond, msg) {
@@ -223,6 +230,19 @@ async function test11_dmDeliveryPreflight() {
     async () => { throw new Error('connection reset'); },
   );
   ok(networkFailure.deliver === true && networkFailure.reason === 'preflight_error', 'network failure fails open');
+
+  let requestBody;
+  const supersededTask = await checkEventDeliveryBeforeInject(
+    'http://hive.test/admin/push-delivery-status',
+    'agent-1',
+    { event_id: 'task:task-1:task-assigned:1', task_id: 'task-1' },
+    async (_url, init) => {
+      requestBody = JSON.parse(init.body);
+      return new Response(JSON.stringify({ deliver: false, reason: 'superseded', seq: 1, latest_seq: 2 }), { status: 200 });
+    },
+  );
+  ok(requestBody.event_id === 'task:task-1:task-assigned:1' && requestBody.task_id === 'task-1', 'generic preflight sends stable task identity');
+  ok(!supersededTask.deliver && supersededTask.reason === 'superseded', 'superseded task decision suppresses injection');
 }
 
 async function test12_foregroundHistoryInjectionStartsNoTurn() {
@@ -271,6 +291,20 @@ async function test14_foregroundOwnershipDecision() {
   ok(decideEventDelivery('auto', 'exec') === 'background_turn', 'auto exec path remains autonomous');
 }
 
+async function test15_replayAndDelayMarkers() {
+  console.log('\n=== Test 15: replay and delayed delivery are model-visible ===');
+  const now = Date.parse('2026-07-20T07:02:00.000Z');
+  const delayed = buildEventTimingLines({
+    received_at: '2026-07-20T07:01:55.000Z',
+    replayed: true,
+    queued_at: '2026-07-20T07:00:00.000Z',
+  }, now);
+  ok(delayed.some(line => line.startsWith('replayed: true')), 'restart replay is labeled explicitly');
+  ok(delayed.some(line => line.includes('stale_delivery: true') && line.includes('delay_ms=120000')), 'old queued_at produces an explicit stale marker');
+  const fresh = buildEventTimingLines({ received_at: '2026-07-20T07:01:55.000Z' }, now);
+  ok(fresh.every(line => !line.includes('stale_delivery')), 'fresh delivery is not mislabeled stale');
+}
+
 async function run() {
   await test1_happyPath();
   await test2_timeoutNoRetry();
@@ -286,6 +320,7 @@ async function run() {
   await test12_foregroundHistoryInjectionStartsNoTurn();
   await test13_foregroundHistoryDedupAndSwitch();
   await test14_foregroundOwnershipDecision();
+  await test15_replayAndDelayMarkers();
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

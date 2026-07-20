@@ -22,6 +22,11 @@ const prompt = buildOpenCodePrompt(dm, { id: 'agent-1', name: 'worker' });
 ok(prompt.includes('hive_dm_read({ message_id: 42'), 'DM prompt requires full-content fetch');
 ok(prompt.includes('event_id: evid:dm:42'), 'prompt carries stable event marker');
 ok(prompt.includes('received: 2026-07-18T00:00:00.000Z'), 'prompt carries arrival timestamp');
+const replayPrompt = buildOpenCodePrompt({
+  type: 'dm', event_id: 'dm:43', message_id: 43, replayed: true,
+  queued_at: '2026-07-18T00:00:00.000Z', received_at: '2026-07-20T00:00:00.000Z',
+}, { id: 'agent-1', name: 'worker' });
+ok(replayPrompt.includes('replayed: true') && replayPrompt.includes('stale_delivery: true'), 'replayed OpenCode event is explicitly marked stale');
 ok(eventDedupKey({ message_id: 9 }) === 'dm:9', 'message id fallback is stable');
 const intro = buildOpenCodePrompt({ type: 'daemon-intro', event_id: 'intro-1' }, { id: 'agent-1', name: 'worker' });
 ok(intro.includes('FIRST ACTION: call hive_start') && intro.includes('wait for the first event'), 'new session receives a standalone identity brief');

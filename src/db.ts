@@ -803,6 +803,13 @@ export function getLatestTeamEvents(teamId: string, limit: number = 10): TeamEve
   return getDB().prepare('SELECT * FROM (SELECT * FROM team_events WHERE team_id = ? ORDER BY seq DESC LIMIT ?) ORDER BY seq ASC').all(teamId, limit) as TeamEvent[];
 }
 
+export function getLatestTeamEventSeq(teamId: string): number {
+  const row = getDB().prepare(
+    'SELECT COALESCE(MAX(seq), 0) AS max_seq FROM team_events WHERE team_id = ?'
+  ).get(teamId) as { max_seq: number };
+  return row.max_seq;
+}
+
 // --- DM queries ---
 
 export function appendDM(fromAgentId: string, toAgentId: string, content: string, attachments: import('./models.js').FileAttachment[] = []): DMMessage {
@@ -969,7 +976,8 @@ export function getReadCursor(agentId: string, targetType: string, targetId: str
 export function setReadCursor(agentId: string, targetType: string, targetId: string, seq: number): void {
   getDB().prepare(`
     INSERT INTO read_cursors (agent_id, target_type, target_id, last_seq) VALUES (?, ?, ?, ?)
-    ON CONFLICT(agent_id, target_type, target_id) DO UPDATE SET last_seq = excluded.last_seq
+    ON CONFLICT(agent_id, target_type, target_id) DO UPDATE
+      SET last_seq = MAX(read_cursors.last_seq, excluded.last_seq)
   `).run(agentId, targetType, targetId, seq);
 }
 

@@ -193,10 +193,13 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_check',
-    'Check the current state of a task by id.',
-    { task_id: z.string().describe('Task id') },
-    async (params) => {
+    'Check the current state of a task by id. For a bound agent, fetching the full task also advances that task\'s read cursor through the returned current seq.',
+    { as: asParam, task_id: z.string().describe('Task id') },
+    async (params, extra) => {
       const result = handleCheck(params);
+      const agent = resolveAgent(extra, params.as);
+      const last = result.recent_events.at(-1);
+      if (agent && last) db.setReadCursor(agent.id, 'task', params.task_id, last.seq);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );

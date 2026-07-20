@@ -19,7 +19,7 @@ import {
   eventDedupKey,
   type HivePushEvent,
 } from './src/opencode-channel-runtime.js';
-import { checkDmDeliveryBeforeInject } from './src/codex-channel-runtime.js';
+import { checkEventDeliveryBeforeInject } from './src/codex-channel-runtime.js';
 
 for (let i = 2; i < process.argv.length; i++) {
   const arg = process.argv[i];
@@ -42,7 +42,7 @@ const HIVE_AGENT_ROLES = process.env.HIVE_AGENT_ROLES || '';
 const PERSISTED_SESSION_ID = (process.env.HIVE_AGENT_SESSION_ID || '').trim();
 const OPENCODE_CMD = process.env.OPENCODE_CMD || 'opencode';
 const OPENCODE_CWD = process.env.OPENCODE_SERVER_CWD || process.cwd();
-const DM_DELIVERY_STATUS_URL = new URL('/admin/dm-delivery-status', HIVE_URL).toString();
+const PUSH_DELIVERY_STATUS_URL = new URL('/admin/push-delivery-status', HIVE_URL).toString();
 
 let hiveSessionId: string | null = null;
 let hiveRpcId = 0;
@@ -164,14 +164,22 @@ function rememberEvent(key: string): boolean {
 }
 
 async function shouldInject(ev: HivePushEvent): Promise<boolean> {
-  if (ev.message_id == null) return true;
-  const decision = await checkDmDeliveryBeforeInject(DM_DELIVERY_STATUS_URL, agentId, ev.message_id);
+  const decision = await checkEventDeliveryBeforeInject(
+    PUSH_DELIVERY_STATUS_URL,
+    agentId,
+    {
+      event_id: ev.event_id,
+      message_id: ev.message_id,
+      task_id: ev.task_id,
+      team_id: ev.team_id,
+    },
+  );
   if (!decision.deliver) {
-    console.error(`[opencode-channel] skipped consumed DM message_id=${ev.message_id} reason=${decision.reason}`);
+    console.error(`[opencode-channel] skipped stale/consumed event event=${eventDedupKey(ev)} reason=${decision.reason} seq=${decision.seq ?? decision.message_id ?? 'n/a'} cursor=${decision.cursor ?? 'n/a'} latest=${decision.latest_seq ?? 'n/a'}`);
     return false;
   }
   if (decision.reason === 'preflight_error') {
-    console.error(`[opencode-channel] DM preflight failed; fail-open message_id=${ev.message_id}: ${decision.error}`);
+    console.error(`[opencode-channel] event preflight failed; fail-open event=${eventDedupKey(ev)}: ${decision.error}`);
   }
   return true;
 }

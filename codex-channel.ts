@@ -36,7 +36,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { HistoryItemInjector, TurnTracker, answerServerRequest, checkDmDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, checkEventDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -83,7 +83,7 @@ const ENV_ID = process.env.HIVE_AGENT_ID || HIVE_AGENT_ID;
 const ENV_KEY = process.env.HIVE_AGENT_KEY || HIVE_AGENT_KEY;
 const ENV_URL = process.env.HIVE_URL || HIVE_URL;
 const HIVE_EVENT_MODE = process.env.HIVE_EVENT_MODE === 'foreground' ? 'foreground' : 'auto';
-const DM_DELIVERY_STATUS_URL = new URL('/admin/codex-dm-delivery-status', ENV_URL).toString();
+const PUSH_DELIVERY_STATUS_URL = new URL('/admin/push-delivery-status', ENV_URL).toString();
 
 function preflight() {
   const rawEventMode = process.env.HIVE_EVENT_MODE;
@@ -230,6 +230,8 @@ interface ParsedEvent {
   title?: string;
   event_id?: string;
   raw?: string;
+  replayed?: boolean;
+  queued_at?: string;
   /** Daemon-side arrival timestamp (ISO), stamped at enqueue. Injected into
    *  the turn text so codex can spot stale deliveries: a turn that hung
    *  in-flight (e.g. the 2026-07-15 approval-freeze incident) may only
@@ -273,6 +275,7 @@ function buildPrompt(ev: ParsedEvent): string {
     `  type:    ${ev.type || 'unknown'}`,
     `  from:    ${senderLabel}`,
     `  summary: ${summary}`,
+    ...buildEventTimingLines(ev).map(line => `  ${line}`),
     ``,
     `STEP 1 — bind your MCP session to your hive identity:`,
     `  Call hive_start({ id: "${agentId}" }) FIRST. This makes subsequent hive_*`,
@@ -899,7 +902,7 @@ function buildEventTurnText(ev: ParsedEvent): string {
     // received: arrival time at THIS daemon. If you are reading this long
     // after that time (thread resumed with a backlog, turn was stuck), treat
     // the event as stale — do not reply as if it just happened.
-    `received: ${ev.received_at || new Date().toISOString()}`,
+    ...buildEventTimingLines(ev),
   ].join('\n');
 }
 
@@ -916,7 +919,7 @@ function buildPendingEventHistoryText(ev: ParsedEvent): string {
     `from: ${senderLabel}`,
     `summary: ${summary}`,
     `event_id: ${eventDedupKey(ev)}`,
-    `received: ${ev.received_at || new Date().toISOString()}`,
+    ...buildEventTimingLines(ev),
     ``,
     `This notice was persisted without starting a model turn. It is not a`,
     `read receipt and Hive read cursors were not advanced. On the next real`,
@@ -970,18 +973,23 @@ function eventDedupKey(ev: ParsedEvent): string {
 }
 
 async function shouldInjectQueuedEvent(ev: ParsedEvent): Promise<boolean> {
-  if (ev.message_id == null || !agentId) return true;
-  const decision = await checkDmDeliveryBeforeInject(
-    DM_DELIVERY_STATUS_URL,
+  if (!agentId) return true;
+  const decision = await checkEventDeliveryBeforeInject(
+    PUSH_DELIVERY_STATUS_URL,
     agentId,
-    ev.message_id,
+    {
+      event_id: ev.event_id,
+      message_id: ev.message_id,
+      task_id: ev.task_id,
+      team_id: ev.team_id,
+    },
   );
   if (!decision.deliver) {
-    console.error(`[codex-channel] skipped already-consumed DM message_id=${ev.message_id} reason=${decision.reason} cursor=${decision.cursor ?? 'n/a'}`);
+    console.error(`[codex-channel] skipped stale/consumed event eventId=${eventDedupKey(ev)} reason=${decision.reason} seq=${decision.seq ?? decision.message_id ?? 'n/a'} cursor=${decision.cursor ?? 'n/a'} latest=${decision.latest_seq ?? 'n/a'}`);
     return false;
   }
   if (decision.reason === 'preflight_error') {
-    console.error(`[codex-channel] DM delivery preflight failed for message_id=${ev.message_id}; fail-open inject: ${decision.error}`);
+    console.error(`[codex-channel] event delivery preflight failed for eventId=${eventDedupKey(ev)}; fail-open inject: ${decision.error}`);
   }
   return true;
 }
@@ -1070,7 +1078,7 @@ async function processNextEvent() {
 }
 
 function enqueue(ev: ParsedEvent) {
-  ev.received_at = new Date().toISOString();
+  ev.received_at ||= new Date().toISOString();
   eventQueue.push(ev);
   setImmediate(processNextEvent);
 }

@@ -8,9 +8,14 @@ import {
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyTeamMembers } from '../sessions.js';
 import { buildPushMessage } from '../preview.js';
+import { setReadCursor } from '../db.js';
 
-function teamEventId(teamId: string, type: string): string {
-  return `team:${teamId}:${type}:${Date.now()}`;
+function teamEventId(teamId: string, type: string, seq: number): string {
+  return `team:${teamId}:${type}:${seq}`;
+}
+
+function teamMetadataEventId(teamId: string, type: string): string {
+  return `team-meta:${teamId}:${type}:${Date.now()}`;
 }
 
 export function registerTeamTools(mcp: McpServer) {
@@ -48,7 +53,7 @@ export function registerTeamTools(mcp: McpServer) {
         type: 'join',
         from: shownName,
         from_agent_id: agent.id,
-        event_id: teamEventId(result.team_id, 'join'),
+        event_id: teamEventId(result.team_id, 'join', result.seq),
         team_id: result.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -93,6 +98,8 @@ export function registerTeamTools(mcp: McpServer) {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
       const result = handleTeamEvents(agent.id, { team_id: params.team_id, since: params.since, limit: params.limit });
+      const last = result.events.at(-1);
+      if (last) setReadCursor(agent.id, 'team', params.team_id, last.seq);
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
     },
   );
@@ -113,7 +120,7 @@ export function registerTeamTools(mcp: McpServer) {
         type: 'team-message',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: teamEventId(params.team_id, 'team-message'),
+        event_id: teamEventId(params.team_id, 'team-message', result.seq),
         team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -136,7 +143,7 @@ export function registerTeamTools(mcp: McpServer) {
         type: 'team-rules-update',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: teamEventId(params.team_id, 'team-rules-update'),
+        event_id: teamMetadataEventId(params.team_id, 'team-rules-update'),
         team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -175,7 +182,7 @@ export function registerTeamTools(mcp: McpServer) {
         type: 'rename',
         from: result.nickname || agent.display_name,
         from_agent_id: agent.id,
-        event_id: teamEventId(params.team_id, 'rename'),
+        event_id: teamEventId(params.team_id, 'rename', result.seq),
         team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };
@@ -207,7 +214,7 @@ export function registerTeamTools(mcp: McpServer) {
         type: 'leave',
         from: agent.display_name,
         from_agent_id: agent.id,
-        event_id: teamEventId(params.team_id, 'leave'),
+        event_id: teamEventId(params.team_id, 'leave', result.seq),
         team_id: params.team_id,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result) }] };

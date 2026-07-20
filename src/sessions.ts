@@ -2,6 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import { log } from './log.js';
 import * as db from './db.js';
+import { getPushDeliveryDecision, markPushReplayed, parsePushPayload } from './push-delivery.js';
 
 export interface Session {
   transport: StreamableHTTPServerTransport;
@@ -13,6 +14,7 @@ export const sessionAgents = new Map<string, string>();
 export const agentSessions = new Map<string, Set<string>>();
 // Sessions with an active SSE GET stream (push notifications only work for these).
 export const activeSSE = new Set<string>();
+const activeDrains = new Map<string, Promise<void>>();
 
 export function bindSession(sessionId: string, agentId: string) {
   const oldAgentId = sessionAgents.get(sessionId);
@@ -88,7 +90,7 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
  * the stream is registered. Idempotent: rows are removed only after at least
  * one session confirmed the send.
  */
-export async function drainPushesForAgent(agentId: string): Promise<void> {
+async function drainPendingPushesOnce(agentId: string): Promise<void> {
   const sids = agentSessions.get(agentId);
   const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
   if (live.length === 0) return;
@@ -97,27 +99,65 @@ export async function drainPushesForAgent(agentId: string): Promise<void> {
   if (rows.length === 0) return;
 
   log('info', `[drain] agent=${agentId} pending=${rows.length} live-sse=${live.length}`);
-  const delivered: number[] = [];
+  const settled: number[] = [];
+  let deliveredCount = 0;
+  let skippedCount = 0;
   for (const row of rows) {
+    const identity = parsePushPayload(row.payload);
+    if (identity) {
+      try {
+        const decision = getPushDeliveryDecision(agentId, identity);
+        if (!decision.deliver) {
+          settled.push(row.id);
+          skippedCount++;
+          log('info', `[drain] skipped stale push=${row.id} agent=${agentId} reason=${decision.reason} seq=${decision.seq ?? decision.message_id ?? 'n/a'} cursor=${decision.cursor ?? 'n/a'}`);
+          continue;
+        }
+      } catch (err) {
+        // Fail open. A duplicate notification is recoverable through the
+        // channel's own preflight; silently losing unread work is not.
+        log('warn', `[drain] watermark check failed push=${row.id}; fail-open: ${err}`);
+      }
+    }
+
+    const replayPayload = markPushReplayed(row.payload, row.created_at);
     let ok = false;
     for (const sid of live) {
       const session = sessions[sid];
       if (!session) continue;
       try {
-        await session.server.sendLoggingMessage({ level: 'info', data: row.payload }, sid);
+        await session.server.sendLoggingMessage({ level: 'info', data: replayPayload }, sid);
         session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
         ok = true;
       } catch (err) {
         log('warn', `[drain] failed sid=${sid} push=${row.id}: ${err}`);
       }
     }
-    if (ok) delivered.push(row.id);
+    if (ok) {
+      settled.push(row.id);
+      deliveredCount++;
+    }
     else break; // stop on first failure to preserve order
   }
-  if (delivered.length > 0) {
-    db.deletePendingPushes(delivered);
-    log('info', `[drain] agent=${agentId} delivered=${delivered.length}/${rows.length}`);
+  if (settled.length > 0) {
+    db.deletePendingPushes(settled);
+    log('info', `[drain] agent=${agentId} delivered=${deliveredCount} skipped=${skippedCount} settled=${settled.length}/${rows.length}`);
   }
+}
+
+/**
+ * Single-flight wrapper: SSE-open and hive_start binding can schedule a drain
+ * for the same agent on adjacent ticks. Sharing one promise prevents both
+ * callers from reading and replaying the same pending rows before deletion.
+ */
+export function drainPushesForAgent(agentId: string): Promise<void> {
+  const existing = activeDrains.get(agentId);
+  if (existing) return existing;
+  const run = drainPendingPushesOnce(agentId).finally(() => {
+    if (activeDrains.get(agentId) === run) activeDrains.delete(agentId);
+  });
+  activeDrains.set(agentId, run);
+  return run;
 }
 
 export async function notifyTeamMembers(teamId: string, excludeAgentId?: string, message?: string) {

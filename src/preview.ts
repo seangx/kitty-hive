@@ -97,9 +97,9 @@ export interface PushPayloadInput {
   /** Globally-unique event id. Used for dedup AND as the payload's stable
    *  identity. Format conventions:
    *    - DM:   `dm:<message_id>`
-   *    - Task: `task-ev:<task_events.id>`
-   *    - Team: `team-ev:<team_events.id>`
-   *    - Synth (no DB row, e.g. task-assigned):  `task:<task_id>:<type>:<ts>` */
+   *    - Task: `task:<task_id>:<type>:<task_events.seq>`
+   *    - Team: `team:<team_id>:<type>:<team_events.seq>`
+   *    - Synthetic metadata: implementation-specific stable prefix + timestamp */
   event_id: string;
   message_id?: number;
   task_id?: string;

@@ -1,3 +1,5 @@
+import { buildEventTimingLines } from './codex-channel-runtime.js';
+
 export interface OpenCodeSession {
   id: string;
   title?: string;
@@ -27,6 +29,8 @@ export interface HivePushEvent {
   event_id?: string;
   raw?: string;
   received_at?: string;
+  replayed?: boolean;
+  queued_at?: string;
 }
 
 export type OpenCodeInjectOutcome =
@@ -94,8 +98,6 @@ export function buildOpenCodePrompt(
 
   const senderLabel = ev.from || ev.from_agent_id || 'unknown';
   const summary = ev.title || ev.preview || ev.raw || '(no summary)';
-  const received = ev.received_at || new Date().toISOString();
-
   let fetchHint: string;
   if (ev.message_id != null) {
     fetchHint = `hive_dm_read({ message_id: ${ev.message_id}, as: "${agent.id}" })`;
@@ -113,7 +115,7 @@ export function buildOpenCodePrompt(
     `[kitty-hive event] type=${ev.type || 'unknown'} from=${senderLabel}`,
     `summary: ${summary}`,
     `fetch: ${fetchHint}`,
-    `received: ${received}`,
+    ...buildEventTimingLines(ev),
     `event_id: ${eventId}`,
     ``,
     `You are kitty-hive agent "${agent.name}" (id: ${agent.id}).`,

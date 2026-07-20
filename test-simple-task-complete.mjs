@@ -24,6 +24,7 @@
 import { spawn } from 'node:child_process';
 import { unlinkSync, existsSync } from 'node:fs';
 import { randomInt } from 'node:crypto';
+import Database from 'better-sqlite3';
 
 const PORT = 15500 + randomInt(0, 99);
 const DB_PATH = `/tmp/hive-test-simple-complete-${process.pid}.db`;
@@ -122,6 +123,23 @@ async function run() {
   ok(c1.ok && c1.data.status === 'completed', `task_complete → completed (got ${JSON.stringify(c1.data)})`);
   const chk1 = (await tool(sidC, 'hive_check', { task_id: t1.task_id })).data;
   ok(chk1.status === 'completed', `hive_check confirms completed`);
+  const cursorDb = new Database(DB_PATH, { readonly: true });
+  const taskCursor = cursorDb.prepare(
+    "SELECT last_seq FROM read_cursors WHERE agent_id = ? AND target_type = 'task' AND target_id = ?"
+  ).get(creator.agent_id, t1.task_id);
+  cursorDb.close();
+  ok(taskCursor?.last_seq === chk1.recent_events.at(-1).seq, 'hive_check advances the bound agent task cursor');
+  const preflightRes = await fetch(`http://127.0.0.1:${PORT}/admin/push-delivery-status`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      agent_id: creator.agent_id,
+      event_id: `task:${t1.task_id}:task-assigned:1`,
+      task_id: t1.task_id,
+    }),
+  });
+  const preflight = await preflightRes.json();
+  ok(preflightRes.ok && !preflight.deliver && preflight.reason === 'already_read', 'HTTP preflight suppresses stale task assignment after hive_check');
   ok(chk1.recent_events.some(e => e.type === 'task-complete' && JSON.parse(e.payload_json || '{}').result === 'did the thing'),
     'task-complete event carries result');
 

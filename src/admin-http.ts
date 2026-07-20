@@ -11,6 +11,7 @@ import { join } from 'node:path';
 import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
+import { getPushDeliveryDecision } from './push-delivery.js';
 import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
 import {
   getOpenCodeDaemonForAgent,
@@ -283,45 +284,39 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
-  // POST /admin/codex-dm-delivery-status — read-only preflight used by the
-  // codex-channel daemon immediately before it injects a queued DM event.
-  // A DM may have been read through hive_inbox in a pane while its original
-  // push was waiting behind another Codex turn. Without this second check the
-  // stale queue entry starts a duplicate turn minutes later.
+  // Read-only preflight used by channel daemons immediately before injecting
+  // queued events. DM uses its per-sender cursor; task/team use stable stream
+  // seq plus their read cursor. Task state hints are also suppressed when a
+  // higher task seq already exists.
   if (
-    ['/admin/dm-delivery-status', '/admin/codex-dm-delivery-status', '/admin/opencode-dm-delivery-status'].includes(url.pathname)
+    [
+      '/admin/push-delivery-status',
+      '/admin/dm-delivery-status',
+      '/admin/codex-dm-delivery-status',
+      '/admin/opencode-dm-delivery-status',
+    ].includes(url.pathname)
     && req.method === 'POST'
   ) {
     try {
       const body = JSON.parse(await readBody(req));
-      const { agent_id, message_id } = body;
-      if (typeof agent_id !== 'string' || !agent_id || !Number.isInteger(message_id) || message_id <= 0) {
+      const { agent_id, event_id, message_id, task_id, team_id } = body;
+      const hasIdentity = typeof event_id === 'string'
+        || (Number.isInteger(message_id) && message_id > 0)
+        || typeof task_id === 'string'
+        || typeof team_id === 'string';
+      if (typeof agent_id !== 'string' || !agent_id || !hasIdentity) {
         res.writeHead(400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'agent_id (string) and message_id (positive integer) required' }));
+        res.end(JSON.stringify({ error: 'agent_id and event identity required' }));
         return;
       }
-
-      const msg = db.getDMById(message_id);
-      if (!msg) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ deliver: false, reason: 'not_found', message_id }));
-        return;
-      }
-      if (msg.to_agent_id !== agent_id) {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ deliver: false, reason: 'not_recipient', message_id }));
-        return;
-      }
-
-      const cursor = db.getReadCursor(agent_id, 'dm', msg.from_agent_id);
-      const deliver = msg.id > cursor;
+      const decision = getPushDeliveryDecision(agent_id, {
+        event_id: typeof event_id === 'string' ? event_id : undefined,
+        message_id: Number.isInteger(message_id) ? message_id : undefined,
+        task_id: typeof task_id === 'string' ? task_id : undefined,
+        team_id: typeof team_id === 'string' ? team_id : undefined,
+      });
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        deliver,
-        reason: deliver ? 'unread' : 'already_read',
-        message_id: msg.id,
-        cursor,
-      }));
+      res.end(JSON.stringify(decision));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));

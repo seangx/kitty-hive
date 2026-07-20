@@ -19,6 +19,7 @@
 import { spawn } from 'node:child_process';
 import { unlinkSync, existsSync } from 'node:fs';
 import { randomInt } from 'node:crypto';
+import Database from 'better-sqlite3';
 
 const PORT = 14800 + randomInt(0, 199);
 const DB_PATH = `/tmp/hive-test-teamops-${process.pid}.db`;
@@ -129,7 +130,7 @@ async function run() {
   const m2 = new HiveClient('m2');
   const outsider = new HiveClient('outsider');
   await Promise.all([host.init(), m1.init(), m2.init(), outsider.init()]);
-  await host.callTool('hive_start', { name: 'host', tool: 'claude' });
+  const hostInfo = await host.callTool('hive_start', { name: 'host', tool: 'claude' });
   const m1Info = await m1.callTool('hive_start', { name: 'm1', tool: 'claude' });
   const m2Info = await m2.callTool('hive_start', { name: 'm2', tool: 'claude' });
   await outsider.callTool('hive_start', { name: 'outsider', tool: 'claude' });
@@ -205,6 +206,12 @@ async function run() {
   ok(m1RenameEvents.length >= 2, `rename events attributed to m1 (got ${m1RenameEvents.length})`);
   const m1LeaveEvent = leaveEvents.find(e => e.actor_agent_id === m1Info.agent_id);
   ok(!!m1LeaveEvent, `leave event attributed to m1 (actor_agent_id=${m1LeaveEvent?.actor_agent_id})`);
+  const cursorDb = new Database(DB_PATH, { readonly: true });
+  const teamCursor = cursorDb.prepare(
+    "SELECT last_seq FROM read_cursors WHERE agent_id = ? AND target_type = 'team' AND target_id = ?"
+  ).get(hostInfo.agent_id, team.team_id);
+  cursorDb.close();
+  ok(teamCursor?.last_seq === events.events.at(-1).seq, 'hive_team_events advances cursor through the returned seq');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);

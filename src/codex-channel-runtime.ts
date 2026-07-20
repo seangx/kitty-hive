@@ -43,6 +43,8 @@
  *     duplicated turn from a user's codex thread.
  */
 
+import type { PushIdentity, PushDeliveryReason } from './push-delivery.js';
+
 export interface CodexTurn {
   id: string;
   status?: string;
@@ -151,47 +153,88 @@ export class HistoryItemInjector {
   }
 }
 
-export interface DmDeliveryDecision {
+export interface EventDeliveryDecision {
   deliver: boolean;
-  reason: 'unread' | 'already_read' | 'not_recipient' | 'not_found' | 'preflight_error';
+  reason: PushDeliveryReason | 'preflight_error';
   message_id?: number;
   cursor?: number;
+  seq?: number;
+  latest_seq?: number;
   error?: string;
 }
+
+export type DmDeliveryDecision = EventDeliveryDecision;
 
 type FetchLike = (input: string, init?: RequestInit) => Promise<Response>;
 
 /**
- * Ask hive whether a queued DM is still unread immediately before injection.
- * Fail open on transport/protocol errors: a duplicate notification is safer
- * than silently dropping a genuinely unread message during a hive restart.
+ * Ask hive whether a queued event is still actionable immediately before
+ * injection. Fail open on transport/protocol errors: a duplicate notification
+ * is safer than silently dropping a genuinely unread event during a restart.
  */
-export async function checkDmDeliveryBeforeInject(
+export async function checkEventDeliveryBeforeInject(
+  adminUrl: string,
+  agentId: string,
+  event: PushIdentity,
+  fetchImpl: FetchLike = fetch,
+): Promise<EventDeliveryDecision> {
+  try {
+    const res = await fetchImpl(adminUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId, ...event }),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json() as Partial<EventDeliveryDecision>;
+    if (typeof data.deliver !== 'boolean' || typeof data.reason !== 'string') {
+      throw new Error('invalid delivery-status response');
+    }
+    return data as EventDeliveryDecision;
+  } catch (err: any) {
+    return {
+      deliver: true,
+      reason: 'preflight_error',
+      message_id: event.message_id,
+      error: String(err?.message || err),
+    };
+  }
+}
+
+/** Backward-compatible convenience wrapper used by older integrations/tests. */
+export function checkDmDeliveryBeforeInject(
   adminUrl: string,
   agentId: string,
   messageId: number,
   fetchImpl: FetchLike = fetch,
 ): Promise<DmDeliveryDecision> {
-  try {
-    const res = await fetchImpl(adminUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: agentId, message_id: messageId }),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data = await res.json() as Partial<DmDeliveryDecision>;
-    if (typeof data.deliver !== 'boolean' || typeof data.reason !== 'string') {
-      throw new Error('invalid delivery-status response');
-    }
-    return data as DmDeliveryDecision;
-  } catch (err: any) {
-    return {
-      deliver: true,
-      reason: 'preflight_error',
-      message_id: messageId,
-      error: String(err?.message || err),
-    };
+  return checkEventDeliveryBeforeInject(adminUrl, agentId, { message_id: messageId }, fetchImpl);
+}
+
+export interface EventTiming {
+  received_at?: string;
+  replayed?: boolean;
+  queued_at?: string;
+}
+
+/** Make queue delay/restart replay explicit in model-visible event prompts. */
+export function buildEventTimingLines(
+  event: EventTiming,
+  nowMs = Date.now(),
+  delayedAfterMs = 30_000,
+): string[] {
+  const received = event.received_at || new Date(nowMs).toISOString();
+  const lines = [`received: ${received}`];
+  if (event.replayed) {
+    lines.push(`replayed: true${event.queued_at ? ` (originally queued ${event.queued_at})` : ''}`);
   }
+  const originMs = Date.parse(event.queued_at || received);
+  if (Number.isFinite(originMs)) {
+    const delayMs = Math.max(0, nowMs - originMs);
+    if (delayMs >= delayedAfterMs) {
+      lines.push(`stale_delivery: true (delay_ms=${delayMs}; fetch authoritative current state before acting)`);
+    }
+  }
+  return lines;
 }
 
 export class TurnTracker {
