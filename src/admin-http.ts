@@ -324,6 +324,134 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
+  // POST /admin/daemon-respawn — force-refresh a supervised Codex/OpenCode
+  // backend while preserving its current conversation identity. This is the
+  // launcher-facing restart primitive: Kitty restarts only its visible attach
+  // process, while Hive owns the daemon/app-server lifecycle and returns the
+  // fresh coordinates after the replacement daemon reports ready.
+  //
+  // body: { agent_id: string }
+  //
+  // Success:
+  // {
+  //   ok: true, ready: true, mode: "respawn", tool, agent_id,
+  //   conversation: { id, requested_id, preserved },
+  //   daemon: { pid, uptime_ms, restart_count },
+  //   attach: { kind, ...tool-specific coordinates }
+  // }
+  //
+  // A non-empty pre-respawn conversation id is a hard preservation contract.
+  // If the backend falls back to a fresh conversation, return HTTP 409 with
+  // ok=false but include the recovered attach coordinates for diagnosis.
+  if (url.pathname === '/admin/daemon-respawn' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string' || !agent_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id (string) required' }));
+        return;
+      }
+
+      const agent = db.getAgentById(agent_id);
+      if (!agent) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `agent not found: ${agent_id}` }));
+        return;
+      }
+      if (agent.origin_peer !== '') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'cannot respawn a remote (federated) agent' }));
+        return;
+      }
+      if (agent.tool !== 'codex' && agent.tool !== 'opencode') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `agent.tool="${agent.tool}" is not supervised` }));
+        return;
+      }
+
+      const requestedConversationId = agent.thread_id || null;
+      const result = await lockPerAgent(agent_id, async () => {
+        log('info', `[admin] daemon-respawn agent=${agent_id.slice(-12)} tool=${agent.tool} preserve=${requestedConversationId || '(none)'}`);
+        if (agent.tool === 'codex') {
+          return { tool: 'codex' as const, snap: await requestDaemonRespawn(agent_id, 45_000) };
+        }
+        return { tool: 'opencode' as const, snap: await requestOpenCodeDaemonRespawn(agent_id, 45_000) };
+      });
+      if (!result.snap) {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          ready: false,
+          status: 'timeout',
+          mode: 'respawn',
+          agent_id,
+          tool: agent.tool,
+          conversation: {
+            id: null,
+            requested_id: requestedConversationId,
+            preserved: null,
+          },
+          attach: null,
+          error: 'replacement daemon did not become ready within 45s',
+        }));
+        return;
+      }
+
+      let conversationId: string | null;
+      let attach: Record<string, unknown>;
+      if (result.tool === 'codex') {
+        conversationId = result.snap.thread_id;
+        attach = {
+          kind: 'codex-remote',
+          ws_url: result.snap.ws_url,
+          thread_id: result.snap.thread_id,
+        };
+      } else {
+        conversationId = result.snap.session_id;
+        attach = {
+          kind: 'opencode-attach',
+          server_url: result.snap.server_url,
+          session_id: result.snap.session_id,
+          server_username: result.snap.server_username,
+          server_password: result.snap.server_password,
+          version: result.snap.version,
+        };
+      }
+      const preserved = requestedConversationId
+        ? conversationId === requestedConversationId
+        : null;
+      const response = {
+        ok: preserved !== false,
+        ready: true,
+        status: preserved === false ? 'conversation_changed' : 'ready',
+        mode: 'respawn',
+        agent_id,
+        tool: agent.tool,
+        conversation: {
+          id: conversationId,
+          requested_id: requestedConversationId,
+          preserved,
+        },
+        daemon: {
+          pid: result.snap.pid,
+          uptime_ms: result.snap.uptime_ms,
+          restart_count: result.snap.restart_count,
+        },
+        attach,
+        ...(preserved === false
+          ? { error: 'replacement daemon became ready on a different conversation id' }
+          : {}),
+      };
+      res.writeHead(preserved === false ? 409 : 200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(response));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
   // POST /admin/codex-set-thread — switch the daemon for a codex agent to a
   // specific thread (resume) or to a fresh thread (reset).
   //
