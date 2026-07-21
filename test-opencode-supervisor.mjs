@@ -8,6 +8,7 @@ import Database from 'better-sqlite3';
 const PORT = 18000 + randomInt(0, 1000);
 const DB = `/tmp/hive-opencode-supervisor-${process.pid}.db`;
 const FAKE = `/tmp/fake-opencode-${process.pid}.mjs`;
+const STATE = `/tmp/fake-opencode-state-${process.pid}.json`;
 let server;
 let pass = 0;
 let fail = 0;
@@ -20,7 +21,7 @@ function ok(condition, message) {
 
 function cleanup() {
   if (server && !server.killed) server.kill('SIGTERM');
-  for (const path of [FAKE, DB, `${DB}-wal`, `${DB}-shm`]) {
+  for (const path of [FAKE, STATE, DB, `${DB}-wal`, `${DB}-shm`]) {
     if (existsSync(path)) try { unlinkSync(path); } catch { /* ignore */ }
   }
 }
@@ -29,14 +30,18 @@ process.on('SIGINT', () => { cleanup(); process.exit(130); });
 
 writeFileSync(FAKE, `#!/usr/bin/env node
 import { createServer } from 'node:http';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 const args = process.argv.slice(2);
 if (args[0] === '--version') { console.log('1.18.0-test'); process.exit(0); }
 if (args[0] !== 'serve') process.exit(2);
 const port = Number(args[args.indexOf('--port') + 1]);
 const expected = 'Basic ' + Buffer.from((process.env.OPENCODE_SERVER_USERNAME || 'opencode') + ':' + process.env.OPENCODE_SERVER_PASSWORD).toString('base64');
-let next = 1;
+const statePath = process.env.FAKE_OPENCODE_STATE;
+const saved = statePath && existsSync(statePath) ? JSON.parse(readFileSync(statePath, 'utf8')) : { next: 1, sessions: [] };
+let next = saved.next;
 let selected = '';
-const sessions = new Map();
+const sessions = new Map(saved.sessions.map(value => [value.id, value]));
+const persist = () => { if (statePath) writeFileSync(statePath, JSON.stringify({ next, sessions: [...sessions.values()].map(value => ({ ...value, busy: false })) })); };
 const json = (res, status, body) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
 const server = createServer(async (req, res) => {
   if (req.headers.authorization !== expected) return json(res, 401, { error: 'unauthorized' });
@@ -49,7 +54,7 @@ const server = createServer(async (req, res) => {
     return json(res, 200, out);
   }
   if (url.pathname === '/session' && req.method === 'POST') {
-    const id = 'ses_test_' + next++; sessions.set(id, { id, title: body.title, messages: [], busy: false });
+    const id = 'ses_test_' + next++; sessions.set(id, { id, title: body.title, messages: [], busy: false }); persist();
     return json(res, 200, { id, title: body.title, version: '1.18.0-test' });
   }
   const match = url.pathname.match(/^\\/session\\/(ses[^/]+)(?:\\/(message|prompt_async))?$/);
@@ -59,8 +64,8 @@ const server = createServer(async (req, res) => {
     if (!match[2] && req.method === 'GET') return json(res, 200, { id: session.id, title: session.title });
     if (match[2] === 'message' && req.method === 'GET') return json(res, 200, session.messages);
     if (match[2] === 'prompt_async' && req.method === 'POST') {
-      session.messages.push({ info: { role: 'user' }, parts: body.parts }); session.busy = true;
-      res.writeHead(204); res.end(); setTimeout(() => { session.busy = false; }, 40); return;
+      session.messages.push({ info: { role: 'user' }, parts: body.parts }); session.busy = true; persist();
+      res.writeHead(204); res.end(); setTimeout(() => { session.busy = false; persist(); }, 40); return;
     }
   }
   if (url.pathname === '/tui/select-session' && req.method === 'POST') { selected = body.sessionID; return json(res, 200, true); }
@@ -73,7 +78,7 @@ for (const sig of ['SIGINT','SIGTERM']) process.on(sig, () => server.close(() =>
 chmodSync(FAKE, 0o755);
 
 server = spawn(process.execPath, ['dist/index.js', 'serve', '--port', String(PORT), '--db', DB, '--quiet'], {
-  env: { ...process.env, OPENCODE_CMD: FAKE },
+  env: { ...process.env, OPENCODE_CMD: FAKE, FAKE_OPENCODE_STATE: STATE },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 server.stdout.on('data', chunk => { serverLog += chunk; });
@@ -92,6 +97,16 @@ await waitFor(async () => {
   const res = await fetch(`http://127.0.0.1:${PORT}/admin/opencode-daemons`);
   return res.ok;
 });
+
+console.log('\n=== Unified respawn validation ===');
+const missingAgentRes = await fetch(`http://127.0.0.1:${PORT}/admin/daemon-respawn`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
+});
+ok(missingAgentRes.status === 400, 'missing agent_id fails closed');
+const unknownAgentRes = await fetch(`http://127.0.0.1:${PORT}/admin/daemon-respawn`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent_id: 'missing-agent' }),
+});
+ok(unknownAgentRes.status === 404, 'unknown agent fails closed');
 
 let rpc = 0;
 async function newMcpSession() {
@@ -160,7 +175,11 @@ ok(
 
 console.log('\n=== Hive DM reaches the persistent OpenCode session ===');
 const senderSid = await newMcpSession();
-await call(senderSid, 'hive_start', { name: 'opencode-test-sender', tool: 'shell' });
+const sender = await call(senderSid, 'hive_start', { name: 'opencode-test-sender', tool: 'shell' });
+const unsupportedRes = await fetch(`http://127.0.0.1:${PORT}/admin/daemon-respawn`, {
+  method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ agent_id: sender.agent_id }),
+});
+ok(unsupportedRes.status === 400, 'non-supervised tool fails closed');
 const sent = await call(senderSid, 'hive_dm', { to: receiver.agent_id, content: 'integration push payload' });
 await waitFor(async () => {
   const res = await fetch(`${ready.server_url}/session/${ready.session_id}/message?limit=100`, { headers: { Authorization: auth } });
@@ -178,7 +197,7 @@ const switched = await waitFor(async () => {
   const body = await res.json();
   return res.ok && body.ok ? body : null;
 });
-ok(true, `set-session succeeds in-process (got ${JSON.stringify(switched)})`);
+ok(true, `set-session succeeds in-process (mode=${switched.mode}, session=${switched.session_id})`);
 ok(switched.server_url === ready.server_url, 'server URL stays stable across session reset');
 ok(switched.session_id !== ready.session_id && switched.session_id.startsWith('ses'), 'fresh OpenCode session selected');
 const selectedRes = await fetch(`${ready.server_url}/test/selected`, { headers: { Authorization: auth } });
@@ -194,6 +213,57 @@ const db = new Database(DB, { readonly: true });
 const row = db.prepare('SELECT thread_id FROM agents WHERE id = ?').get(receiver.agent_id);
 db.close();
 ok(row.thread_id === switched.session_id, 'new session id persisted for daemon restart');
+
+console.log('\n=== Forced daemon respawn preserves session and returns fresh attach ===');
+const beforeRespawn = await waitFor(async () => {
+  const res = await fetch(`http://127.0.0.1:${PORT}/admin/opencode-daemons`);
+  const body = await res.json();
+  return body.daemons.find(item => item.agent_id === receiver.agent_id && item.ready);
+});
+const respawnRes = await fetch(`http://127.0.0.1:${PORT}/admin/daemon-respawn`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ agent_id: receiver.agent_id }),
+});
+const respawned = await respawnRes.json();
+ok(respawnRes.status === 200 && respawned.ok && respawned.ready, 'unified respawn waits for ready');
+ok(respawned.tool === 'opencode' && respawned.mode === 'respawn', 'response identifies OpenCode respawn');
+ok(
+  respawned.conversation?.requested_id === switched.session_id
+  && respawned.conversation?.id === switched.session_id
+  && respawned.conversation?.preserved === true,
+  'forced respawn preserves the existing OpenCode session',
+);
+ok(
+  respawned.attach?.kind === 'opencode-attach'
+  && respawned.attach?.session_id === switched.session_id
+  && respawned.attach?.server_url !== switched.server_url,
+  'response returns fresh OpenCode attach coordinates',
+);
+ok(respawned.daemon?.pid !== beforeRespawn.pid, 'replacement daemon has a new pid');
+const respawnAuth = `Basic ${Buffer.from(`${respawned.attach.server_username}:${respawned.attach.server_password}`).toString('base64')}`;
+const respawnHealth = await fetch(`${respawned.attach.server_url}/global/health`, { headers: { Authorization: respawnAuth } });
+ok(respawnHealth.ok, 'fresh attach credentials authenticate to the replacement backend');
+
+console.log('\n=== Conversation preservation fails closed ===');
+const mismatchDb = new Database(DB);
+mismatchDb.prepare('UPDATE agents SET thread_id = ? WHERE id = ?').run('ses_missing_for_respawn_test', receiver.agent_id);
+mismatchDb.close();
+const mismatchRes = await fetch(`http://127.0.0.1:${PORT}/admin/daemon-respawn`, {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({ agent_id: receiver.agent_id }),
+});
+const mismatch = await mismatchRes.json();
+ok(mismatchRes.status === 409 && mismatch.ok === false && mismatch.ready === true,
+  'conversation mismatch returns HTTP 409 with recovered ready state');
+ok(
+  mismatch.status === 'conversation_changed'
+  && mismatch.conversation?.requested_id === 'ses_missing_for_respawn_test'
+  && mismatch.conversation?.preserved === false
+  && mismatch.attach?.session_id,
+  'mismatch response exposes requested id and recovered attach coordinates',
+);
 
 console.log(`\n${pass} passed, ${fail} failed`);
 server.kill('SIGTERM');

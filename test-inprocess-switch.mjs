@@ -20,6 +20,8 @@
 //   5. restart_count stays 0 throughout (nothing crashed, nothing respawned)
 //   6. set-thread BEFORE daemon ready → mode='respawn' (fallback path alive)
 //   7. TurnTracker.setThreadId retargets turn/start (unit, stub transport)
+//   8. Unified forced respawn → NEW pid/ws, SAME persisted thread id, and
+//      fresh launcher attach coordinates
 //
 // Requires codex installed (same assumption as test-immediate-respawn.mjs).
 
@@ -133,6 +135,15 @@ async function callSetThread(agentId, threadId) {
   return { elapsed: Date.now() - t0, status: res.status, body };
 }
 
+async function callDaemonRespawn(agentId) {
+  const res = await fetch(`${ADMIN}/admin/daemon-respawn`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_id: agentId }),
+  });
+  return { status: res.status, body: await res.json() };
+}
+
 function dbThreadId(agentId) {
   const db = new Database(DB_PATH, { readonly: true });
   try {
@@ -231,6 +242,28 @@ async function run() {
   ok(d2.pid === d0.pid, `pid ${d0.pid} unchanged through reset+resume`);
   ok(d2.restart_count === 0, `restart_count=0 (got ${d2.restart_count})`);
   ok(d2.control_url === d0.control_url, `control_url stable (${d2.control_url})`);
+
+  console.log('\n=== Test 8: forced daemon respawn preserves thread and returns fresh attach ===');
+  const forced = await callDaemonRespawn(agent.agent_id);
+  ok(forced.status === 200 && forced.body.ok && forced.body.ready,
+    `unified respawn waits for ready (status ${forced.status}, error=${forced.body.error || '-'})`);
+  ok(forced.body.tool === 'codex' && forced.body.mode === 'respawn', 'response identifies Codex respawn');
+  ok(
+    forced.body.conversation?.requested_id === firstThread
+    && forced.body.conversation?.id === firstThread
+    && forced.body.conversation?.preserved === true,
+    'forced respawn preserves the existing Codex thread',
+  );
+  ok(
+    forced.body.attach?.kind === 'codex-remote'
+    && forced.body.attach?.thread_id === firstThread
+    && forced.body.attach?.ws_url !== d2.ws_url,
+    'response returns fresh Codex attach coordinates',
+  );
+  ok(forced.body.daemon?.pid !== d2.pid, 'replacement Codex daemon has a new pid');
+  const d3 = await getDaemon(agent.agent_id);
+  ok(d3?.pid === forced.body.daemon?.pid && d3?.thread_id === firstThread,
+    'supervisor snapshot matches returned daemon and thread');
 
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
