@@ -3,6 +3,7 @@ import type { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/se
 import { log } from './log.js';
 import * as db from './db.js';
 import { getPushDeliveryDecision, markPushReplayed, parsePushPayload } from './push-delivery.js';
+import { notifyKittyWakeup } from './kitty-wakeup.js';
 
 export interface Session {
   transport: StreamableHTTPServerTransport;
@@ -50,8 +51,26 @@ export function unbindSession(sessionId: string) {
 
 export async function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string) {
   const payload = message ?? 'New event';
+  const visibleNotifications: Promise<void>[] = [];
   for (const agentId of agentIds) {
     if (agentId === excludeAgentId) continue;
+    const target = db.getAgentById(agentId);
+    if (
+      target?.event_mode === 'foreground'
+      && target.tool === 'codex'
+      && target.origin_peer === ''
+      && target.external_key
+    ) {
+      visibleNotifications.push(notifyKittyWakeup(target.external_key, payload).then((result) => {
+        if (result.kind === 'sent') {
+          log('info', `[notify] agent=${agentId} → kitty visible wakeup OK`);
+        } else {
+          // Headless/server-only Hive installs normally have no Kitty socket;
+          // that is not a delivery failure. Keep details at debug level.
+          log('debug', `[notify] agent=${agentId} kitty wakeup ${result.kind}: ${result.reason}`);
+        }
+      }));
+    }
     const sids = agentSessions.get(agentId);
     const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
     if (live.length === 0) {
@@ -82,6 +101,7 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
       log('warn', `[notify] agent=${agentId} all sends failed → enqueued`);
     }
   }
+  await Promise.all(visibleNotifications);
 }
 
 /**
