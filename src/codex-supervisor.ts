@@ -29,7 +29,7 @@
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { log } from './log.js';
@@ -42,6 +42,10 @@ const __dirname = dirname(__filename);
 interface DaemonInfo {
   agentId: string;
   displayName: string;
+  // Effective cwd captured when this daemon was spawned. The DB project_dir
+  // may be filled in later by an orchestrator re-registration; comparing the
+  // two prevents a live daemon from starting future threads in stale cwd.
+  projectDir: string;
   child: ChildProcess;
   pid: number;
   startedAt: Date;
@@ -79,6 +83,30 @@ interface DaemonInfo {
 const daemons = new Map<string, DaemonInfo>();
 let shuttingDown = false;
 let supervisorPort = 4123;  // set by startCodexSupervisor
+
+/** Resolve the exact cwd injected into a codex-channel daemon.
+ *  Empty project_dir preserves the historical fallback to hive serve's cwd. */
+export function resolveDaemonProjectDir(projectDir: string, fallbackCwd = process.cwd()): string {
+  return resolve(projectDir || fallbackCwd);
+}
+
+/** True when a running daemon no longer matches the authoritative DB hint. */
+export function daemonProjectDirHasDrifted(
+  daemonProjectDir: string,
+  configuredProjectDir: string,
+  fallbackCwd = process.cwd(),
+): boolean {
+  return resolve(daemonProjectDir) !== resolveDaemonProjectDir(configuredProjectDir, fallbackCwd);
+}
+
+/** Retire a daemon without leaving its soon-to-close websocket discoverable. */
+function requestIntentionalDaemonExit(info: DaemonInfo): void {
+  info.intentionalShutdown = true;
+  info.readyAt = null;
+  info.wsUrl = null;
+  info.controlUrl = null;
+  try { info.child.kill('SIGTERM'); } catch { /* exit handler / next reconcile recovers */ }
+}
 
 function findNpx(): string {
   const probe = process.platform === 'win32' ? 'where npx' : 'command -v npx';
@@ -151,7 +179,8 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // operator-set via `agent register --project-dir`; empty falls back to
   // serve's own cwd.
   const fresh = getAgentById(agentId);
-  if (fresh?.project_dir) cleanEnv.CODEX_APPSERVER_CWD = fresh.project_dir;
+  const projectDir = resolveDaemonProjectDir(fresh?.project_dir || '');
+  cleanEnv.CODEX_APPSERVER_CWD = projectDir;
   // Foreground mode is a hard ownership boundary: the channel may persist
   // notifications into the shared thread but must never start model turns.
   cleanEnv.HIVE_EVENT_MODE = fresh?.event_mode || 'auto';
@@ -175,7 +204,7 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   }
 
   const info: DaemonInfo = {
-    agentId, displayName, child, pid: child.pid,
+    agentId, displayName, projectDir, child, pid: child.pid,
     startedAt: new Date(), restartCount,
     wsUrl: null, threadId: null, readyAt: null, controlUrl: null,
   };
@@ -283,6 +312,7 @@ export function stopCodexSupervisor(): Promise<void> {
 export interface DaemonSnapshot {
   agent_id: string;
   display_name: string;
+  project_dir: string;
   pid: number;
   uptime_ms: number;
   restart_count: number;
@@ -299,6 +329,7 @@ export function getDaemonSnapshots(): DaemonSnapshot[] {
   return [...daemons.values()].map(info => ({
     agent_id: info.agentId,
     display_name: info.displayName,
+    project_dir: info.projectDir,
     pid: info.pid,
     uptime_ms: now - info.startedAt.getTime(),
     restart_count: info.restartCount,
@@ -327,6 +358,7 @@ export function getDaemonForAgent(
   return {
     agent_id: info.agentId,
     display_name: info.displayName,
+    project_dir: info.projectDir,
     pid: info.pid,
     uptime_ms: Date.now() - info.startedAt.getTime(),
     restart_count: info.restartCount,
@@ -342,7 +374,7 @@ export function getDaemonForAgent(
  *  outside callers can attach via `codex --remote <ws_url>`. */
 export function markDaemonReady(agentId: string, wsUrl: string, threadId: string, controlUrl?: string | null): boolean {
   const info = daemons.get(agentId);
-  if (!info) return false;
+  if (!info || info.intentionalShutdown) return false;
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
@@ -383,15 +415,26 @@ export function markDaemonReady(agentId: string, wsUrl: string, threadId: string
   return true;
 }
 
-/** Called by /admin/notify-agent-created when a CLI-side `agent register`
- *  inserts a row. The CLI runs in its own process so the in-process
- *  onAgentCreated hook doesn't reach the supervisor; this is the bridge.
- *  Idempotent: returns false if already spawned, true if a new spawn started. */
+/** Called by /admin/notify-agent-created after a CLI-side `agent register`.
+ *  The CLI runs in its own process, so this bridges both new rows and updates
+ *  to a live supervisor. A project_dir change intentionally replaces the
+ *  daemon: codex-channel caches its thread/start cwd at process startup.
+ *  Returns true if a spawn/restart was initiated. */
 export function notifyAgentCreated(agentId: string): boolean {
-  if (daemons.has(agentId)) return false;
   const agent = getAgentById(agentId);
   if (!agent) return false;
   if (agent.tool !== 'codex' || agent.origin_peer !== '') return false;
+  const existing = daemons.get(agentId);
+  if (existing) {
+    if (!daemonProjectDirHasDrifted(existing.projectDir, agent.project_dir)) return false;
+    log(
+      'info',
+      `[codex-supervisor] project_dir changed for "${existing.displayName}": `
+      + `${existing.projectDir} → ${resolveDaemonProjectDir(agent.project_dir)}; restarting daemon`,
+    );
+    requestIntentionalDaemonExit(existing);
+    return true;
+  }
   log('info', `[codex-supervisor] notify-agent-created: "${agent.display_name}" (${agentId.slice(-12)}) → spawning daemon`);
   spawnDaemon(agent.id, agent.display_name, 0);
   return true;
@@ -438,6 +481,15 @@ export async function switchDaemonThread(agentId: string, threadId: string, time
   const info = daemons.get(agentId);
   if (!info || !info.readyAt || !info.controlUrl) {
     log('info', `[codex-supervisor] switchDaemonThread: no in-process path for ${agentId.slice(-12)} (daemon=${!!info} ready=${!!info?.readyAt} control=${!!info?.controlUrl})`);
+    return null;
+  }
+  const agent = getAgentById(agentId);
+  if (agent && daemonProjectDirHasDrifted(info.projectDir, agent.project_dir)) {
+    log(
+      'info',
+      `[codex-supervisor] refusing in-process thread switch for "${info.displayName}": `
+      + `daemon cwd ${info.projectDir} != configured cwd ${resolveDaemonProjectDir(agent.project_dir)}; falling back to respawn`,
+    );
     return null;
   }
   try {
@@ -491,8 +543,7 @@ export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000):
   const existing = daemons.get(agentId);
   if (existing) {
     log('info', `[codex-supervisor] requestDaemonRespawn: SIGTERM existing daemon for "${existing.displayName}" (${agentId.slice(-12)}), intentional=true`);
-    existing.intentionalShutdown = true;
-    try { existing.child.kill('SIGTERM'); } catch { /* ignore */ }
+    requestIntentionalDaemonExit(existing);
   } else {
     log('info', `[codex-supervisor] requestDaemonRespawn: no live daemon for ${agentId.slice(-12)}, requesting spawn`);
     notifyAgentCreated(agentId);
@@ -517,6 +568,7 @@ export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000):
     return {
       agent_id: snap.agentId,
       display_name: snap.displayName,
+      project_dir: snap.projectDir,
       pid: snap.pid,
       uptime_ms: Date.now() - snap.startedAt.getTime(),
       restart_count: snap.restartCount,
