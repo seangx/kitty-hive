@@ -36,7 +36,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, checkEventDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -532,7 +532,11 @@ async function setupAppserver(): Promise<void> {
   let resumed = false;
   if (persistedThreadId) {
     try {
-      const resumeResp = await rpcCall('thread/resume', { threadId: persistedThreadId }, THREAD_RPC_TIMEOUT_MS);
+      const resumeResp = await rpcCall(
+        'thread/resume',
+        buildThreadResumeParams(persistedThreadId, CODEX_APPSERVER_CWD),
+        THREAD_RPC_TIMEOUT_MS,
+      );
       const resumedId = resumeResp?.thread?.id;
       if (!resumedId) throw new Error(`thread/resume returned no thread.id: ${JSON.stringify(resumeResp)}`);
       threadId = resumedId;
@@ -706,7 +710,11 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
   }
   try {
     if (target) {
-      const resp = await rpcCall('thread/resume', { threadId: target }, THREAD_RPC_TIMEOUT_MS);
+      const resp = await rpcCall(
+        'thread/resume',
+        buildThreadResumeParams(target, CODEX_APPSERVER_CWD),
+        THREAD_RPC_TIMEOUT_MS,
+      );
       const resumedId = resp?.thread?.id;
       if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = resumedId;

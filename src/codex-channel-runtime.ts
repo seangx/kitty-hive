@@ -84,6 +84,23 @@ export interface RpcTransport {
   call(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
 }
 
+export interface ThreadResumeParams {
+  threadId: string;
+  cwd: string;
+}
+
+/** Build resume overrides for a supervised Codex thread.
+ *
+ * A rollout's original session_meta cwd is immutable, so resuming with only
+ * threadId restores that stale cwd and hides project-local skills deployed
+ * after the thread was first created. Codex app-server supports cwd as a
+ * thread/resume override; always carry the daemon's authoritative project cwd
+ * on both boot-time resume and in-process thread switches.
+ */
+export function buildThreadResumeParams(threadId: string, cwd: string): ThreadResumeParams {
+  return { threadId, cwd };
+}
+
 export interface TurnTrackerOptions {
   /** How long to wait for `turn/completed` after `turn/start` succeeds.
    *  Default 10 min — matches codex's typical long-running turn budget. */
