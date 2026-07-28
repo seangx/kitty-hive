@@ -128,6 +128,13 @@ export interface TurnTrackerOptions {
   /** How long to wait for `turn/completed` after `turn/start` succeeds.
    *  Default 10 min — matches codex's typical long-running turn budget. */
   turnTimeoutMs?: number;
+  /** Retain daemon-started turn ids after their waiter times out so a late
+   *  terminal notification cannot be mistaken for a foreground TUI turn. */
+  ownedTurnTtlMs?: number;
+  /** Hard memory bound for retained daemon-owned turn ids. */
+  ownedTurnMaxEntries?: number;
+  /** Injectable clock for deterministic ownership-expiry tests. */
+  now?: () => number;
   /** Hook for tests / observability. Called once per terminal outcome. */
   onOutcome?: (outcome: TurnOutcome, eventId?: string) => void;
 }
@@ -277,10 +284,145 @@ export function buildEventTimingLines(
   return lines;
 }
 
+export type CodexTerminalStatus = 'completed' | 'interrupted' | 'failed';
+
+export interface CodexTerminalNotice {
+  threadId: string;
+  turnId: string;
+  status: CodexTerminalStatus;
+}
+
+export type CodexTerminalDecision =
+  | { kind: 'notify'; notice: CodexTerminalNotice }
+  | {
+      kind: 'ignored';
+      reason: 'not-terminal' | 'wrong-thread' | 'daemon-owned' | 'duplicate';
+      notice?: CodexTerminalNotice;
+    };
+
+export interface CodexTerminalNotificationTrackerOptions {
+  seenTtlMs?: number;
+  seenMaxEntries?: number;
+  now?: () => number;
+}
+
+export function parseCodexTerminalNotice(
+  method: string,
+  params: unknown,
+): CodexTerminalNotice | null {
+  if (method === 'turn/completed') {
+    const p = params as { threadId?: string; turn?: CodexTurn };
+    const turnId = p?.turn?.id;
+    const threadId = p?.threadId;
+    if (!threadId || !turnId || p.turn?.status === 'inProgress') return null;
+    const status: CodexTerminalStatus =
+      p.turn?.status === 'interrupted'
+        ? 'interrupted'
+        : p.turn?.status === 'failed'
+          ? 'failed'
+          : 'completed';
+    return { threadId, turnId, status };
+  }
+  if (method === 'turn/interrupt') {
+    const p = params as { threadId?: string; turnId?: string; turn?: CodexTurn };
+    const turnId = p?.turn?.id || p?.turnId;
+    if (!p?.threadId || !turnId) return null;
+    return { threadId: p.threadId, turnId, status: 'interrupted' };
+  }
+  if (method === 'error') {
+    const p = params as Partial<ErrorNotificationParams>;
+    if (!p?.threadId || !p?.turnId || p.willRetry === true) return null;
+    return { threadId: p.threadId, turnId: p.turnId, status: 'failed' };
+  }
+  return null;
+}
+
+/**
+ * Classify terminal app-server notifications for Kitty UI delivery.
+ *
+ * The app-server broadcasts thread events to both the daemon and an attached
+ * remote TUI. Only terminal events for the daemon's CURRENT thread that were
+ * not started by the daemon itself are user-visible foreground completions.
+ * Every terminal id is remembered before ownership filtering so a duplicate
+ * notification cannot become visible after daemon ownership is released.
+ */
+export class CodexTerminalNotificationTracker {
+  private seen = new Map<string, number>();
+  private readonly seenTtlMs: number;
+  private readonly seenMaxEntries: number;
+  private readonly now: () => number;
+
+  constructor(
+    private threadId: string,
+    opts: CodexTerminalNotificationTrackerOptions = {},
+  ) {
+    this.seenTtlMs = opts.seenTtlMs ?? 24 * 60 * 60 * 1000;
+    this.seenMaxEntries = Math.max(1, opts.seenMaxEntries ?? 2048);
+    this.now = opts.now ?? Date.now;
+  }
+
+  setThreadId(threadId: string): void {
+    this.threadId = threadId;
+  }
+
+  observe(
+    method: string,
+    params: unknown,
+    daemonOwned: boolean,
+  ): CodexTerminalDecision {
+    return this.observeNotice(
+      parseCodexTerminalNotice(method, params),
+      daemonOwned,
+    );
+  }
+
+  observeNotice(
+    notice: CodexTerminalNotice | null,
+    daemonOwned: boolean,
+  ): CodexTerminalDecision {
+    if (!notice) return { kind: 'ignored', reason: 'not-terminal' };
+
+    const now = this.now();
+    this.prune(now);
+    const dedupKey = `${notice.threadId}:${notice.turnId}`;
+    if (this.seen.has(dedupKey)) {
+      return { kind: 'ignored', reason: 'duplicate', notice };
+    }
+    this.seen.set(dedupKey, now + this.seenTtlMs);
+    this.enforceBound();
+
+    if (notice.threadId !== this.threadId) {
+      return { kind: 'ignored', reason: 'wrong-thread', notice };
+    }
+    if (daemonOwned) {
+      return { kind: 'ignored', reason: 'daemon-owned', notice };
+    }
+    return { kind: 'notify', notice };
+  }
+
+  private prune(now: number): void {
+    for (const [key, expiresAt] of this.seen) {
+      if (expiresAt <= now) this.seen.delete(key);
+    }
+  }
+
+  private enforceBound(): void {
+    while (this.seen.size > this.seenMaxEntries) {
+      const oldest = this.seen.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.seen.delete(oldest);
+    }
+  }
+}
+
 export class TurnTracker {
   private waiters = new Map<string, Waiter>();
   private injectedEventIds = new Set<string>();
+  private daemonOwnedTurns = new Map<string, number>();
   private readonly turnTimeoutMs: number;
+  private readonly ownedTurnTtlMs: number;
+  private readonly ownedTurnMaxEntries: number;
+  private readonly now: () => number;
   private readonly onOutcome?: TurnTrackerOptions['onOutcome'];
 
   constructor(
@@ -289,6 +431,9 @@ export class TurnTracker {
     opts: TurnTrackerOptions = {},
   ) {
     this.turnTimeoutMs = opts.turnTimeoutMs ?? 600_000;
+    this.ownedTurnTtlMs = opts.ownedTurnTtlMs ?? 24 * 60 * 60 * 1000;
+    this.ownedTurnMaxEntries = Math.max(1, opts.ownedTurnMaxEntries ?? 2048);
+    this.now = opts.now ?? Date.now;
     this.onOutcome = opts.onOutcome;
   }
 
@@ -350,6 +495,7 @@ export class TurnTracker {
       this.onOutcome?.(outcome, eventId);
       return outcome;
     }
+    this.rememberOwnedTurn(turnId);
 
     // Register waiter keyed by turn id. Codex's notifications include turnId
     // — we use that to route, not the FIFO order. Multiple concurrent turns
@@ -437,11 +583,28 @@ export class TurnTracker {
     return !!turnId && this.waiters.has(turnId);
   }
 
+  /** True for any retained turn id started by this daemon, including a turn
+   *  whose waiter already timed out. This is deliberately broader than
+   *  isActiveTurn(), which remains the strict approval-response gate. */
+  isOwnedTurn(turnId: string | undefined): boolean {
+    if (!turnId) return false;
+    this.pruneOwnedTurns(this.now());
+    return this.daemonOwnedTurns.has(turnId);
+  }
+
+  /** Release ownership after a terminal notification has been classified.
+   *  The separate terminal-notification dedup set guards duplicate delivery. */
+  releaseOwnedTurn(turnId: string | undefined): void {
+    if (turnId) this.daemonOwnedTurns.delete(turnId);
+  }
+
   /** Diagnostic snapshot of in-flight turns. Not used at runtime; exposed
    *  for the optional `/admin/codex-daemons` extension and tests. */
-  snapshot(): { activeTurns: string[]; injectedEventIds: number } {
+  snapshot(): { activeTurns: string[]; ownedTurns: string[]; injectedEventIds: number } {
+    this.pruneOwnedTurns(this.now());
     return {
       activeTurns: [...this.waiters.keys()],
+      ownedTurns: [...this.daemonOwnedTurns.keys()],
       injectedEventIds: this.injectedEventIds.size,
     };
   }
@@ -451,6 +614,24 @@ export class TurnTracker {
   destroyForTest(): void {
     for (const w of this.waiters.values()) clearTimeout(w.timer);
     this.waiters.clear();
+    this.daemonOwnedTurns.clear();
+  }
+
+  private rememberOwnedTurn(turnId: string): void {
+    const now = this.now();
+    this.pruneOwnedTurns(now);
+    this.daemonOwnedTurns.set(turnId, now + this.ownedTurnTtlMs);
+    while (this.daemonOwnedTurns.size > this.ownedTurnMaxEntries) {
+      const oldest = this.daemonOwnedTurns.keys().next().value as string | undefined;
+      if (oldest === undefined) break;
+      this.daemonOwnedTurns.delete(oldest);
+    }
+  }
+
+  private pruneOwnedTurns(now: number): void {
+    for (const [turnId, expiresAt] of this.daemonOwnedTurns) {
+      if (expiresAt <= now) this.daemonOwnedTurns.delete(turnId);
+    }
   }
 }
 

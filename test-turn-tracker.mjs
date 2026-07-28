@@ -22,6 +22,7 @@
 //   9. Timer is cleaned up on every terminal outcome (no leaked handles)
 
 import {
+  CodexTerminalNotificationTracker,
   HistoryItemInjector,
   TurnTracker,
   buildEventTimingLines,
@@ -305,6 +306,105 @@ async function test15_replayAndDelayMarkers() {
   ok(fresh.every(line => !line.includes('stale_delivery')), 'fresh delivery is not mislabeled stale');
 }
 
+async function test16_externalTerminalNotificationContract() {
+  console.log('\n=== Test 16: external terminal notifications are current-thread, typed, and deduplicated ===');
+  const tracker = new CodexTerminalNotificationTracker('thread-current');
+
+  const completed = tracker.observe('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-human-1', status: 'completed' },
+  }, false);
+  ok(completed.kind === 'notify' && completed.notice.status === 'completed', 'foreground completion becomes a completed notice');
+
+  const duplicate = tracker.observe('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-human-1', status: 'completed' },
+  }, false);
+  ok(duplicate.kind === 'ignored' && duplicate.reason === 'duplicate', 'duplicate terminal notification is ignored');
+
+  const wrongThread = tracker.observe('turn/completed', {
+    threadId: 'thread-old',
+    turn: { id: 'turn-human-old', status: 'completed' },
+  }, false);
+  ok(wrongThread.kind === 'ignored' && wrongThread.reason === 'wrong-thread', 'terminal event from a stale thread is ignored');
+
+  const interrupted = tracker.observe('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-human-2', status: 'interrupted' },
+  }, false);
+  ok(interrupted.kind === 'notify' && interrupted.notice.status === 'interrupted', 'interrupted status is preserved');
+
+  const failed = tracker.observe('error', {
+    threadId: 'thread-current',
+    turnId: 'turn-human-3',
+    willRetry: false,
+    error: { kind: 'badRequest' },
+  }, false);
+  ok(failed.kind === 'notify' && failed.notice.status === 'failed', 'final error becomes a failed notice');
+
+  const retrying = tracker.observe('error', {
+    threadId: 'thread-current',
+    turnId: 'turn-human-4',
+    willRetry: true,
+    error: 'transient',
+  }, false);
+  ok(retrying.kind === 'ignored' && retrying.reason === 'not-terminal', 'retryable error does not end Working');
+}
+
+async function test17_daemonOwnershipSurvivesTimeout() {
+  console.log('\n=== Test 17: daemon ownership survives waiter timeout and blocks false UI notification ===');
+  let now = 1000;
+  const t = makeTransport();
+  const turns = new TurnTracker(t.transport, 'thread-current', {
+    turnTimeoutMs: 10,
+    ownedTurnTtlMs: 1000,
+    now: () => now,
+  });
+  const outcome = await turns.sendTurn('daemon turn');
+  ok(outcome.kind === 'timeout', 'daemon turn waiter timed out');
+  ok(turns.isOwnedTurn('turn-1'), 'timed-out turn remains daemon-owned');
+
+  const terminals = new CodexTerminalNotificationTracker('thread-current');
+  const ignored = terminals.observe('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-1', status: 'completed' },
+  }, turns.isOwnedTurn('turn-1'));
+  ok(ignored.kind === 'ignored' && ignored.reason === 'daemon-owned', 'late daemon completion is not shown by Kitty');
+  turns.releaseOwnedTurn('turn-1');
+  ok(!turns.isOwnedTurn('turn-1'), 'ownership is released after terminal classification');
+
+  const duplicate = terminals.observe('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-1', status: 'completed' },
+  }, false);
+  ok(duplicate.kind === 'ignored' && duplicate.reason === 'duplicate', 'duplicate stays hidden after ownership release');
+
+  now += 1001;
+  ok(!turns.isOwnedTurn('turn-1'), 'released ownership remains absent after TTL');
+}
+
+async function test18_daemonOwnershipIsBoundedAndExpires() {
+  console.log('\n=== Test 18: daemon ownership retention is bounded and expires ===');
+  let now = 2000;
+  const t = makeTransport();
+  const tracker = new TurnTracker(t.transport, 'thread-current', {
+    turnTimeoutMs: 1,
+    ownedTurnTtlMs: 100,
+    ownedTurnMaxEntries: 2,
+    now: () => now,
+  });
+  await tracker.sendTurn('one');
+  now += 1;
+  await tracker.sendTurn('two');
+  now += 1;
+  await tracker.sendTurn('three');
+  const bounded = tracker.snapshot().ownedTurns;
+  ok(bounded.length === 2, `ownership set is capped at 2 (got ${bounded.length})`);
+  ok(!bounded.includes('turn-1') && bounded.includes('turn-2') && bounded.includes('turn-3'), 'oldest ownership entry is evicted first');
+  now += 101;
+  ok(tracker.snapshot().ownedTurns.length === 0, 'retained ownership entries expire by TTL');
+}
+
 async function run() {
   await test1_happyPath();
   await test2_timeoutNoRetry();
@@ -321,6 +421,9 @@ async function run() {
   await test13_foregroundHistoryDedupAndSwitch();
   await test14_foregroundOwnershipDecision();
   await test15_replayAndDelayMarkers();
+  await test16_externalTerminalNotificationContract();
+  await test17_daemonOwnershipSurvivesTimeout();
+  await test18_daemonOwnershipIsBoundedAndExpires();
   console.log(`\n${pass} passed, ${fail} failed`);
   process.exit(fail === 0 ? 0 : 1);
 }

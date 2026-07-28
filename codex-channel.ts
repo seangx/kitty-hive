@@ -37,7 +37,8 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
 
@@ -314,6 +315,7 @@ let appserverWsUrl: string | null = null;  // ws://127.0.0.1:<port> — for outs
 let threadId: string | null = null;
 let appserverDeathHandled = false;  // guard so multiple death signals only exit once
 let turnTracker: TurnTracker | null = null;
+let terminalNotificationTracker: CodexTerminalNotificationTracker | null = null;
 let historyInjector: HistoryItemInjector | null = null;
 let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
@@ -503,11 +505,41 @@ async function setupAppserver(): Promise<void> {
       handleServerRequest(msg);
       return;
     }
-    // Notification — let the tracker route turn-related ones by turn id.
-    // Unmatched notifications (item delta, agentMessage stream, etc.) are
-    // ignored at this layer.
-    if (msg.method && turnTracker?.handleNotification(msg.method, msg.params)) {
-      return;
+    if (msg.method) {
+      // Classify the terminal event BEFORE releasing daemon ownership. The
+      // app-server broadcasts the same thread notification to this daemon and
+      // an attached remote TUI; only non-daemon turns become Kitty completion
+      // notifications.
+      const terminalNotice = parseCodexTerminalNotice(msg.method, msg.params);
+      const daemonOwned = turnTracker?.isOwnedTurn(terminalNotice?.turnId) ?? false;
+      const matched = turnTracker?.handleNotification(msg.method, msg.params) ?? false;
+      const terminalDecision = terminalNotificationTracker?.observeNotice(
+        terminalNotice,
+        daemonOwned,
+      );
+      if (terminalNotice && daemonOwned) {
+        turnTracker?.releaseOwnedTurn(terminalNotice.turnId);
+      }
+      if (terminalDecision?.kind === 'notify') {
+        void notifyKittyCodexTurnCompleted(ENV_KEY, terminalDecision.notice)
+          .then((result) => {
+            if (result.kind === 'sent') {
+              console.error(
+                `[codex-channel] Kitty notified: turn=${terminalDecision.notice.turnId} status=${terminalDecision.notice.status}`,
+              );
+            } else if (result.kind === 'rejected') {
+              console.error(
+                `[codex-channel] Kitty rejected turn notification: ${result.reason}`,
+              );
+            }
+          })
+          .catch((err) => {
+            console.error(
+              `[codex-channel] Kitty turn notification failed: ${err instanceof Error ? err.message : String(err)}`,
+            );
+          });
+      }
+      if (matched) return;
     }
   });
 
@@ -568,6 +600,7 @@ async function setupAppserver(): Promise<void> {
     { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
     threadId!,
   );
+  terminalNotificationTracker = new CodexTerminalNotificationTracker(threadId!);
   historyInjector = new HistoryItemInjector(
     { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
     threadId!,
@@ -730,6 +763,7 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
     }
     turnTracker?.setThreadId(threadId!);
+    terminalNotificationTracker?.setThreadId(threadId!);
     historyInjector?.setThreadId(threadId!);
     const briefText = target ? buildRebindText() : buildIntroText();
     const briefKind = target ? 'switch-rebind' : 'switch-intro';
@@ -1211,6 +1245,7 @@ function cleanupAppserver() {
     appserverProc = null;
   }
   turnTracker = null;
+  terminalNotificationTracker = null;
   historyInjector = null;
   threadId = null;
 }
