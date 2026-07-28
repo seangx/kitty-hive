@@ -1,11 +1,64 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  buildCodexDaemonEnv,
   daemonProjectDirHasDrifted,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
   signalDaemonProcessTree,
 } from './codex-supervisor.js';
+
+test('daemon env restores only the authoritative agent Kitty key', () => {
+  const env = buildCodexDaemonEnv(
+    {
+      PATH: '/opt/homebrew/bin',
+      HIVE_AGENT_KEY: 'wrong-inherited-key',
+      HIVE_AGENT_ID: 'wrong-inherited-agent',
+      HIVE_EVENT_MODE: 'foreground',
+    },
+    {
+      agentId: 'agent-123',
+      displayName: 'reviewer',
+      externalKey: 'kitty-session-456',
+      projectDir: '/Users/example/project',
+      eventMode: 'auto',
+      threadId: 'thread-789',
+      supervisorPort: 4123,
+      supervisorPid: 99,
+    },
+  );
+
+  assert.deepEqual(env, {
+    PATH: '/opt/homebrew/bin',
+    HIVE_AGENT_ID: 'agent-123',
+    HIVE_AGENT_NAME: 'reviewer',
+    HIVE_AGENT_KEY: 'kitty-session-456',
+    HIVE_URL: 'http://127.0.0.1:4123/mcp',
+    HIVE_SUPERVISOR_PID: '99',
+    CODEX_APPSERVER_CWD: '/Users/example/project',
+    HIVE_EVENT_MODE: 'auto',
+    HIVE_AGENT_THREAD_ID: 'thread-789',
+  });
+});
+
+test('daemon env does not invent a Kitty key for unmanaged agents', () => {
+  const env = buildCodexDaemonEnv(
+    { HIVE_AGENT_KEY: 'wrong-inherited-key' },
+    {
+      agentId: 'agent-123',
+      displayName: 'reviewer',
+      externalKey: '',
+      projectDir: '/Users/example/project',
+      eventMode: 'foreground',
+      threadId: '',
+      supervisorPort: 4123,
+      supervisorPid: 99,
+    },
+  );
+
+  assert.equal(env.HIVE_AGENT_KEY, undefined);
+  assert.equal(env.HIVE_AGENT_THREAD_ID, undefined);
+});
 
 test('detects a project_dir added after the daemon was spawned', () => {
   const serveCwd = '/Users/example';

@@ -517,6 +517,14 @@ async function setupAppserver(): Promise<void> {
         terminalNotice,
         daemonOwned,
       );
+      if (terminalNotice) {
+        const decision = terminalDecision?.kind === 'ignored'
+          ? terminalDecision.reason
+          : terminalDecision?.kind ?? 'tracker-unavailable';
+        console.error(
+          `[codex-channel] terminal notice: turn=${terminalNotice.turnId} thread=${terminalNotice.threadId} status=${terminalNotice.status} daemonOwned=${daemonOwned} decision=${decision}`,
+        );
+      }
       if (terminalNotice && daemonOwned) {
         turnTracker?.releaseOwnedTurn(terminalNotice.turnId);
       }
@@ -530,6 +538,10 @@ async function setupAppserver(): Promise<void> {
             } else if (result.kind === 'rejected') {
               console.error(
                 `[codex-channel] Kitty rejected turn notification: ${result.reason}`,
+              );
+            } else {
+              console.error(
+                `[codex-channel] Kitty notification unavailable: ${result.reason}`,
               );
             }
           })

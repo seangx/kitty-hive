@@ -103,6 +103,44 @@ export function shouldDetachDaemonProcess(platform = process.platform): boolean 
   return platform !== 'win32';
 }
 
+export interface CodexDaemonEnvOptions {
+  agentId: string;
+  displayName: string;
+  externalKey: string;
+  projectDir: string;
+  eventMode: Agent['event_mode'];
+  threadId: string;
+  supervisorPort: number;
+  supervisorPid: number;
+}
+
+/** Build the exact environment for one supervised codex-channel daemon.
+ *
+ * Inherited HIVE_* values are untrusted because `kitty-hive serve` may itself
+ * have been launched from a Kitty-managed shell. Restore identity only from
+ * the authoritative agent row, including its Kitty session key so terminal
+ * turn notifications can address the correct UI session.
+ */
+export function buildCodexDaemonEnv(
+  inheritedEnv: NodeJS.ProcessEnv,
+  opts: CodexDaemonEnvOptions,
+): NodeJS.ProcessEnv {
+  const cleanEnv: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(inheritedEnv)) {
+    if (key.startsWith('HIVE_')) continue;
+    cleanEnv[key] = value;
+  }
+  cleanEnv.HIVE_AGENT_ID = opts.agentId;
+  cleanEnv.HIVE_AGENT_NAME = opts.displayName;
+  if (opts.externalKey) cleanEnv.HIVE_AGENT_KEY = opts.externalKey;
+  cleanEnv.HIVE_URL = `http://127.0.0.1:${opts.supervisorPort}/mcp`;
+  cleanEnv.HIVE_SUPERVISOR_PID = String(opts.supervisorPid);
+  cleanEnv.CODEX_APPSERVER_CWD = opts.projectDir;
+  cleanEnv.HIVE_EVENT_MODE = opts.eventMode;
+  if (opts.threadId) cleanEnv.HIVE_AGENT_THREAD_ID = opts.threadId;
+  return cleanEnv;
+}
+
 /** Signal the complete npx -> tsx -> codex-channel process tree on POSIX.
  *
  * Supervised daemons are spawned as process-group leaders. Signaling only the
@@ -183,42 +221,20 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // 2026-05-20: smoke test renamed `kitty-hive` to `test-codex-1` because
   // the operator shell had HIVE_AGENT_KEY=<kitty-hive's external_key>.
   //
-  // Daemon gets a minimal env: system basics (PATH, HOME, etc.) + EXACTLY
-  // the hive identity overrides we want.
-  const cleanEnv: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (k.startsWith('HIVE_')) continue;  // drop any HIVE_* inherited from operator shell
-    cleanEnv[k] = v;
-  }
-  cleanEnv.HIVE_AGENT_ID = agentId;
-  cleanEnv.HIVE_AGENT_NAME = displayName;
-  // HIVE_URL: explicitly set so daemon talks to *this* serve (whose port the
-  // supervisor knows), not whatever was in the operator shell or the daemon's
-  // own fallback default.
-  cleanEnv.HIVE_URL = `http://127.0.0.1:${supervisorPort}/mcp`;
-  // Lets codex-channel notice an ungraceful serve death (including SIGKILL)
-  // and run its own app-server process-group cleanup before exiting.
-  cleanEnv.HIVE_SUPERVISOR_PID = String(process.pid);
-  // CODEX_APPSERVER_CWD: codex-channel.ts reads this and passes to thread/start
-  // as cwd. Determines where the codex agent thinks it's running — must match
-  // the operator's intent (the project the kitty pane was launched for), not
-  // the cwd hive serve happens to be running from. agent.project_dir is
-  // operator-set via `agent register --project-dir`; empty falls back to
-  // serve's own cwd.
-  const fresh = getAgentById(agentId);
-  const projectDir = resolveDaemonProjectDir(fresh?.project_dir || '');
-  cleanEnv.CODEX_APPSERVER_CWD = projectDir;
-  // Foreground mode is a hard ownership boundary: the channel may persist
-  // notifications into the shared thread but must never start model turns.
-  cleanEnv.HIVE_EVENT_MODE = fresh?.event_mode || 'auto';
-  // HIVE_AGENT_THREAD_ID: presence tells codex-channel to `thread/resume` an
-  // existing codex thread (jsonl already on disk in ~/.codex/sessions/)
-  // instead of `thread/start`. Set on every spawn after the first ready
-  // (markDaemonReady persists it to agents.thread_id). On a respawn after
-  // resume failure, codex-channel announces a brand-new thread_id and
-  // markDaemonReady overwrites — old jsonl is orphaned but content survives
-  // on disk.
-  if (fresh?.thread_id) cleanEnv.HIVE_AGENT_THREAD_ID = fresh.thread_id;
+  // Daemon gets system basics plus identity restored from THIS agent's DB row.
+  // In particular, HIVE_AGENT_KEY must come from external_key rather than the
+  // operator shell; Kitty's wakeup socket uses it to route completion notices.
+  const projectDir = resolveDaemonProjectDir(eligible.project_dir || '');
+  const cleanEnv = buildCodexDaemonEnv(process.env, {
+    agentId,
+    displayName,
+    externalKey: eligible.external_key,
+    projectDir,
+    eventMode: eligible.event_mode || 'auto',
+    threadId: eligible.thread_id,
+    supervisorPort,
+    supervisorPid: process.pid,
+  });
 
   const child = spawn(findNpx(), ['-y', 'tsx', scriptPath], {
     env: cleanEnv,
