@@ -12,6 +12,12 @@ export type KittyWakeupResult =
   | { kind: 'unavailable'; reason: string }
   | { kind: 'rejected'; reason: string };
 
+export interface KittyCodexTurnCompletedNotice {
+  status: 'completed' | 'interrupted' | 'failed';
+  threadId: string;
+  turnId: string;
+}
+
 interface HivePushNotice {
   type?: string;
   from?: string;
@@ -52,6 +58,21 @@ export function buildKittyWakeupPayload(payload: string): Record<string, string>
   };
 }
 
+/** Minimal, content-free lifecycle payload for Kitty's transient completion
+ * notification. The session is addressed separately by X-Kitty-Session. */
+export function buildKittyCodexTurnCompletedPayload(
+  notice: KittyCodexTurnCompletedNotice,
+): Record<string, string> {
+  return {
+    tool: 'codex',
+    hook_event_name: 'TurnCompleted',
+    notification_type: 'codex_turn_completed',
+    status: notice.status,
+    thread_id: notice.threadId,
+    turn_id: notice.turnId,
+  };
+}
+
 /**
  * Best-effort bridge to kitty-kitty's local wakeup server. A successful call
  * lights the matching session badge and shows the pet speech bubble. Failure
@@ -62,12 +83,38 @@ export function notifyKittyWakeup(
   payload: string,
   opts: KittyWakeupOptions = {},
 ): Promise<KittyWakeupResult> {
+  return postKittyWakeup(
+    externalKey,
+    buildKittyWakeupPayload(payload),
+    opts,
+  );
+}
+
+/** Best-effort Codex lifecycle bridge. Unlike Hive wakeups this is a
+ * transient UI event and must not create or consume Hive unread state. */
+export function notifyKittyCodexTurnCompleted(
+  externalKey: string,
+  notice: KittyCodexTurnCompletedNotice,
+  opts: KittyWakeupOptions = {},
+): Promise<KittyWakeupResult> {
+  return postKittyWakeup(
+    externalKey,
+    buildKittyCodexTurnCompletedPayload(notice),
+    opts,
+  );
+}
+
+function postKittyWakeup(
+  externalKey: string,
+  payload: Record<string, string>,
+  opts: KittyWakeupOptions,
+): Promise<KittyWakeupResult> {
   const sessionKey = externalKey.trim();
   if (!sessionKey) return Promise.resolve({ kind: 'unavailable', reason: 'missing external key' });
 
   const socketPath = opts.socketPath || process.env.KITTY_WAKEUP_SOCKET || join(homedir(), '.kitty-kitty', 'wakeup.sock');
   const timeoutMs = opts.timeoutMs ?? 750;
-  const body = JSON.stringify(buildKittyWakeupPayload(payload));
+  const body = JSON.stringify(payload);
 
   return new Promise((resolve) => {
     let settled = false;

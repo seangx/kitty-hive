@@ -4,7 +4,12 @@ import { createServer } from 'node:http';
 import { mkdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { buildKittyWakeupPayload, notifyKittyWakeup } from './dist/kitty-wakeup.js';
+import {
+  buildKittyCodexTurnCompletedPayload,
+  buildKittyWakeupPayload,
+  notifyKittyCodexTurnCompleted,
+  notifyKittyWakeup,
+} from './dist/kitty-wakeup.js';
 import { createAgent, initDB, listPendingPushes } from './dist/db.js';
 import { notifyAgents } from './dist/sessions.js';
 import { buildPushMessage } from './dist/preview.js';
@@ -67,6 +72,31 @@ ok(direct.kind === 'sent', 'accepts Kitty wakeup acknowledgement');
 ok(requests[0]?.path === '/wakeup', 'posts to /wakeup');
 ok(requests[0]?.session === 'abcdef123456', 'addresses the matching Kitty session');
 ok(!JSON.stringify(requests[0]?.body).includes('TOP-SECRET'), 'wire payload remains content-free');
+
+console.log('\n=== Codex turn-completed contract ===');
+const codexNotice = {
+  status: 'completed',
+  threadId: 'thread-123',
+  turnId: 'turn-456',
+};
+const codexPayload = buildKittyCodexTurnCompletedPayload(codexNotice);
+ok(
+  codexPayload.tool === 'codex'
+    && codexPayload.hook_event_name === 'TurnCompleted'
+    && codexPayload.notification_type === 'codex_turn_completed',
+  'uses the dedicated Codex terminal-event contract',
+);
+ok(
+  codexPayload.status === 'completed'
+    && codexPayload.thread_id === 'thread-123'
+    && codexPayload.turn_id === 'turn-456',
+  'includes only terminal lifecycle identifiers',
+);
+ok(!('message' in codexPayload), 'does not forward conversation content or synthesize message text');
+const codexDelivery = await notifyKittyCodexTurnCompleted('abcdef123456', codexNotice);
+ok(codexDelivery.kind === 'sent', 'delivers Codex terminal event through the existing Kitty socket');
+ok(requests.at(-1)?.session === 'abcdef123456', 'Codex event uses X-Kitty-Session routing');
+ok(requests.at(-1)?.body?.notification_type === 'codex_turn_completed', 'Codex wire payload preserves notification type');
 
 console.log('\n=== Foreground Hive integration ===');
 initDB(DB);
