@@ -89,6 +89,29 @@ export interface ThreadResumeParams {
   cwd: string;
 }
 
+export type ProcessProbe = (pid: number, signal: 0) => void;
+
+/** True only when a configured supervisor PID is known to no longer exist.
+ *
+ * Missing/invalid configuration keeps standalone codex-channel invocations
+ * working. EPERM also means "still alive but not signalable", so only ESRCH
+ * authorizes the daemon to tear itself down.
+ */
+export function supervisorProcessIsMissing(
+  rawPid: string | undefined,
+  probe: ProcessProbe = process.kill,
+): boolean {
+  if (!rawPid) return false;
+  const pid = Number(rawPid);
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try {
+    probe(pid, 0);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
 /** Build resume overrides for a supervised Codex thread.
  *
  * A rollout's original session_meta cwd is immutable, so resuming with only

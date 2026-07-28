@@ -99,13 +99,37 @@ export function daemonProjectDirHasDrifted(
   return resolve(daemonProjectDir) !== resolveDaemonProjectDir(configuredProjectDir, fallbackCwd);
 }
 
+export function shouldDetachDaemonProcess(platform = process.platform): boolean {
+  return platform !== 'win32';
+}
+
+/** Signal the complete npx -> tsx -> codex-channel process tree on POSIX.
+ *
+ * Supervised daemons are spawned as process-group leaders. Signaling only the
+ * direct npx wrapper can leave the actual channel alive after the wrapper
+ * exits; that channel in turn owns a detached codex app-server. Windows has
+ * no negative-PID process-group signaling, so it retains the direct fallback.
+ */
+export function signalDaemonProcessTree(
+  pid: number,
+  signal: NodeJS.Signals,
+  directSignal: () => unknown,
+  groupSignal: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+  platform = process.platform,
+): void {
+  if (shouldDetachDaemonProcess(platform)) {
+    try { groupSignal(-pid, signal); } catch { /* direct fallback below */ }
+  }
+  try { directSignal(); } catch { /* exit handler / next reconcile recovers */ }
+}
+
 /** Retire a daemon without leaving its soon-to-close websocket discoverable. */
 function requestIntentionalDaemonExit(info: DaemonInfo): void {
   info.intentionalShutdown = true;
   info.readyAt = null;
   info.wsUrl = null;
   info.controlUrl = null;
-  try { info.child.kill('SIGTERM'); } catch { /* exit handler / next reconcile recovers */ }
+  signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
 }
 
 function findNpx(): string {
@@ -172,6 +196,9 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   // supervisor knows), not whatever was in the operator shell or the daemon's
   // own fallback default.
   cleanEnv.HIVE_URL = `http://127.0.0.1:${supervisorPort}/mcp`;
+  // Lets codex-channel notice an ungraceful serve death (including SIGKILL)
+  // and run its own app-server process-group cleanup before exiting.
+  cleanEnv.HIVE_SUPERVISOR_PID = String(process.pid);
   // CODEX_APPSERVER_CWD: codex-channel.ts reads this and passes to thread/start
   // as cwd. Determines where the codex agent thinks it's running — must match
   // the operator's intent (the project the kitty pane was launched for), not
@@ -196,6 +223,7 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   const child = spawn(findNpx(), ['-y', 'tsx', scriptPath], {
     env: cleanEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
+    detached: shouldDetachDaemonProcess(),
   });
 
   if (!child.pid) {
@@ -291,7 +319,7 @@ export function stopCodexSupervisor(): Promise<void> {
         pending.delete(info.agentId);
         if (pending.size === 0) resolve();
       });
-      try { info.child.kill('SIGTERM'); } catch { /* ignore */ }
+      signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
     }
     // Hard timeout: if children don't exit in 5s, SIGKILL and resolve
     setTimeout(() => {
@@ -299,7 +327,7 @@ export function stopCodexSupervisor(): Promise<void> {
       log('warn', `[codex-supervisor] ${pending.size} daemon(s) didn't exit cleanly; SIGKILL`);
       for (const info of daemons.values()) {
         if (pending.has(info.agentId)) {
-          try { info.child.kill('SIGKILL'); } catch { /* ignore */ }
+          signalDaemonProcessTree(info.pid, 'SIGKILL', () => info.child.kill('SIGKILL'));
         }
       }
       resolve();
@@ -453,7 +481,7 @@ export function notifyAgentRemoved(agentId: string): boolean {
   const info = daemons.get(agentId);
   if (!info) return false;
   log('info', `[codex-supervisor] notify-agent-removed: "${info.displayName}" (${agentId.slice(-12)}) → killing daemon`);
-  try { info.child.kill('SIGTERM'); } catch { /* ignore */ }
+  signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
   return true;
 }
 

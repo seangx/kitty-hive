@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import { buildThreadResumeParams } from './codex-channel-runtime.js';
+import {
+  buildThreadResumeParams,
+  supervisorProcessIsMissing,
+} from './codex-channel-runtime.js';
 
 test('thread resume keeps history while overriding stale project cwd', () => {
   assert.deepEqual(
@@ -29,5 +32,23 @@ test('boot and in-process resume paths both carry the daemon project cwd', () =>
   assert.doesNotMatch(
     channelSource,
     /rpcCall\(\s*['"]thread\/resume['"]\s*,\s*\{\s*threadId:/,
+  );
+});
+
+test('supervisor watchdog exits only for a confirmed missing process', () => {
+  assert.equal(supervisorProcessIsMissing(undefined), false);
+  assert.equal(supervisorProcessIsMissing('not-a-pid'), false);
+  assert.equal(supervisorProcessIsMissing('42', () => {}), false);
+  assert.equal(
+    supervisorProcessIsMissing('42', () => {
+      throw Object.assign(new Error('not permitted'), { code: 'EPERM' });
+    }),
+    false,
+  );
+  assert.equal(
+    supervisorProcessIsMissing('42', () => {
+      throw Object.assign(new Error('missing'), { code: 'ESRCH' });
+    }),
+    true,
   );
 });

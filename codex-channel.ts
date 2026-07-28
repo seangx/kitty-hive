@@ -27,6 +27,7 @@
  *   HIVE_AGENT_NAME   display_name to register as
  *   HIVE_AGENT_ROLES  comma-separated initial roles
  *   HIVE_EVENT_MODE   auto (daemon handles events) or foreground (default auto)
+ *   HIVE_SUPERVISOR_PID parent kitty-hive serve PID (supervised mode only)
  *   CODEX_CMD         path to codex binary (default: `codex` from PATH)
  *   CODEX_PROFILE     codex profile name to pass via --profile (optional)
  *   CODEX_EXTRA_ARGS  extra space-separated args before the prompt
@@ -36,7 +37,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 
 // --- Config (env) ---
 
@@ -54,6 +55,7 @@ const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || '').trim();
 // spawn-per-event mode (works on any codex version, no shared context).
 const CODEX_CHANNEL_MODE = (process.env.CODEX_CHANNEL_MODE || 'auto') as 'auto' | 'appserver' | 'exec';
 const CODEX_APPSERVER_CWD = process.env.CODEX_APPSERVER_CWD || process.cwd();
+const HIVE_SUPERVISOR_PID = process.env.HIVE_SUPERVISOR_PID;
 // Timeout for thread/start + thread/resume. codex 0.144 blocks these ~30s on
 // a models-refresh child-process hang (vendor bug, openai/codex#14795-family:
 // "failed to refresh available models: timeout waiting for child process to
@@ -315,6 +317,7 @@ let turnTracker: TurnTracker | null = null;
 let historyInjector: HistoryItemInjector | null = null;
 let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
+let supervisorWatchdog: NodeJS.Timeout | null = null;
 
 /** Called when EITHER codex app-server child process dies post-ready OR the WS
  *  closes / errors. Both fire together when app-server crashes. Exits the
@@ -1212,19 +1215,36 @@ function cleanupAppserver() {
   threadId = null;
 }
 
-function shutdown(signal: NodeJS.Signals) {
+function shutdown(reason: NodeJS.Signals | 'supervisor-exit') {
   // Mark intentional shutdown BEFORE killing children — otherwise
   // appserverProc.kill() triggers our death handler thinking app-server
   // crashed, racing process.exit(0) with process.exit(2).
   appserverDeathHandled = true;
-  console.error(`[codex-channel] received ${signal}, shutting down...`);
+  if (supervisorWatchdog) {
+    clearInterval(supervisorWatchdog);
+    supervisorWatchdog = null;
+  }
+  console.error(`[codex-channel] received ${reason}, shutting down...`);
   cleanupAppserver();
   process.exit(0);
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 
+function startSupervisorWatchdog(): void {
+  if (!HIVE_SUPERVISOR_PID) return;
+  const checkSupervisor = () => {
+    if (!supervisorProcessIsMissing(HIVE_SUPERVISOR_PID)) return;
+    console.error(`[codex-channel] supervisor pid ${HIVE_SUPERVISOR_PID} is gone; cleaning up daemon process tree`);
+    shutdown('supervisor-exit');
+  };
+  checkSupervisor();
+  supervisorWatchdog = setInterval(checkSupervisor, 2000);
+  supervisorWatchdog.unref();
+}
+
 async function main() {
+  startSupervisorWatchdog();
   preflight();
   // 1. register on hive
   while (true) {
