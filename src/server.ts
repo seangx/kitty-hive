@@ -4,7 +4,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import { isInitializeRequest } from '@modelcontextprotocol/sdk/types.js';
 import { initDB, cleanupStaleTasks, cleanupPendingPushes, pendingPushCountByAgent } from './db.js';
 import { log, setLogLevel } from './log.js';
-import { sessions, unbindSession, sessionAgents, activeSSE, drainPushesForAgent } from './sessions.js';
+import { sessions, unbindSession, sessionAgents, activeSSE, eventConsumers, declaresEventConsumer, markEventConsumer, drainPushesForAgent } from './sessions.js';
 import { createMcpServer } from './mcp/server.js';
 import { handleFederation, cleanupOldFiles, getNodeName } from './federation-http.js';
 import { handleAdmin } from './admin-http.js';
@@ -46,7 +46,8 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         res.end(JSON.stringify({ error: 'Invalid or missing session ID' }));
         return;
       }
-      log('info', `[sse] opening stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'}`);
+      const isEventConsumer = eventConsumers.has(sid);
+      log('info', `[sse] opening stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'} event-consumer=${isEventConsumer}`);
       activeSSE.add(sid);
       // Keepalive: write an SSE comment every 25s so half-open / zombie TCP
       // connections fail fast (write errors → 'close' event → cleanup), and
@@ -116,12 +117,16 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         }));
         return;
       } else if (!sid && isInitializeRequest(body)) {
+        const experimental = body?.params?.capabilities?.experimental;
+        const clientName = body?.params?.clientInfo?.name;
+        const isEventConsumer = declaresEventConsumer(clientName, experimental);
         const server = createMcpServer();
         const transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (newSid: string) => {
-            log('info', `[session] new session: ${newSid}`);
             sessions[newSid] = { transport, server };
+            if (isEventConsumer) markEventConsumer(newSid);
+            log('info', `[session] new session: ${newSid} client=${clientName || 'unknown'} event-consumer=${isEventConsumer}`);
           },
         });
         transport.onclose = () => {

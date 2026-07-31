@@ -76,7 +76,7 @@ async function initHiveSession() {
   sessionId = null  // ensure no stale id is sent
   await hivePost('initialize', {
     protocolVersion: '2025-03-26',
-    capabilities: {},
+    capabilities: { experimental: { 'kitty-hive/event-consumer': {} } },
     clientInfo: { name: 'hive-channel', version: '1.0' },
   })
   await fetch(HIVE_URL, {

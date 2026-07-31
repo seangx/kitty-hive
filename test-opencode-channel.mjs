@@ -26,7 +26,7 @@ const replayPrompt = buildOpenCodePrompt({
   type: 'dm', event_id: 'dm:43', message_id: 43, replayed: true,
   queued_at: '2026-07-18T00:00:00.000Z', received_at: '2026-07-20T00:00:00.000Z',
 }, { id: 'agent-1', name: 'worker' });
-ok(replayPrompt.includes('replayed: true') && replayPrompt.includes('stale_delivery: true'), 'replayed OpenCode event is explicitly marked stale');
+ok(replayPrompt.includes('replayed: true') && replayPrompt.includes('queued_delivery: true'), 'replayed OpenCode event exposes replay and queue-delay markers');
 ok(eventDedupKey({ message_id: 9 }) === 'dm:9', 'message id fallback is stable');
 const intro = buildOpenCodePrompt({ type: 'daemon-intro', event_id: 'intro-1' }, { id: 'agent-1', name: 'worker' });
 ok(intro.includes('FIRST ACTION: call hive_start') && intro.includes('wait for the first event'), 'new session receives a standalone identity brief');

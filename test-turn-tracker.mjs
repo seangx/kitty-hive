@@ -301,9 +301,9 @@ async function test15_replayAndDelayMarkers() {
     queued_at: '2026-07-20T07:00:00.000Z',
   }, now);
   ok(delayed.some(line => line.startsWith('replayed: true')), 'restart replay is labeled explicitly');
-  ok(delayed.some(line => line.includes('stale_delivery: true') && line.includes('delay_ms=120000')), 'old queued_at produces an explicit stale marker');
+  ok(delayed.some(line => line.includes('queued_delivery: true') && line.includes('delay_ms=120000')), 'old queued_at produces an explicit queue-delay marker');
   const fresh = buildEventTimingLines({ received_at: '2026-07-20T07:01:55.000Z' }, now);
-  ok(fresh.every(line => !line.includes('stale_delivery')), 'fresh delivery is not mislabeled stale');
+  ok(fresh.every(line => !line.includes('queued_delivery')), 'fresh delivery is not mislabeled as queued');
 }
 
 async function test16_externalTerminalNotificationContract() {

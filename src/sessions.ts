@@ -13,9 +13,48 @@ export interface Session {
 export const sessions: Record<string, Session> = {};
 export const sessionAgents = new Map<string, string>();
 export const agentSessions = new Map<string, Set<string>>();
-// Sessions with an active SSE GET stream (push notifications only work for these).
+// Sessions with an active SSE GET stream. Standard MCP clients also open one
+// for server notifications, so activeSSE alone does not mean "Hive event
+// consumer".
 export const activeSSE = new Set<string>();
+// Channel daemons opt in through the kitty-hive/event-consumer experimental
+// MCP capability. When at least one opted-in session exists for an agent,
+// pushes go only there.
+export const eventConsumers = new Set<string>();
+// Remember agents that have used the explicit consumer protocol. If their
+// channel disconnects while an ordinary MCP SSE remains open, queue events
+// instead of falling back to the tool session and falsely reporting delivery.
+export const eventConsumerAgents = new Set<string>();
 const activeDrains = new Map<string, Promise<void>>();
+
+export function declaresEventConsumer(
+  clientName: unknown,
+  experimentalCapabilities: unknown,
+): boolean {
+  const capabilities = experimentalCapabilities && typeof experimentalCapabilities === 'object'
+    ? experimentalCapabilities as Record<string, unknown>
+    : {};
+  return Object.prototype.hasOwnProperty.call(capabilities, 'kitty-hive/event-consumer')
+    // Compatibility for channel clients released before the capability marker
+    // was added.
+    || clientName === 'hive-channel'
+    || clientName === 'codex-channel'
+    || clientName === 'opencode-channel';
+}
+
+export function livePushSessionsForAgent(agentId: string): string[] {
+  const sids = agentSessions.get(agentId);
+  const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
+  const consumers = live.filter(s => eventConsumers.has(s));
+  if (consumers.length > 0) return consumers;
+  return eventConsumerAgents.has(agentId) ? [] : live;
+}
+
+export function markEventConsumer(sessionId: string) {
+  eventConsumers.add(sessionId);
+  const agentId = sessionAgents.get(sessionId);
+  if (agentId) eventConsumerAgents.add(agentId);
+}
 
 export function bindSession(sessionId: string, agentId: string) {
   const oldAgentId = sessionAgents.get(sessionId);
@@ -24,6 +63,7 @@ export function bindSession(sessionId: string, agentId: string) {
     if (oldSet) { oldSet.delete(sessionId); if (oldSet.size === 0) agentSessions.delete(oldAgentId); }
   }
   sessionAgents.set(sessionId, agentId);
+  if (eventConsumers.has(sessionId)) eventConsumerAgents.add(agentId);
   let set = agentSessions.get(agentId);
   if (!set) { set = new Set(); agentSessions.set(agentId, set); }
   set.add(sessionId);
@@ -47,6 +87,7 @@ export function unbindSession(sessionId: string) {
     log('info', `[unbind] session=${sessionId} → agent=${agentId} (remaining sessions: ${set?.size ?? 0})`);
   }
   activeSSE.delete(sessionId);
+  eventConsumers.delete(sessionId);
 }
 
 export async function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string) {
@@ -71,15 +112,14 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
         }
       }));
     }
-    const sids = agentSessions.get(agentId);
-    const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
+    const live = livePushSessionsForAgent(agentId);
     if (live.length === 0) {
       // No live SSE — persist so a future reconnect / restart can pick it up.
       db.enqueuePendingPush(agentId, payload);
-      log('info', `[notify] agent=${agentId} → no live SSE, enqueued`);
+      log('info', `[notify] agent=${agentId} → no live event consumer, enqueued`);
       continue;
     }
-    log('info', `[notify] agent=${agentId} live-sse=${live.length}`);
+    log('info', `[notify] agent=${agentId} live-consumers=${live.length}`);
     let anyDelivered = false;
     for (const sid of live) {
       const session = sessions[sid];
@@ -87,7 +127,7 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
       try {
         await session.server.sendLoggingMessage({ level: 'info', data: payload }, sid);
         session.server.server.sendResourceUpdated({ uri: 'hive://inbox' });
-        log('info', `[notify] sent to session ${sid} (SSE active) OK`);
+        log('info', `[notify] sent to event consumer ${sid} OK`);
         anyDelivered = true;
       } catch (err) {
         log('warn', `[notify] failed sid=${sid}: ${err}`);
@@ -111,14 +151,13 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
  * one session confirmed the send.
  */
 async function drainPendingPushesOnce(agentId: string): Promise<void> {
-  const sids = agentSessions.get(agentId);
-  const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
+  const live = livePushSessionsForAgent(agentId);
   if (live.length === 0) return;
 
   const rows = db.listPendingPushes(agentId);
   if (rows.length === 0) return;
 
-  log('info', `[drain] agent=${agentId} pending=${rows.length} live-sse=${live.length}`);
+  log('info', `[drain] agent=${agentId} pending=${rows.length} live-consumers=${live.length}`);
   const settled: number[] = [];
   let deliveredCount = 0;
   let skippedCount = 0;

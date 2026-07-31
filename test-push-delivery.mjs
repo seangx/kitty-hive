@@ -4,7 +4,14 @@ import { existsSync, unlinkSync } from 'node:fs';
 import {
   activeSSE,
   agentSessions,
+  declaresEventConsumer,
   drainPushesForAgent,
+  eventConsumerAgents,
+  eventConsumers,
+  livePushSessionsForAgent,
+  markEventConsumer,
+  notifyAgents,
+  sessionAgents,
   sessions,
 } from './dist/sessions.js';
 import {
@@ -34,7 +41,10 @@ function ok(condition, message) {
 
 function cleanup() {
   activeSSE.clear();
+  eventConsumerAgents.clear();
+  eventConsumers.clear();
   agentSessions.clear();
+  sessionAgents.clear();
   for (const key of Object.keys(sessions)) delete sessions[key];
   for (const suffix of ['', '-wal', '-shm']) {
     const path = DB + suffix;
@@ -46,6 +56,17 @@ process.on('exit', cleanup);
 initDB(DB);
 const sender = createAgent('delivery-sender');
 const recipient = createAgent('delivery-recipient');
+
+console.log('\n=== Event consumer capability ===');
+ok(declaresEventConsumer('codex-channel', undefined), 'legacy channel client name remains an event consumer');
+ok(
+  declaresEventConsumer('custom-channel', { 'kitty-hive/event-consumer': {} }),
+  'custom client can opt in through the event-consumer capability',
+);
+ok(
+  !declaresEventConsumer('codex-mcp-client', {}),
+  'ordinary Codex MCP tool client is not an event consumer',
+);
 
 console.log('\n=== Forward-only read watermarks ===');
 const firstDm = appendDM(sender.id, recipient.id, 'first');
@@ -107,8 +128,10 @@ enqueuePendingPush(recipient.id, JSON.stringify({
   message_id: liveDm.id,
 }));
 let sends = 0;
+let toolSessionSends = 0;
 let replayPayload;
 const sid = 'push-delivery-test-session';
+const toolSid = 'ordinary-mcp-tool-session';
 sessions[sid] = {
   server: {
     async sendLoggingMessage(message) {
@@ -119,15 +142,55 @@ sessions[sid] = {
     server: { sendResourceUpdated() {} },
   },
 };
-agentSessions.set(recipient.id, new Set([sid]));
+sessions[toolSid] = {
+  server: {
+    async sendLoggingMessage() {
+      toolSessionSends++;
+    },
+    server: { sendResourceUpdated() {} },
+  },
+};
+agentSessions.set(recipient.id, new Set([sid, toolSid]));
+sessionAgents.set(sid, recipient.id);
+sessionAgents.set(toolSid, recipient.id);
 activeSSE.add(sid);
+activeSSE.add(toolSid);
+markEventConsumer(sid);
+ok(
+  JSON.stringify(livePushSessionsForAgent(recipient.id)) === JSON.stringify([sid]),
+  'explicit event consumer excludes an ordinary MCP SSE session',
+);
+const immediateDm = appendDM(sender.id, recipient.id, 'live event consumer delivery');
+await notifyAgents([recipient.id], undefined, JSON.stringify({
+  type: 'dm',
+  event_id: `dm:${immediateDm.id}`,
+  message_id: immediateDm.id,
+}));
+ok(sends === 1, 'live notification is sent once to the explicit event consumer');
+ok(toolSessionSends === 0, 'live notification is not copied to an ordinary MCP SSE session');
+sends = 0;
 await Promise.all([
   drainPushesForAgent(recipient.id),
   drainPushesForAgent(recipient.id),
 ]);
 ok(sends === 1, `concurrent drain triggers send each row once (got ${sends})`);
+ok(toolSessionSends === 0, 'pending replay is not copied to an ordinary MCP SSE session');
 ok(replayPayload?.replayed === true && typeof replayPayload?.queued_at === 'string', 'replayed push carries queued_at metadata');
 ok(listPendingPushes(recipient.id).length === 0, 'delivered replay row is deleted');
+
+eventConsumers.clear();
+ok(
+  livePushSessionsForAgent(recipient.id).length === 0,
+  'known consumer disconnect does not fall back to an ordinary MCP SSE session',
+);
+eventConsumers.add(sid);
+
+const legacyRecipient = createAgent('legacy-delivery-recipient');
+agentSessions.set(legacyRecipient.id, new Set([toolSid]));
+ok(
+  JSON.stringify(livePushSessionsForAgent(legacyRecipient.id)) === JSON.stringify([toolSid]),
+  'legacy clients without an explicit consumer retain the all-live-SSE fallback',
+);
 
 enqueuePendingPush(recipient.id, JSON.stringify({
   type: 'dm',

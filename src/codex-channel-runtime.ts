@@ -278,7 +278,7 @@ export function buildEventTimingLines(
   if (Number.isFinite(originMs)) {
     const delayMs = Math.max(0, nowMs - originMs);
     if (delayMs >= delayedAfterMs) {
-      lines.push(`stale_delivery: true (delay_ms=${delayMs}; fetch authoritative current state before acting)`);
+      lines.push(`queued_delivery: true (delay_ms=${delayMs}; fetch authoritative current state before acting)`);
     }
   }
   return lines;

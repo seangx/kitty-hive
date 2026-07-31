@@ -162,7 +162,7 @@ async function initHiveSession() {
   sessionId = null;
   await hivePost('initialize', {
     protocolVersion: '2025-03-26',
-    capabilities: {},
+    capabilities: { experimental: { 'kitty-hive/event-consumer': {} } },
     clientInfo: { name: 'codex-channel', version: '1.0' },
   });
   await fetch(ENV_URL, {
