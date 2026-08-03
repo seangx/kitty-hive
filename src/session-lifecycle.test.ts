@@ -31,7 +31,7 @@ test('reaps a session whose SSE stream does not reconnect', () => {
   const activeSSE = new Set<string>();
   const expired: string[] = [];
   const clock = new FakeClock();
-  const reaper = new DisconnectedSessionReaper(activeSSE, sid => expired.push(sid), 30_000, undefined, clock);
+  const reaper = new DisconnectedSessionReaper(activeSSE, sid => { expired.push(sid); }, 30_000, undefined, clock);
 
   const stream = reaper.openStream('session-1');
   reaper.closeStream('session-1', stream);
@@ -46,7 +46,7 @@ test('a reconnected SSE stream cancels pending cleanup', () => {
   const activeSSE = new Set<string>();
   const expired: string[] = [];
   const clock = new FakeClock();
-  const reaper = new DisconnectedSessionReaper(activeSSE, sid => expired.push(sid), 30_000, undefined, clock);
+  const reaper = new DisconnectedSessionReaper(activeSSE, sid => { expired.push(sid); }, 30_000, undefined, clock);
 
   const oldStream = reaper.openStream('session-1');
   reaper.closeStream('session-1', oldStream);
@@ -62,7 +62,7 @@ test('an in-flight request defers cleanup until the request ends', () => {
   const activeSSE = new Set<string>();
   const expired: string[] = [];
   const clock = new FakeClock();
-  const reaper = new DisconnectedSessionReaper(activeSSE, sid => expired.push(sid), 30_000, undefined, clock);
+  const reaper = new DisconnectedSessionReaper(activeSSE, sid => { expired.push(sid); }, 30_000, undefined, clock);
 
   const stream = reaper.openStream('session-1');
   reaper.closeStream('session-1', stream);
@@ -82,7 +82,7 @@ test('closing an older stream cannot retire a replacement stream', () => {
   const activeSSE = new Set<string>();
   const expired: string[] = [];
   const clock = new FakeClock();
-  const reaper = new DisconnectedSessionReaper(activeSSE, sid => expired.push(sid), 30_000, undefined, clock);
+  const reaper = new DisconnectedSessionReaper(activeSSE, sid => { expired.push(sid); }, 30_000, undefined, clock);
 
   const oldStream = reaper.openStream('session-1');
   const replacementStream = reaper.openStream('session-1');
