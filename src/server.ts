@@ -11,11 +11,45 @@ import { handleAdmin } from './admin-http.js';
 import { startHeartbeat } from './federation-heartbeat.js';
 import { startCodexSupervisor, stopCodexSupervisor } from './codex-supervisor.js';
 import { startOpenCodeSupervisor, stopOpenCodeSupervisor } from './opencode-supervisor.js';
+import { DisconnectedSessionReaper } from './session-lifecycle.js';
 
 export { setLogLevel };
 
 export async function startServer(port: number, dbPath?: string): Promise<void> {
   initDB(dbPath);
+
+  let sessionReaper: DisconnectedSessionReaper;
+  const disposeSession = async (
+    sid: string,
+    reason: string,
+    closeTransport = true,
+  ): Promise<void> => {
+    const session = sessions[sid];
+    sessionReaper.clear(sid);
+    if (!session) {
+      unbindSession(sid);
+      return;
+    }
+
+    // Remove all routing references before closing the transport. Its onclose
+    // callback re-enters this function, so deletion also makes disposal
+    // idempotent.
+    delete sessions[sid];
+    unbindSession(sid);
+    log('info', `[session] disposed session=${sid} reason=${reason}`);
+    if (!closeTransport) return;
+    try {
+      await session.transport.close();
+    } catch (error) {
+      log('warn', `[session] failed to close transport session=${sid}: ${error}`);
+    }
+  };
+  sessionReaper = new DisconnectedSessionReaper(
+    activeSSE,
+    sid => disposeSession(sid, 'SSE reconnect grace expired'),
+    undefined,
+    error => log('warn', `[session] disconnect cleanup failed: ${error}`),
+  );
 
   const httpServer = createServer(async (req: IncomingMessage, res: ServerResponse) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`);
@@ -48,7 +82,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
       }
       const isEventConsumer = eventConsumers.has(sid);
       log('info', `[sse] opening stream for session=${sid} agent=${sessionAgents.get(sid) || 'unbound'} event-consumer=${isEventConsumer}`);
-      activeSSE.add(sid);
+      const streamToken = sessionReaper.openStream(sid);
       // Keepalive: write an SSE comment every 25s so half-open / zombie TCP
       // connections fail fast (write errors → 'close' event → cleanup), and
       // intermediates don't reap the idle stream. Cheap (~3 bytes / 25s).
@@ -56,9 +90,9 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         if (res.writableEnded || res.destroyed) return;
         try { res.write(': ka\n\n'); } catch { /* ignore — close handler will fire */ }
       }, 25_000);
-      res.on('close', () => {
+      res.once('close', () => {
         clearInterval(keepalive);
-        activeSSE.delete(sid);
+        sessionReaper.closeStream(sid, streamToken);
         log('info', `[sse] stream closed for session=${sid}`);
       });
       // Drain any pending pushes for the bound agent. Fire-and-forget — we
@@ -83,7 +117,6 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
         return;
       }
       log('info', `[session] DELETE session=${sid}`);
-      unbindSession(sid);
       await sessions[sid].transport.handleRequest(req, res);
       return;
     }
@@ -103,7 +136,12 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
       }
 
       if (sid && sessions[sid]) {
-        await sessions[sid].transport.handleRequest(req, res, body);
+        const requestToken = sessionReaper.beginRequest(sid);
+        try {
+          await sessions[sid].transport.handleRequest(req, res, body);
+        } finally {
+          sessionReaper.endRequest(sid, requestToken);
+        }
       } else if (sid && !sessions[sid]) {
         // Stale session id (e.g. after server restart) — reject with 404 so the client
         // knows to re-initialize. Do NOT fall through to stateless: that would create
@@ -133,8 +171,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
           const tSid = transport.sessionId;
           if (tSid) {
             log('debug', `[session] transport closed: ${tSid}`);
-            unbindSession(tSid);
-            delete sessions[tSid];
+            void disposeSession(tSid, 'transport closed', false);
           }
         };
         await server.connect(transport);
