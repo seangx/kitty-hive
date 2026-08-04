@@ -4,7 +4,9 @@ import test from 'node:test';
 import {
   CodexTerminalNotificationTracker,
   TurnTracker,
+  buildAppServerInitializeParams,
   buildThreadResumeParams,
+  describeWebSocketEvent,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
   type RpcTransport,
@@ -14,7 +16,7 @@ function ignoredReason(decision: CodexTerminalDecision): string | undefined {
   return decision.kind === 'ignored' ? decision.reason : undefined;
 }
 
-test('thread resume keeps history while overriding stale project cwd', () => {
+test('thread resume keeps server-side history without returning serialized turns', () => {
   assert.deepEqual(
     buildThreadResumeParams(
       '019fa11b-79eb-79e3-8628-863405bf27de',
@@ -23,11 +25,28 @@ test('thread resume keeps history while overriding stale project cwd', () => {
     {
       threadId: '019fa11b-79eb-79e3-8628-863405bf27de',
       cwd: '/Users/example/.kitty-kitty/sessions/e2f81622',
+      excludeTurns: true,
     },
   );
 });
 
-test('boot and in-process resume paths both carry the daemon project cwd', () => {
+test('app-server initialization enables the experimental resume field', () => {
+  assert.deepEqual(
+    buildAppServerInitializeParams({
+      name: 'kitty-hive-codex-channel',
+      version: '0.7.0',
+    }),
+    {
+      clientInfo: {
+        name: 'kitty-hive-codex-channel',
+        version: '0.7.0',
+      },
+      capabilities: { experimentalApi: true },
+    },
+  );
+});
+
+test('boot and in-process resume paths both use the metadata-only builder', () => {
   const channelSource = readFileSync(
     new URL('../codex-channel.ts', import.meta.url),
     'utf8',
@@ -37,9 +56,30 @@ test('boot and in-process resume paths both carry the daemon project cwd', () =>
   );
 
   assert.equal(cwdAwareResumeCalls?.length, 2);
+  assert.match(channelSource, /rpcCall\(\s*['"]initialize['"]\s*,\s*buildAppServerInitializeParams\(/);
   assert.doesNotMatch(
     channelSource,
     /rpcCall\(\s*['"]thread\/resume['"]\s*,\s*\{\s*threadId:/,
+  );
+  assert.doesNotMatch(channelSource, /thread\?\.turns\?\.length/);
+  assert.match(channelSource, /onAppserverFailure\('process', `codex app-server exited/);
+  assert.match(channelSource, /onAppserverFailure\('transport', `WebSocket error/);
+  assert.doesNotMatch(channelSource, /appserver died:/);
+});
+
+test('WebSocket diagnostics expose nested Undici errors and close details', () => {
+  assert.equal(
+    describeWebSocketEvent({
+      type: 'error',
+      error: Object.assign(new Error('Payload size exceeds maximum allowed size'), {
+        code: 'WS_ERR_PAYLOAD_TOO_LARGE',
+      }),
+    }),
+    'type=error code=WS_ERR_PAYLOAD_TOO_LARGE message=Payload size exceeds maximum allowed size',
+  );
+  assert.equal(
+    describeWebSocketEvent({ type: 'close', code: 1009, reason: 'Message Too Big' }),
+    'type=close code=1009 reason=Message Too Big',
   );
 });
 

@@ -2,7 +2,7 @@
  * codex-channel-runtime — the testable core of codex-channel.ts.
  *
  * Encapsulates everything that talks to a codex app-server's JSON-RPC v2
- * protocol (https://github.com/openai/codex 0.124+): issuing `turn/start`,
+ * protocol (https://github.com/openai/codex 0.125+): issuing `turn/start`,
  * tracking in-flight turns by their server-assigned turn id, and reacting to
  * `turn/completed` / `turn/interrupt` / `error` notifications.
  *
@@ -87,6 +87,32 @@ export interface RpcTransport {
 export interface ThreadResumeParams {
   threadId: string;
   cwd: string;
+  excludeTurns: true;
+}
+
+export interface AppServerInitializeParams {
+  clientInfo: {
+    name: string;
+    version: string;
+  };
+  capabilities: {
+    experimentalApi: true;
+  };
+}
+
+/** Opt in to Codex's experimental protocol surface.
+ *
+ * `thread/resume.excludeTurns` is experimental and Codex rejects the field
+ * unless the client enables this capability during its single initialize
+ * request. The field is available in Codex 0.125+.
+ */
+export function buildAppServerInitializeParams(
+  clientInfo: AppServerInitializeParams['clientInfo'],
+): AppServerInitializeParams {
+  return {
+    clientInfo,
+    capabilities: { experimentalApi: true },
+  };
 }
 
 export type ProcessProbe = (pid: number, signal: 0) => void;
@@ -118,10 +144,45 @@ export function supervisorProcessIsMissing(
  * threadId restores that stale cwd and hides project-local skills deployed
  * after the thread was first created. Codex app-server supports cwd as a
  * thread/resume override; always carry the daemon's authoritative project cwd
- * on both boot-time resume and in-process thread switches.
+ * on both boot-time resume and in-process thread switches. `excludeTurns`
+ * omits the potentially enormous serialized history from the RPC response;
+ * it does not discard the history Codex loads internally for the resumed
+ * thread.
  */
 export function buildThreadResumeParams(threadId: string, cwd: string): ThreadResumeParams {
-  return { threadId, cwd };
+  return { threadId, cwd, excludeTurns: true };
+}
+
+function recordOf(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null
+    ? value as Record<string, unknown>
+    : undefined;
+}
+
+function nonEmptyString(value: unknown): string | undefined {
+  return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+/** Preserve the useful details hidden inside Node/Undici WebSocket events.
+ *
+ * Undici exposes protocol failures such as its maximum-payload rejection on
+ * `event.error`, while the outer event commonly contains only `type=error`.
+ */
+export function describeWebSocketEvent(event: unknown): string {
+  const outer = recordOf(event);
+  const nested = recordOf(outer?.error);
+  const type = nonEmptyString(outer?.type);
+  const message = nonEmptyString(nested?.message) ?? nonEmptyString(outer?.message);
+  const code = nested?.code ?? outer?.code;
+  const reason = nonEmptyString(outer?.reason);
+  const details: string[] = [];
+
+  if (type) details.push(`type=${type}`);
+  if (code !== undefined && code !== null && String(code).trim()) details.push(`code=${String(code)}`);
+  if (message) details.push(`message=${message}`);
+  if (reason) details.push(`reason=${reason}`);
+
+  return details.join(' ') || 'unknown';
 }
 
 export interface TurnTrackerOptions {

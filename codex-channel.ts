@@ -37,7 +37,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -50,8 +50,9 @@ const HIVE_AGENT_ROLES = process.env.HIVE_AGENT_ROLES || '';
 const CODEX_CMD = process.env.CODEX_CMD || 'codex';
 const CODEX_PROFILE = process.env.CODEX_PROFILE || '';
 const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || '').trim();
-// CODEX_CHANNEL_MODE: 'auto' (default) tries appserver first, falls back to
-// exec if codex < 0.124 or app-server fails to start. 'appserver' forces
+// CODEX_CHANNEL_MODE: 'auto' (default) tries appserver first and falls back to
+// exec when app-server fails to start. Metadata-safe supervised resume requires
+// Codex 0.125+ for thread/resume.excludeTurns. 'appserver' forces
 // appserver mode (fails hard if unavailable). 'exec' forces the legacy
 // spawn-per-event mode (works on any codex version, no shared context).
 const CODEX_CHANNEL_MODE = (process.env.CODEX_CHANNEL_MODE || 'auto') as 'auto' | 'appserver' | 'exec';
@@ -301,7 +302,7 @@ function buildPrompt(ev: ParsedEvent): string {
   ].join('\n');
 }
 
-// ===== Appserver mode (codex ≥ 0.124) =====
+// ===== Appserver mode (codex ≥ 0.125) =====
 // Long-lived codex via `codex app-server --listen ws://127.0.0.1:<port>`.
 // One JSON-RPC WebSocket connection and one persistent thread. Auto-mode
 // events start turns; foreground-mode events only append model-visible
@@ -321,16 +322,19 @@ let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
 let supervisorWatchdog: NodeJS.Timeout | null = null;
 
-/** Called when EITHER codex app-server child process dies post-ready OR the WS
- *  closes / errors. Both fire together when app-server crashes. Exits the
- *  daemon with non-zero so the supervisor's child.on('exit') triggers an
- *  exponential-backoff respawn with a fresh codex app-server. In-flight events
- *  in the local queue ARE lost — known limitation, documented in v0.7.0 notes.
- *  Idempotent via the appserverDeathHandled guard. */
-function onAppserverDeath(reason: string): void {
+/** Called when the codex app-server process fails post-ready OR this daemon's
+ *  WebSocket transport closes / errors. A transport failure does not prove
+ *  that Codex crashed, but either condition leaves the daemon unable to serve
+ *  events. Exit non-zero so the supervisor respawns a clean pair. In-flight
+ *  events in the local queue ARE lost — known limitation, documented in
+ *  v0.7.0 notes. Idempotent via the appserverDeathHandled guard. */
+function onAppserverFailure(source: 'process' | 'transport', reason: string): void {
   if (appserverDeathHandled) return;
   appserverDeathHandled = true;
-  console.error(`[codex-channel] appserver died: ${reason}`);
+  const label = source === 'process'
+    ? 'app-server process failure'
+    : 'app-server client transport failure';
+  console.error(`[codex-channel] ${label}: ${reason}`);
   console.error('[codex-channel] exiting daemon — supervisor will respawn with fresh codex app-server');
   // Full group cleanup, NOT just appserverProc.kill(): this path also fires
   // on WS-level errors while the codex app-server process tree is still
@@ -341,7 +345,8 @@ function onAppserverDeath(reason: string): void {
   // timed out on thread/resume → death spiral across all 10 daemons after a
   // serve restart. cleanupAppserver() does the process-group SIGTERM.
   cleanupAppserver();
-  // exit code 2 distinguishes "app-server crash" from "clean shutdown via SIGTERM"
+  // Exit code 2 distinguishes an app-server runtime/transport failure from a
+  // clean shutdown via SIGTERM.
   process.exit(2);
 }
 let nextRpcId = 100;
@@ -455,11 +460,11 @@ async function setupAppserver(): Promise<void> {
       // are lost — acceptable for v1 (rare path); pending_pushes in hive
       // will hold any events that arrived AFTER daemon exit and re-deliver
       // when supervisor's new daemon binds.
-      onAppserverDeath(`codex app-server exited (code=${code}, signal=${signal})`);
+      onAppserverFailure('process', `codex app-server exited (code=${code}, signal=${signal})`);
     });
     appserverProc!.on('error', (err) => {
       if (!ready) { ready = true; clearTimeout(timer); reject(err); return; }
-      onAppserverDeath(`codex app-server process error: ${err?.message || err}`);
+      onAppserverFailure('process', `codex app-server process error: ${err?.message || err}`);
     });
   });
 
@@ -470,7 +475,7 @@ async function setupAppserver(): Promise<void> {
   appserverWs = new (globalThis as any).WebSocket(`ws://127.0.0.1:${port}`);
   await new Promise<void>((resolve, reject) => {
     const onOpen = () => { cleanup(); resolve(); };
-    const onErr = (e: any) => { cleanup(); reject(new Error(`WS open failed: ${e?.message || e?.type || 'unknown'}`)); };
+    const onErr = (e: any) => { cleanup(); reject(new Error(`WS open failed: ${describeWebSocketEvent(e)}`)); };
     const cleanup = () => {
       appserverWs.removeEventListener('open', onOpen);
       appserverWs.removeEventListener('error', onErr);
@@ -555,17 +560,18 @@ async function setupAppserver(): Promise<void> {
     }
   });
 
-  appserverWs.addEventListener('close', () => {
-    onAppserverDeath('appserver WS closed by remote (codex app-server likely exited)');
+  appserverWs.addEventListener('close', (e: any) => {
+    onAppserverFailure('transport', `WebSocket closed (${describeWebSocketEvent(e)})`);
   });
   appserverWs.addEventListener('error', (e: any) => {
-    onAppserverDeath(`appserver WS error: ${e?.message || e?.type || 'unknown'}`);
+    onAppserverFailure('transport', `WebSocket error (${describeWebSocketEvent(e)})`);
   });
 
   // 1. initialize
-  await rpcCall('initialize', {
-    clientInfo: { name: 'kitty-hive-codex-channel', version: '0.7.0' },
-  });
+  await rpcCall('initialize', buildAppServerInitializeParams({
+    name: 'kitty-hive-codex-channel',
+    version: '0.7.0',
+  }));
   // initialized notification — fire and forget
   appserverWs.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }));
 
@@ -588,7 +594,7 @@ async function setupAppserver(): Promise<void> {
       if (!resumedId) throw new Error(`thread/resume returned no thread.id: ${JSON.stringify(resumeResp)}`);
       threadId = resumedId;
       resumed = true;
-      console.error(`[codex-channel] appserver thread resumed: ${threadId} (${resumeResp?.thread?.turns?.length ?? 0} turns)`);
+      console.error(`[codex-channel] appserver thread resumed: ${threadId} (metadata-only response)`);
     } catch (err) {
       // Common cause: jsonl missing (stale thread_id from a wiped ~/.codex)
       // or codex schema upgrade. Fall back to a fresh thread; the new
@@ -766,7 +772,7 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       const resumedId = resp?.thread?.id;
       if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = resumedId;
-      console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (${resp?.thread?.turns?.length ?? 0} turns)`);
+      console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (metadata-only response)`);
     } else {
       const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
       const newId = resp?.thread?.id;
