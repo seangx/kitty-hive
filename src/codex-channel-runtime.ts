@@ -100,6 +100,33 @@ export interface AppServerInitializeParams {
   };
 }
 
+/** Build arguments for the long-lived Codex app-server owned by Hive.
+ *
+ * Codex prewarms a Responses WebSocket when a thread starts or resumes. That
+ * is useful for an interactive CLI whose first turn follows immediately, but
+ * a Hive daemon can sit idle for minutes before its first real turn. The
+ * prewarmed socket may be closed upstream during that idle window, making the
+ * first send fail with Broken pipe before Codex falls back to HTTPS.
+ *
+ * Keep this override process-local: interactive Codex sessions retain their
+ * normal WebSocket transport, while the long-lived Hive app-server uses the
+ * stable Responses-over-HTTPS path from the outset.
+ */
+export function buildCodexAppServerArgs(
+  listenUrl: string,
+  hiveToolNames: readonly string[],
+): string[] {
+  const args = [
+    'app-server',
+    '--listen', listenUrl,
+    '-c', 'model_providers.openai.supports_websockets=false',
+  ];
+  for (const toolName of hiveToolNames) {
+    args.push('-c', `mcp_servers.hive.tools.${toolName}.approval_mode="auto"`);
+  }
+  return args;
+}
+
 /** Opt in to Codex's experimental protocol surface.
  *
  * `thread/resume.excludeTurns` is experimental and Codex rejects the field

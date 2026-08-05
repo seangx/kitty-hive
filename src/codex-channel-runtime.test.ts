@@ -5,6 +5,7 @@ import {
   CodexTerminalNotificationTracker,
   TurnTracker,
   buildAppServerInitializeParams,
+  buildCodexAppServerArgs,
   buildThreadResumeParams,
   describeWebSocketEvent,
   supervisorProcessIsMissing,
@@ -43,6 +44,23 @@ test('app-server initialization enables the experimental resume field', () => {
       },
       capabilities: { experimentalApi: true },
     },
+  );
+});
+
+test('Hive app-server uses HTTPS Responses without changing interactive Codex', () => {
+  assert.deepEqual(
+    buildCodexAppServerArgs('ws://127.0.0.1:4567', ['hive_start', 'hive_inbox']),
+    [
+      'app-server',
+      '--listen',
+      'ws://127.0.0.1:4567',
+      '-c',
+      'model_providers.openai.supports_websockets=false',
+      '-c',
+      'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
+      '-c',
+      'mcp_servers.hive.tools.hive_inbox.approval_mode="auto"',
+    ],
   );
 });
 

@@ -37,7 +37,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -421,15 +421,11 @@ async function setupAppserver(): Promise<void> {
   // NOTE codex config precedence: tool-level > server default. A single
   // `default_tools_approval_mode` override would LOSE to the user's explicit
   // per-tool "approve" entries, so we must override every tool by name.
-  const approvalOverrides: string[] = [];
-  for (const t of await listHiveToolNames()) {
-    approvalOverrides.push('-c', `mcp_servers.hive.tools.${t}.approval_mode="auto"`);
-  }
-  appserverProc = spawn(CODEX_CMD, [
-    'app-server',
-    '--listen', `ws://127.0.0.1:${port}`,
-    ...approvalOverrides,
-  ], {
+  const appserverArgs = buildCodexAppServerArgs(
+    `ws://127.0.0.1:${port}`,
+    await listHiveToolNames(),
+  );
+  appserverProc = spawn(CODEX_CMD, appserverArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
