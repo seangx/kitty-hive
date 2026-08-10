@@ -15,6 +15,25 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
     tasks; `agentBadges` contains only non-terminal work.
   - `agentPool` contains authoritative local registered agents. Current entries
     are resident agents; no on-demand launcher is implied.
+
+`agentPool[]` raw shape:
+
+```json
+{
+  "agentId": "...",
+  "displayName": "Reviewer",
+  "tool": "codex",
+  "roles": ["reviewer"],
+  "expertise": "optional",
+  "status": "active",
+  "projectDir": "/repo",
+  "launchMode": "resident"
+}
+```
+
+`status` is the Hive agent presence state (`active | idle | busy | offline`),
+not task execution state. Kitty should combine it with `agentBadges` when it
+needs to render `working` versus `idle`.
 - `GET /runs/:taskId`
   - graph, activation-preserving node runs, approvals, and taken edge ids.
 - `GET /runs/:taskId/events?since=<cursor>`
