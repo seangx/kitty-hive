@@ -290,11 +290,21 @@ interface CheckOutput {
   task_id: string;
   title: string;
   status: TaskStatus;
+  input: Record<string, unknown>;
   assignee?: { id: string; display_name: string };
   recent_events: TaskEvent[];
   workflow?:
     | { kind: 'linear'; current_step: number; steps: WorkflowStep[] }
     | { kind: 'graph'; current_node_id: string; definition: GraphWorkflowDefinition };
+}
+
+function parseTaskInput(json: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(json);
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
 }
 
 export function handleCheck(input: { task_id: string }): CheckOutput {
@@ -318,6 +328,7 @@ export function handleCheck(input: { task_id: string }): CheckOutput {
 
   return {
     task_id: task.id, title: task.title, status: task.status as TaskStatus,
+    input: parseTaskInput(task.input_json),
     assignee, recent_events: events.slice(-10), workflow,
   };
 }

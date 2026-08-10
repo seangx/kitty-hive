@@ -5,6 +5,7 @@ import {
   handleGraphGateDecision,
   handleGraphNodeComplete,
   handleGraphWorkflowStart,
+  handleCheck,
   handleTaskClaim,
   handleTaskComplete,
   handleTaskCreate,
@@ -66,6 +67,7 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
     detail.takenEdgeIds.filter(edgeId => edgeId === 'e2e-changes-implement'),
     ['e2e-changes-implement'],
   );
+  assert.equal(handleCheck({ task_id: run.task_id }).input.workspace_dir, '/tmp/graph-kernel');
 
   const snapshot = getSidecarSnapshot();
   assert.equal(snapshot.agentPool.length, 4);

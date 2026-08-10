@@ -77,8 +77,9 @@ export function buildOpenCodePrompt(
       `Push notifications are id-only. Always call the fetch tool named by the`,
       `event (hive_dm_read / hive_check / hive_team_events / hive_team_info)`,
       `before acting. For task-assigned, finish the work and call`,
-      `hive_task_complete; only propose a workflow when multiple agents,`,
-      `multiple steps, or review gates are genuinely needed.`,
+      `hive_task_complete. Start/propose a workflow only when the user/creator`,
+      `explicitly requested Workflow; ordinary multi-step work stays a simple task.`,
+      `For node-start, finish the graph node and call hive_workflow_node_complete.`,
       ``,
       `Acknowledge readiness briefly, then wait for the first event.`,
       `event_id: ${eventId}`,
@@ -121,9 +122,9 @@ export function buildOpenCodePrompt(
     `You are kitty-hive agent "${agent.name}" (id: ${agent.id}).`,
     `The notification is id-only by design: fetch the full content before acting.`,
     `DM: reply with hive_dm when appropriate. Task assigned: do the work, then call`,
-    `hive_task_complete({ task_id, result }); only propose a workflow for genuinely`,
-    `multi-step, multi-agent, or review-gated work. Step start: finish your part and`,
-    `call hive_workflow_step_complete. Do not approve gates unless you are the creator.`,
+    `hive_task_complete({ task_id, result }); only start/propose Workflow when the`,
+    `user/creator explicitly requested it. Node start: call hive_workflow_node_complete.`,
+    `Legacy step start: call hive_workflow_step_complete. Do not approve gates unless you are the creator.`,
   ].join('\n');
 }
 
