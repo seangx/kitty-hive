@@ -101,6 +101,8 @@ export const TASK_EVENT_TYPES = [
   'task-start', 'task-claim', 'task-update',
   'task-propose', 'task-approve', 'task-reject',
   'step-start', 'step-complete', 'step-approve',
+  'workflow-start', 'node-start', 'node-complete',
+  'edge-taken', 'approval-request', 'approval-decision',
   'task-complete', 'task-fail', 'task-cancel',
 ] as const;
 export type TaskEventType = typeof TASK_EVENT_TYPES[number];
@@ -126,4 +128,43 @@ export interface WorkflowStep {
    *  status `awaiting_approval` until the creator calls hive-workflow-step-approve. */
   gate?: boolean;
   completed_by: string[];
+}
+
+export type GraphWorkflowOutcome = 'passed' | 'changes_requested' | 'failed';
+
+/** A reusable graph node. Assignees may be concrete agent ids, role:xxx, or
+ * `$assignee` in a template. Templates are resolved to concrete ids when a
+ * run starts, so execution remains deterministic even if the pool changes. */
+export interface GraphWorkflowNode {
+  node_id: string;
+  title: string;
+  assignees: string[];
+  action: string;
+  completion: 'all' | 'any';
+  gate?: boolean;
+}
+
+export interface GraphWorkflowEdge {
+  edge_id: string;
+  from: string;
+  to: string;
+  when: GraphWorkflowOutcome;
+}
+
+export interface GraphWorkflowDefinition {
+  kind: 'graph';
+  version: 1;
+  template_id: string;
+  template_name: string;
+  entry_node_id: string;
+  nodes: GraphWorkflowNode[];
+  edges: GraphWorkflowEdge[];
+}
+
+export interface GraphWorkflowTemplate {
+  template_id: string;
+  template_name: string;
+  description: string;
+  version: 1;
+  definition: GraphWorkflowDefinition;
 }

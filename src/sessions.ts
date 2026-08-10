@@ -232,9 +232,10 @@ export async function notifyTaskParticipants(taskId: string, excludeAgentId?: st
   if (task.assignee_agent_id) participants.add(task.assignee_agent_id);
   if (task.workflow_json) {
     try {
-      const steps = JSON.parse(task.workflow_json);
-      for (const step of steps) {
-        for (const a of step.assignees || []) {
+      const workflow = JSON.parse(task.workflow_json);
+      const nodes = Array.isArray(workflow) ? workflow : Array.isArray(workflow?.nodes) ? workflow.nodes : [];
+      for (const node of nodes) {
+        for (const a of node.assignees || []) {
           if (a.startsWith('role:')) {
             const agent = db.findAgentByRole(a.slice(5), { teamId: task.source_team_id ?? undefined });
             if (agent) participants.add(agent.id);

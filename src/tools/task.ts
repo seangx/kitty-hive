@@ -5,7 +5,25 @@ import {
   ensureRemoteAgentByRemoteId,
 } from '../db.js';
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
-import type { Task, TaskEvent, TaskStatus, WorkflowStep } from '../models.js';
+import {
+  BUILTIN_WORKFLOW_TEMPLATES,
+  getBuiltinWorkflowTemplate,
+  graphEdge,
+  graphNodeAt,
+  graphNodeIndex,
+  parseGraphWorkflow,
+  validateGraphWorkflow,
+} from '../graph-workflow.js';
+import type {
+  GraphWorkflowDefinition,
+  GraphWorkflowNode,
+  GraphWorkflowOutcome,
+  GraphWorkflowTemplate,
+  Task,
+  TaskEvent,
+  TaskStatus,
+  WorkflowStep,
+} from '../models.js';
 
 // --- hive_task ---
 
@@ -14,6 +32,8 @@ interface TaskInput {
   title: string;
   input?: object;
   source_team_id?: string;
+  workspace_dir?: string;
+  branch?: string;
 }
 
 interface TaskOutput {
@@ -39,19 +59,24 @@ export function handleTaskCreate(actorId: string, input: TaskInput): TaskOutput 
     }
   }
 
+  const taskInput = {
+    ...(input.input ?? {}),
+    ...(input.workspace_dir ? { workspace_dir: input.workspace_dir } : {}),
+    ...(input.branch ? { branch: input.branch } : {}),
+  };
   const task = createTask(input.title, actorId, {
     assigneeId: assignee?.id,
     sourceTeamId: input.source_team_id,
-    input: input.input,
+    input: taskInput,
   });
 
-  // task-start → proposing (assignee should propose workflow)
-  validateWorkflowTransition('created' as TaskStatus, 'task-start');
   appendTaskEvent(task.id, 'task-start', actorId, {
-    title: input.title, input: input.input, assignee_agent_id: assignee?.id ?? null,
+    title: input.title, input: taskInput, assignee_agent_id: assignee?.id ?? null,
   });
 
-  let status: TaskStatus = assignee ? 'proposing' : 'created';
+  // The lightweight lane is the default: assigned tasks can start immediately.
+  // A workflow is attached only through an explicit workflow tool call.
+  const status: TaskStatus = assignee ? 'in_progress' : 'created';
   updateTaskStatus(task.id, status, assignee ? { assignee_agent_id: assignee.id } : {});
 
   return { task_id: task.id, title: task.title, status, assignee };
@@ -247,8 +272,9 @@ export function handleTaskClaim(taskId: string, agentId: string): TaskOutput {
   const agent = getAgentById(agentId);
   if (!agent) throw new Error('Agent not found');
 
-  // Claim → proposing (agent should propose workflow next)
-  const status: TaskStatus = 'proposing';
+  // Claiming an ordinary task starts it immediately. Workflow construction is
+  // explicit and never a mandatory intermediate state.
+  const status: TaskStatus = validateTransition(task.status as TaskStatus, 'task-claim');
   appendTaskEvent(taskId, 'task-claim', agentId, {});
   updateTaskStatus(taskId, status, { assignee_agent_id: agentId });
 
@@ -266,7 +292,9 @@ interface CheckOutput {
   status: TaskStatus;
   assignee?: { id: string; display_name: string };
   recent_events: TaskEvent[];
-  workflow?: { current_step: number; steps: WorkflowStep[] };
+  workflow?:
+    | { kind: 'linear'; current_step: number; steps: WorkflowStep[] }
+    | { kind: 'graph'; current_node_id: string; definition: GraphWorkflowDefinition };
 }
 
 export function handleCheck(input: { task_id: string }): CheckOutput {
@@ -280,9 +308,12 @@ export function handleCheck(input: { task_id: string }): CheckOutput {
     if (agent) assignee = { id: agent.id, display_name: agent.display_name };
   }
 
-  let workflow: { current_step: number; steps: WorkflowStep[] } | undefined;
+  let workflow: CheckOutput['workflow'];
   if (task.workflow_json) {
-    workflow = { current_step: task.current_step, steps: JSON.parse(task.workflow_json) };
+    const graph = parseGraphWorkflow(task.workflow_json);
+    workflow = graph
+      ? { kind: 'graph', current_node_id: graphNodeAt(graph, task.current_step).node_id, definition: graph }
+      : { kind: 'linear', current_step: task.current_step, steps: JSON.parse(task.workflow_json) };
   }
 
   return {
@@ -297,6 +328,7 @@ export function handleWorkflowPropose(taskId: string, agentId: string, workflow:
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (task.creator_agent_id !== agentId && task.assignee_agent_id !== agentId) throw new Error('Only the task creator or assignee can propose a workflow');
+  if (parseGraphWorkflow(task.workflow_json)) throw new Error('Graph workflows cannot be replaced by a legacy proposal');
 
   validateWorkflowTransition(task.status as TaskStatus, 'task-propose');
   const steps = workflow.map(s => ({ ...s, completed_by: [] }));
@@ -319,6 +351,7 @@ export function handleWorkflowApprove(taskId: string, agentId: string): Workflow
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (task.creator_agent_id !== agentId) throw new Error('Only the task creator can approve the workflow');
   if (!task.workflow_json) throw new Error('No workflow defined');
+  if (parseGraphWorkflow(task.workflow_json)) throw new Error('Graph workflows start explicitly and do not use legacy workflow approval');
 
   const steps: WorkflowStep[] = JSON.parse(task.workflow_json);
   if (steps.length === 0) throw new Error('Workflow has no steps');
@@ -342,6 +375,7 @@ export function handleStepComplete(taskId: string, agentId: string, stepNum: num
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
+  if (parseGraphWorkflow(task.workflow_json)) throw new Error('Graph workflow — use hive_workflow_node_complete');
   if (task.current_step !== stepNum) throw new Error(`Step ${stepNum} is not current (current: ${task.current_step})`);
 
   validateWorkflowTransition(task.status as TaskStatus, 'step-complete');
@@ -391,6 +425,7 @@ export function handleStepApprove(taskId: string, agentId: string): WorkflowActi
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
+  if (parseGraphWorkflow(task.workflow_json)) throw new Error('Graph workflow — use hive_workflow_gate_decide');
   if (task.creator_agent_id !== agentId) throw new Error('Only the task creator can approve a gated step');
   if (task.status !== 'awaiting_approval') throw new Error(`Task is not awaiting approval (status: ${task.status})`);
 
@@ -424,6 +459,7 @@ export function handleWorkflowReject(taskId: string, agentId: string, stepNum: n
   const task = getTaskById(taskId);
   if (!task) throw new Error(`Task not found: ${taskId}`);
   if (!task.workflow_json) throw new Error('No workflow defined');
+  if (parseGraphWorkflow(task.workflow_json)) throw new Error('Graph workflow — report changes_requested with hive_workflow_node_complete');
 
   validateWorkflowTransition(task.status as TaskStatus, 'task-reject');
 
@@ -444,6 +480,299 @@ export function handleWorkflowReject(taskId: string, agentId: string, stepNum: n
   appendTaskEvent(taskId, 'step-start', null, { step: targetStep, assignees: target?.assignees || [] });
 
   return { type: 'step-start', step: targetStep, assignees: target?.assignees || [] };
+}
+
+// --- Graph workflow kernel ---
+
+export function listWorkflowTemplates(): readonly GraphWorkflowTemplate[] {
+  return BUILTIN_WORKFLOW_TEMPLATES;
+}
+
+export interface GraphWorkflowStartInput {
+  template_id: string;
+  to: string;
+  title: string;
+  input?: object;
+  source_team_id?: string;
+  workspace_dir?: string;
+  branch?: string;
+}
+
+export interface GraphWorkflowAction {
+  type: 'node-start' | 'awaiting_approval' | 'task-complete' | 'task-fail' | 'waiting';
+  node_id?: string;
+  activation?: number;
+  assignees?: string[];
+  edge_id?: string;
+  outcome?: GraphWorkflowOutcome;
+  approver?: string;
+}
+
+function resolveWorkflowAssignee(
+  actorId: string,
+  reference: string,
+  primaryAssigneeId: string,
+  sourceTeamId?: string,
+): string {
+  if (reference === '$assignee') return primaryAssigneeId;
+  if (reference.startsWith('role:')) {
+    const agent = findAgentByRole(reference.slice(5), { teamId: sourceTeamId });
+    if (!agent) throw new Error(`No active agent found for ${reference}`);
+    return agent.id;
+  }
+  const resolved = resolveAddressee(actorId, reference);
+  if ('error' in resolved) throw new Error(resolved.error);
+  return resolved.agent!.id;
+}
+
+function instantiateGraphTemplate(
+  actorId: string,
+  template: GraphWorkflowTemplate,
+  primaryAssigneeId: string,
+  sourceTeamId?: string,
+): GraphWorkflowDefinition {
+  const definition = structuredClone(template.definition);
+  definition.nodes = definition.nodes.map(node => ({
+    ...node,
+    assignees: [...new Set(node.assignees.map(reference =>
+      resolveWorkflowAssignee(actorId, reference, primaryAssigneeId, sourceTeamId)))],
+  }));
+  validateGraphWorkflow(definition);
+  return definition;
+}
+
+function resolvePrimaryAssignee(actorId: string, to: string, sourceTeamId?: string): string {
+  if (to.startsWith('role:')) {
+    const agent = findAgentByRole(to.slice(5), { teamId: sourceTeamId });
+    if (!agent) throw new Error(`No active agent found for ${to}`);
+    return agent.id;
+  }
+  const resolved = resolveAddressee(actorId, to);
+  if ('error' in resolved) throw new Error(resolved.error);
+  return resolved.agent!.id;
+}
+
+export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowStartInput): TaskOutput & { action: GraphWorkflowAction } {
+  const actor = getAgentById(actorId);
+  if (!actor) throw new Error('Actor not found');
+  const template = getBuiltinWorkflowTemplate(input.template_id);
+  if (!template) throw new Error(`Workflow template not found: ${input.template_id}`);
+
+  const primaryAssigneeId = resolvePrimaryAssignee(actorId, input.to, input.source_team_id);
+  const definition = instantiateGraphTemplate(actorId, template, primaryAssigneeId, input.source_team_id);
+  const entryIndex = graphNodeIndex(definition, definition.entry_node_id);
+  const entry = graphNodeAt(definition, entryIndex);
+  const taskInput = {
+    ...(input.input ?? {}),
+    workflow_template_id: template.template_id,
+    ...(input.workspace_dir ? { workspace_dir: input.workspace_dir } : {}),
+    ...(input.branch ? { branch: input.branch } : {}),
+  };
+  const task = createTask(input.title, actorId, {
+    assigneeId: entry.assignees[0],
+    sourceTeamId: input.source_team_id,
+    input: taskInput,
+  });
+  updateTaskStatus(task.id, 'in_progress', {
+    workflow_json: JSON.stringify(definition),
+    current_step: entryIndex,
+    assignee_agent_id: entry.assignees[0],
+  });
+  appendTaskEvent(task.id, 'task-start', actorId, {
+    title: input.title,
+    input: taskInput,
+    assignee_agent_id: entry.assignees[0],
+  });
+  appendTaskEvent(task.id, 'workflow-start', actorId, {
+    template_id: template.template_id,
+    template_name: template.template_name,
+    version: template.version,
+  });
+  appendTaskEvent(task.id, 'node-start', null, {
+    node_id: entry.node_id,
+    activation: 1,
+    assignees: entry.assignees,
+  });
+
+  const assignee = getAgentById(entry.assignees[0]);
+  return {
+    task_id: task.id,
+    title: task.title,
+    status: 'in_progress',
+    assignee: assignee ? { id: assignee.id, display_name: assignee.display_name } : undefined,
+    action: {
+      type: 'node-start',
+      node_id: entry.node_id,
+      activation: 1,
+      assignees: entry.assignees,
+    },
+  };
+}
+
+function eventPayload(event: TaskEvent): Record<string, any> {
+  try {
+    const parsed = JSON.parse(event.payload_json);
+    return parsed && typeof parsed === 'object' ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function graphActivation(events: TaskEvent[], nodeId: string): number {
+  let activation = 0;
+  for (const event of events) {
+    if (event.type !== 'node-start') continue;
+    const payload = eventPayload(event);
+    if (payload.node_id === nodeId) activation = Math.max(activation, Number(payload.activation) || activation + 1);
+  }
+  return activation;
+}
+
+function completedAgentsForActivation(events: TaskEvent[], nodeId: string, activation: number): Set<string> {
+  const completed = new Set<string>();
+  for (const event of events) {
+    if (event.type !== 'node-complete' || !event.actor_agent_id) continue;
+    const payload = eventPayload(event);
+    if (payload.node_id === nodeId && Number(payload.activation) === activation) completed.add(event.actor_agent_id);
+  }
+  return completed;
+}
+
+function startGraphNode(
+  task: Task,
+  definition: GraphWorkflowDefinition,
+  nodeId: string,
+  edgeId: string,
+  outcome: GraphWorkflowOutcome,
+): GraphWorkflowAction {
+  const targetIndex = graphNodeIndex(definition, nodeId);
+  const target = graphNodeAt(definition, targetIndex);
+  const priorEvents = getTaskEvents(task.id, 0, 10_000);
+  const activation = graphActivation(priorEvents, nodeId) + 1;
+  appendTaskEvent(task.id, 'edge-taken', null, {
+    edge_id: edgeId,
+    from: graphNodeAt(definition, task.current_step).node_id,
+    to: nodeId,
+    outcome,
+  });
+  updateTaskStatus(task.id, 'in_progress', {
+    current_step: targetIndex,
+    assignee_agent_id: target.assignees[0],
+  });
+  appendTaskEvent(task.id, 'node-start', null, {
+    node_id: target.node_id,
+    activation,
+    assignees: target.assignees,
+  });
+  return {
+    type: 'node-start',
+    node_id: target.node_id,
+    activation,
+    assignees: target.assignees,
+    edge_id: edgeId,
+    outcome,
+  };
+}
+
+function finishOrAdvanceGraph(
+  task: Task,
+  definition: GraphWorkflowDefinition,
+  outcome: GraphWorkflowOutcome,
+  result?: string,
+): GraphWorkflowAction {
+  const current = graphNodeAt(definition, task.current_step);
+  const edge = graphEdge(definition, current.node_id, outcome);
+  if (edge) return startGraphNode(task, definition, edge.to, edge.edge_id, outcome);
+
+  const completedAt = new Date().toISOString();
+  if (outcome === 'passed') {
+    updateTaskStatus(task.id, 'completed', { completed_at: completedAt });
+    appendTaskEvent(task.id, 'task-complete', null, { result, final_node_id: current.node_id });
+    return { type: 'task-complete', node_id: current.node_id, outcome };
+  }
+  updateTaskStatus(task.id, 'failed', { completed_at: completedAt });
+  appendTaskEvent(task.id, 'task-fail', null, {
+    reason: result || `No ${outcome} edge from ${current.node_id}`,
+    final_node_id: current.node_id,
+    outcome,
+  });
+  return { type: 'task-fail', node_id: current.node_id, outcome };
+}
+
+export function handleGraphNodeComplete(
+  taskId: string,
+  agentId: string,
+  outcome: GraphWorkflowOutcome,
+  result?: string,
+): GraphWorkflowAction {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  const definition = parseGraphWorkflow(task.workflow_json);
+  if (!definition) throw new Error('Task does not use a graph workflow');
+  if (task.status !== 'in_progress') throw new Error(`Graph workflow is not running (status: ${task.status})`);
+
+  const node = graphNodeAt(definition, task.current_step);
+  if (!node.assignees.includes(agentId)) throw new Error(`Agent is not assigned to current node: ${node.node_id}`);
+  const events = getTaskEvents(taskId, 0, 10_000);
+  const activation = graphActivation(events, node.node_id);
+  if (activation < 1) throw new Error(`Current node has no activation: ${node.node_id}`);
+  const completed = completedAgentsForActivation(events, node.node_id, activation);
+  if (completed.has(agentId)) throw new Error(`Agent already completed ${node.node_id} activation ${activation}`);
+
+  appendTaskEvent(taskId, 'node-complete', agentId, {
+    node_id: node.node_id,
+    activation,
+    outcome,
+    result,
+  });
+  completed.add(agentId);
+
+  // A negative review/test result takes its conditional edge immediately.
+  // Positive completion still honors all/any fan-in semantics.
+  if (outcome === 'passed') {
+    const ready = node.completion === 'any' || completed.size >= node.assignees.length;
+    if (!ready) return { type: 'waiting', node_id: node.node_id, activation, assignees: node.assignees, outcome };
+    if (node.gate) {
+      updateTaskStatus(taskId, 'awaiting_approval');
+      appendTaskEvent(taskId, 'approval-request', null, {
+        node_id: node.node_id,
+        activation,
+        approver: task.creator_agent_id,
+      });
+      return {
+        type: 'awaiting_approval',
+        node_id: node.node_id,
+        activation,
+        outcome,
+        approver: task.creator_agent_id,
+      };
+    }
+  }
+  return finishOrAdvanceGraph(task, definition, outcome, result);
+}
+
+export function handleGraphGateDecision(
+  taskId: string,
+  agentId: string,
+  decision: 'approved' | 'changes_requested' | 'failed',
+  reason?: string,
+): GraphWorkflowAction {
+  const task = getTaskById(taskId);
+  if (!task) throw new Error(`Task not found: ${taskId}`);
+  const definition = parseGraphWorkflow(task.workflow_json);
+  if (!definition) throw new Error('Task does not use a graph workflow');
+  if (task.creator_agent_id !== agentId) throw new Error('Only the task creator can decide a graph gate');
+  if (task.status !== 'awaiting_approval') throw new Error(`Task is not awaiting approval (status: ${task.status})`);
+  const node = graphNodeAt(definition, task.current_step);
+  if (!node.gate) throw new Error(`Current node is not gated: ${node.node_id}`);
+
+  appendTaskEvent(taskId, 'approval-decision', agentId, {
+    node_id: node.node_id,
+    decision,
+    reason,
+  });
+  const outcome: GraphWorkflowOutcome = decision === 'approved' ? 'passed' : decision;
+  return finishOrAdvanceGraph(task, definition, outcome, reason);
 }
 
 // --- Task: cancel ---
@@ -474,9 +803,8 @@ export function handleTaskCancel(taskId: string, agentId: string, reason?: strin
 // --- Task: complete (simple, no-workflow path) ---
 
 /** Complete a task that has NO workflow. This is the lightweight lane: an
- *  assigned/claimed task sits in 'proposing' ("workflow proposal expected"),
- *  but most tasks are single-step and never need one — the assignee just
- *  does the work and calls this. Tasks WITH a workflow must go through
+ *  assigned/claimed task enters in_progress and the assignee just does the
+ *  work and calls this. Tasks WITH a workflow must go through
  *  hive_workflow_step_complete so gates/steps stay authoritative. */
 export function handleTaskComplete(taskId: string, agentId: string, result?: string): void {
   const task = getTaskById(taskId);

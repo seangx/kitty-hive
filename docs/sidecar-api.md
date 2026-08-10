@@ -2,18 +2,19 @@
 
 The Sidecar API is a loopback-only operator view over Hive's authoritative
 `tasks` and `task_events` tables. It does not create a second workflow state
-machine. The current linear workflow is projected into a graph-shaped read
-model so Kitty can keep the same UI contract when Hive's execution kernel is
-replaced later.
+machine. Native graph workflows are returned directly; legacy linear workflows
+are still projected into the same graph-shaped read model.
 
 Base URL: `http://127.0.0.1:4123/admin/sidecar`
 
 ## Reads
 
 - `GET /snapshot?limit=200`
-  - `{ version, generatedAt, runs, tasks, agentBadges }`
+  - `{ version, generatedAt, runs, tasks, agentBadges, agentPool }`
   - `runs` contains tasks with `workflow_json`; `tasks` contains standalone
     tasks; `agentBadges` contains only non-terminal work.
+  - `agentPool` contains authoritative local registered agents. Current entries
+    are resident agents; no on-demand launcher is implied.
 - `GET /runs/:taskId`
   - graph, activation-preserving node runs, approvals, and taken edge ids.
 - `GET /runs/:taskId/events?since=<cursor>`
@@ -24,6 +25,7 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
 All public fields are camelCase. Agent-facing fields include stable ids
 (`assigneeAgentId`, `assigneeAgentIds`, `agentId`) in addition to display names
 so Kitty can focus the matching SessionDeck terminal without guessing by name.
+Run/task summaries also expose optional `workspaceDir` and `branch` metadata.
 
 ## Wake subscription
 
@@ -44,7 +46,8 @@ visible while disconnected.
 
 ## Projection boundaries
 
-- Existing Hive steps become graph nodes.
+- Native graph definitions retain their node and edge ids exactly.
+- Existing linear Hive steps become projected graph nodes.
 - Normal advancement becomes a `passed` edge.
 - `on_reject: revise` becomes a self-edge; `back:N` becomes a back-edge.
 - Every `step-start` creates a new node activation; rejected history is never

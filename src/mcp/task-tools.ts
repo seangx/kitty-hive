@@ -5,6 +5,9 @@ import {
   handleTaskClaimAsync, handleTaskCancelAsync, handleTaskCompleteAsync,
   handleWorkflowProposeAsync, handleWorkflowApproveAsync,
   handleStepCompleteAsync, handleStepApproveAsync, handleWorkflowRejectAsync,
+  handleGraphWorkflowStart, handleGraphNodeComplete, handleGraphGateDecision,
+  listWorkflowTemplates,
+  type GraphWorkflowAction,
 } from '../tools/task.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { notifyAgents, notifyTaskParticipants } from '../sessions.js';
@@ -28,6 +31,13 @@ function eventId(taskId: string, type: string, seq: number): string {
   return `task:${taskId}:${type}:${seq}`;
 }
 
+function graphActionRecipients(taskId: string, action: GraphWorkflowAction): string[] {
+  if (action.type === 'node-start' || action.type === 'waiting') return action.assignees ?? [];
+  if (action.type === 'awaiting_approval') return action.approver ? [action.approver] : [];
+  const task = db.getTaskById(taskId);
+  return task ? [task.creator_agent_id] : [];
+}
+
 // --- Task list output projection ---
 // Whitelist of fields that may appear in `hive_tasks` list responses. Adding a
 // field here is a deliberate decision; this guards against accidental leaks of
@@ -40,7 +50,12 @@ type TaskListRow = { [K in typeof TASK_LIST_FIELDS[number]]: string };
 function projectTaskListRow(t: Task): TaskListRow {
   // Compute step "N/M" once; M=0 when no workflow.
   const stepCount = t.workflow_json
-    ? (() => { try { return (JSON.parse(t.workflow_json) as any[]).length; } catch { return 0; } })()
+    ? (() => {
+      try {
+        const workflow = JSON.parse(t.workflow_json);
+        return Array.isArray(workflow) ? workflow.length : Array.isArray(workflow?.nodes) ? workflow.nodes.length : 0;
+      } catch { return 0; }
+    })()
     : 0;
   return {
     id: t.id,
@@ -65,6 +80,8 @@ export function registerTaskTools(mcp: McpServer) {
       title: z.string().describe('Task title'),
       input: z.record(z.string(), z.unknown()).optional().describe('Structured task input'),
       source_team_id: z.string().optional().describe('Team id this task belongs to. Once set, immutable — to change team, create a new task. Enables team-scoped visibility (hive_tasks(team=X)) and team-scoped role:xxx routing.'),
+      workspace_dir: z.string().optional().describe('Optional task worktree/workspace directory. Stored as task metadata for Kitty and agents; it does not change the current process cwd.'),
+      branch: z.string().optional().describe('Optional git branch associated with this task.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
@@ -74,6 +91,8 @@ export function registerTaskTools(mcp: McpServer) {
         title: params.title,
         input: params.input as object,
         source_team_id: params.source_team_id,
+        workspace_dir: params.workspace_dir,
+        branch: params.branch,
       });
       if (result.assignee) {
         const seq = db.getLatestTaskEventSeq(result.task_id);
@@ -205,9 +224,123 @@ export function registerTaskTools(mcp: McpServer) {
   );
 
   mcp.tool(
+    'hive_workflow_templates',
+    'List the predefined graph workflows available for explicit workflow runs. Reading this list does not create a task or workflow.',
+    { as: asParam },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const templates = listWorkflowTemplates().map(template => ({
+        template_id: template.template_id,
+        template_name: template.template_name,
+        description: template.description,
+        version: template.version,
+        nodes: template.definition.nodes.map(node => ({
+          node_id: node.node_id,
+          title: node.title,
+          assignees: node.assignees,
+          gate: Boolean(node.gate),
+        })),
+        edges: template.definition.edges,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(templates, null, 2) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_workflow_start',
+    'Explicitly start a predefined graph workflow. Use only when the user/creator asks for a workflow (for example `/workflow`) — ordinary delegated tasks must use hive_task and start immediately. ' +
+    'Template role placeholders are resolved to concrete active agents at start, making the run deterministic. No proposal/approval round-trip is inserted.',
+    {
+      as: asParam,
+      template_id: z.string().describe('Template id from hive_workflow_templates.'),
+      to: z.string().describe('Primary implementation agent id/name/role. Replaces `$assignee` in the template.'),
+      title: z.string().describe('Workflow run title.'),
+      input: z.record(z.string(), z.unknown()).optional().describe('Structured task input.'),
+      source_team_id: z.string().optional().describe('Optional team binding used for deterministic role resolution.'),
+      workspace_dir: z.string().optional().describe('Optional task worktree/workspace directory.'),
+      branch: z.string().optional().describe('Optional git branch associated with this workflow run.'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const result = handleGraphWorkflowStart(agent.id, {
+        template_id: params.template_id,
+        to: params.to,
+        title: params.title,
+        input: params.input as object,
+        source_team_id: params.source_team_id,
+        workspace_dir: params.workspace_dir,
+        branch: params.branch,
+      });
+      const seq = db.getLatestTaskEventSeq(result.task_id);
+      await notifyAgents(result.action.assignees ?? [], agent.id, buildPushMessage({
+        type: 'node-start',
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(result.task_id, 'node-start', seq),
+        task_id: result.task_id,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify(result) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_workflow_node_complete',
+    'Complete your part of the current graph node with an explicit outcome. `passed` advances when the node completion policy is satisfied; `changes_requested` and `failed` take their conditional edge immediately (or fail the run when no edge exists).',
+    {
+      as: asParam,
+      task_id: z.string().describe('Graph workflow task id.'),
+      outcome: z.enum(['passed', 'changes_requested', 'failed']).describe('Node outcome used to select the next edge.'),
+      result: z.string().optional().describe('Short result, evidence pointer, or rejection reason.'),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const action = handleGraphNodeComplete(params.task_id, agent.id, params.outcome, params.result);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
+      await notifyAgents(graphActionRecipients(params.task_id, action), agent.id, buildPushMessage({
+        type: action.type,
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, action.type, seq),
+        task_id: params.task_id,
+        reason: params.outcome === 'passed' ? undefined : params.result,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
+    },
+  );
+
+  mcp.tool(
+    'hive_workflow_gate_decide',
+    'Creator-only decision for a gated graph node. Approve to follow the passed edge; request changes/fail to follow that conditional edge or fail the run.',
+    {
+      as: asParam,
+      task_id: z.string().describe('Graph workflow task id.'),
+      decision: z.enum(['approved', 'changes_requested', 'failed']),
+      reason: z.string().optional(),
+    },
+    async (params, extra) => {
+      const agent = resolveAgent(extra, params.as);
+      if (!agent) return authError();
+      const action = handleGraphGateDecision(params.task_id, agent.id, params.decision, params.reason);
+      const seq = db.getLatestTaskEventSeq(params.task_id);
+      await notifyAgents(graphActionRecipients(params.task_id, action), agent.id, buildPushMessage({
+        type: action.type,
+        from: agent.display_name,
+        from_agent_id: agent.id,
+        event_id: eventId(params.task_id, action.type, seq),
+        task_id: params.task_id,
+        reason: params.reason,
+      }));
+      return { content: [{ type: 'text', text: JSON.stringify({ task_id: params.task_id, action }) }] };
+    },
+  );
+
+  mcp.tool(
     'hive_workflow_propose',
-    'Propose a workflow for a task. ONLY for genuinely complex work: multiple steps, multiple agents, or review gates between phases. ' +
-    'Most tasks do NOT need a workflow — just do the work and call hive_task_complete; proposing a workflow forces a creator-approval round-trip before you can even start. ' +
+    'Legacy compatibility: propose an ad-hoc linear workflow for a task. Use only when the user explicitly asks for a custom workflow that no predefined graph template covers. ' +
+    'Most tasks do NOT need a workflow — just do the work and call hive_task_complete; this legacy path forces a creator-approval round-trip before work can start. ' +
     'Creator must approve before steps start. ' +
     'For multi-phase workflows where the user (creator) will want to review the output between phases, ' +
     'set `gate: true` on each phase — the task then pauses in status `awaiting_approval` after each gated step ' +

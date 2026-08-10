@@ -159,7 +159,11 @@ npx kitty-hive init cursor
 | `hive-task-cancel` | `hive_task_cancel` | 取消任务（仅创建者；任何非终态都可用） |
 | `hive-tasks` | `hive_tasks` | 任务看板 |
 | `hive-check` | `hive_check` | 查看任务状态 |
-| `hive-workflow-propose` | `hive_workflow_propose` | 提出工作流方案；每步可设 `gate: true` → 完成后停在 `awaiting_approval` 等创建者放行 |
+| `hive-workflow-templates` | `hive_workflow_templates` | 列出预定义图工作流 |
+| `hive-workflow-start` | `hive_workflow_start` | 显式启动预定义图工作流 |
+| `hive-workflow-node-complete` | `hive_workflow_node_complete` | 按条件结果完成当前图节点 |
+| `hive-workflow-gate-decide` | `hive_workflow_gate_decide` | 决定 gated 图节点（仅创建者） |
+| `hive-workflow-propose` | `hive_workflow_propose` | 兼容旧版：提出临时线性工作流 |
 | `hive-workflow-approve` | `hive_workflow_approve` | 批准提案（仅创建者） |
 | `hive-workflow-step-complete` | `hive_workflow_step_complete` | 完成步骤（gated 步骤会进入 `awaiting_approval`） |
 | `hive-workflow-step-approve` | `hive_workflow_step_approve` | 放行 gated 步骤的暂停（仅创建者） |
@@ -213,18 +217,15 @@ hive-task({ title: "Review PR #42" })                   # 未分配，任何人�
 **生命周期：**
 
 ```
-created ──→ proposing ──→ approved ──→ in_progress ──→ completed
-  │            ↑    │                    │    ↑
-  │            └────┘                    │    │
-  │          (重新提案)              step 流转 (reject → 回退)
-  │
-  └──→ canceled (任何非终态均可取消)
+普通任务：created ──领取/指派──→ in_progress ──→ completed
+
+显式图工作流：node ──条件边──→ node ──→ ... ──→ completed
+                    └──changes_requested──→ 之前的 node
 ```
 
-1. Creator 创建任务 → assignee 提出工作流方案
-2. Creator 审核批准（人在回路）
-3. 步骤按序执行，每步可多 assignee
-4. Reject 把任务回退到之前某一步
+普通任务创建/领取后直接进入 `in_progress`，完成后调用 `hive_task_complete`。
+仅当用户显式要求 Workflow 时，才用 `hive_workflow_start` 启动预定义图；
+旧的提案/编号步骤流程只为已有线性工作流保留兼容。
 
 ## 联邦
 

@@ -10,12 +10,9 @@ const TRANSITIONS: Record<string, TaskStatus> = {
   'in_progress:task-fail': 'failed',
   'created:task-cancel': 'canceled',
   'in_progress:task-cancel': 'canceled',
-  // 'proposing' is NOT workflow-only: handleTaskCreate/handleTaskClaim put
-  // every assigned/claimed task into 'proposing' ("workflow proposal
-  // expected"), but for simple tasks that proposal never comes. Without
-  // these entries a plain assigned task could neither complete nor cancel —
-  // real incident 2026-07-15: an agent's task stuck in 'proposing' returning
-  // "Invalid task transition" on every cancel attempt.
+  // Compatibility for assigned tasks created by Hive versions before 0.8.
+  // New simple tasks enter in_progress directly; old rows may still be in
+  // proposing and must remain completable/cancelable.
   'proposing:task-complete': 'completed',
   'proposing:task-fail': 'failed',
   'proposing:task-cancel': 'canceled',
@@ -37,6 +34,10 @@ export function isTerminal(status: TaskStatus): boolean {
 
 const WORKFLOW_TRANSITIONS: Record<string, TaskStatus> = {
   'created:task-start': 'proposing',
+  // Explicit legacy workflow proposals may be attached to an ordinary task.
+  // Ordinary tasks no longer enter proposing by default.
+  'created:task-propose': 'proposing',
+  'in_progress:task-propose': 'proposing',
   'proposing:task-propose': 'proposing',
   'proposing:task-approve': 'approved',
   'proposing:task-reject': 'proposing',

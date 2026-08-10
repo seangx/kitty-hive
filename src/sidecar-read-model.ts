@@ -1,5 +1,14 @@
 import * as db from './db.js';
-import type { Agent, Task, TaskEvent, TaskStatus as HiveTaskStatus, WorkflowStep } from './models.js';
+import { graphNodeAt, parseGraphWorkflow } from './graph-workflow.js';
+import type {
+  Agent,
+  GraphWorkflowDefinition,
+  GraphWorkflowNode,
+  Task,
+  TaskEvent,
+  TaskStatus as HiveTaskStatus,
+  WorkflowStep,
+} from './models.js';
 
 export type RunStatus = 'running' | 'waiting_approval' | 'succeeded' | 'failed' | 'canceled';
 export type NodeRunStatus = 'blocked' | 'ready' | 'running' | 'waiting_approval' | 'succeeded' | 'failed' | 'canceled';
@@ -63,6 +72,8 @@ export interface RunSummary {
   assigneeAgentIds: string[];
   awaitingCreator: boolean;
   updatedAt: string;
+  workspaceDir?: string;
+  branch?: string;
 }
 
 export interface RunDetail {
@@ -92,6 +103,8 @@ export interface TaskSummary {
   runId?: string;
   nodeRunId?: string;
   updatedAt: string;
+  workspaceDir?: string;
+  branch?: string;
 }
 
 export interface TaskDetail extends TaskSummary {
@@ -131,12 +144,24 @@ export interface AgentTaskBadge {
   updatedAt: string;
 }
 
+export interface AgentPoolEntry {
+  agentId: string;
+  displayName: string;
+  tool: string;
+  roles: string[];
+  expertise?: string;
+  status: Agent['status'];
+  projectDir?: string;
+  launchMode: 'resident';
+}
+
 export interface SidecarSnapshot {
   version: 1;
   generatedAt: string;
   runs: RunSummary[];
   tasks: TaskSummary[];
   agentBadges: AgentTaskBadge[];
+  agentPool: AgentPoolEntry[];
 }
 
 type AgentResolver = (id: string) => Agent | undefined;
@@ -162,6 +187,14 @@ function parseSteps(task: Task): WorkflowStep[] {
 
 function taskUpdatedAt(task: Task, events: TaskEvent[]): string {
   return events.at(-1)?.ts ?? task.completed_at ?? task.created_at;
+}
+
+function taskWorkspace(task: Task): { workspaceDir?: string; branch?: string } {
+  const input = parseObject(task.input_json);
+  return {
+    workspaceDir: typeof input.workspace_dir === 'string' && input.workspace_dir ? input.workspace_dir : undefined,
+    branch: typeof input.branch === 'string' && input.branch ? input.branch : undefined,
+  };
 }
 
 function mapTaskStatus(status: HiveTaskStatus): SidecarTaskStatus {
@@ -258,6 +291,178 @@ function latestRunForStep(runs: InternalNodeRun[], step: number): InternalNodeRu
   return [...runs].reverse().find(run => run.nodeId === stepNodeId(step));
 }
 
+function graphNodeRunId(taskId: string, nodeId: string, activation: number): string {
+  return `${taskId}:${nodeId}:${activation}`;
+}
+
+function resolveGraphAssignees(node: GraphWorkflowNode | undefined, resolveAgent: AgentResolver): { ids: string[]; names: string[] } {
+  if (!node) return { ids: [], names: [] };
+  return {
+    ids: node.assignees,
+    names: node.assignees.map(id => resolveAgent(id)?.display_name ?? id),
+  };
+}
+
+function projectGraphRunSummary(
+  task: Task,
+  definition: GraphWorkflowDefinition,
+  updatedAt: string,
+  resolveAgent: AgentResolver,
+): RunSummary {
+  const current = graphNodeAt(definition, task.current_step);
+  const assignees = resolveGraphAssignees(current, resolveAgent);
+  return {
+    runId: task.id,
+    template: {
+      templateId: definition.template_id,
+      templateName: definition.template_name,
+      version: definition.version,
+    },
+    status: mapRunStatus(task.status),
+    currentNodeLabels: [current.title],
+    assigneeNames: assignees.names,
+    assigneeAgentIds: assignees.ids,
+    awaitingCreator: task.status === 'awaiting_approval',
+    updatedAt,
+    ...taskWorkspace(task),
+  };
+}
+
+function projectGraphWorkflowRun(
+  task: Task,
+  definition: GraphWorkflowDefinition,
+  events: TaskEvent[],
+  resolveAgent: AgentResolver,
+): RunDetail {
+  const nodeRuns: InternalNodeRun[] = [];
+  const activations = new Map<string, number>();
+  const takenEdgeIds: string[] = [];
+  const approvals: Approval[] = [];
+
+  const latestRun = (nodeId: string) => [...nodeRuns].reverse().find(run => run.nodeId === nodeId);
+
+  for (const event of events) {
+    const payload = parseObject(event.payload_json);
+    if (event.type === 'node-start') {
+      const nodeId = String(payload.node_id || '');
+      const node = definition.nodes.find(candidate => candidate.node_id === nodeId);
+      if (!node) continue;
+      const activation = Number(payload.activation) || (activations.get(nodeId) ?? 0) + 1;
+      activations.set(nodeId, Math.max(activation, activations.get(nodeId) ?? 0));
+      const assignees = resolveGraphAssignees(node, resolveAgent);
+      nodeRuns.push({
+        nodeRunId: graphNodeRunId(task.id, nodeId, activation),
+        nodeId,
+        activation,
+        status: 'running',
+        taskId: task.id,
+        assigneeName: assignees.names.join(', ') || undefined,
+        assigneeAgentId: assignees.ids.length === 1 ? assignees.ids[0] : undefined,
+        startedAt: event.ts,
+        completedBy: new Set(),
+      });
+      continue;
+    }
+
+    if (event.type === 'node-complete') {
+      const nodeId = String(payload.node_id || '');
+      const run = latestRun(nodeId);
+      const node = definition.nodes.find(candidate => candidate.node_id === nodeId);
+      if (!run || !node) continue;
+      if (event.actor_agent_id) run.completedBy.add(event.actor_agent_id);
+      const outcome = String(payload.outcome || 'passed');
+      if (outcome !== 'passed') {
+        run.status = 'failed';
+        run.finishedAt = event.ts;
+      } else {
+        const complete = node.completion === 'any' || run.completedBy.size >= node.assignees.length;
+        if (complete) {
+          run.status = node.gate ? 'waiting_approval' : 'succeeded';
+          run.finishedAt = event.ts;
+        }
+      }
+      continue;
+    }
+
+    if (event.type === 'edge-taken') {
+      if (typeof payload.edge_id === 'string') takenEdgeIds.push(payload.edge_id);
+      continue;
+    }
+
+    if (event.type === 'approval-request') {
+      const nodeId = String(payload.node_id || '');
+      const run = latestRun(nodeId);
+      approvals.push({
+        approvalId: `${task.id}:approval:${event.seq}`,
+        nodeRunId: run?.nodeRunId ?? `${task.id}:${nodeId}:unknown`,
+        status: 'pending',
+        creatorName: resolveAgent(task.creator_agent_id)?.display_name ?? task.creator_agent_id,
+        reason: `${definition.nodes.find(node => node.node_id === nodeId)?.title ?? nodeId}等待 Creator 批准`,
+      });
+      continue;
+    }
+
+    if (event.type === 'approval-decision') {
+      const nodeId = String(payload.node_id || '');
+      const run = latestRun(nodeId);
+      if (run) {
+        run.status = payload.decision === 'approved' ? 'succeeded' : 'failed';
+        run.finishedAt = event.ts;
+      }
+      const pending = [...approvals].reverse().find(approval => approval.nodeRunId === run?.nodeRunId && approval.status === 'pending');
+      if (pending) {
+        pending.status = payload.decision === 'approved' ? 'approved' : 'rejected';
+        pending.reason = typeof payload.reason === 'string' ? payload.reason : pending.reason;
+        pending.decidedAt = event.ts;
+      } else {
+        approvals.push({
+          approvalId: `${task.id}:decision:${event.seq}`,
+          nodeRunId: run?.nodeRunId ?? `${task.id}:${nodeId}:unknown`,
+          status: payload.decision === 'approved' ? 'approved' : 'rejected',
+          creatorName: event.actor_agent_id ? resolveAgent(event.actor_agent_id)?.display_name ?? event.actor_agent_id : 'creator',
+          reason: typeof payload.reason === 'string' ? payload.reason : undefined,
+          decidedAt: event.ts,
+        });
+      }
+    }
+  }
+
+  const current = graphNodeAt(definition, task.current_step);
+  const currentRun = latestRun(current.node_id);
+  if (currentRun) {
+    if (task.status === 'awaiting_approval') currentRun.status = 'waiting_approval';
+    else if (task.status === 'failed') currentRun.status = 'failed';
+    else if (task.status === 'canceled') currentRun.status = 'canceled';
+    else if (task.status === 'in_progress') currentRun.status = 'running';
+  }
+
+  return {
+    summary: projectGraphRunSummary(task, definition, taskUpdatedAt(task, events), resolveAgent),
+    graph: {
+      nodes: definition.nodes.map((node, index) => {
+        const assignees = resolveGraphAssignees(node, resolveAgent);
+        return {
+          nodeId: node.node_id,
+          label: node.title,
+          assigneeHint: assignees.names.join(', ') || undefined,
+          assigneeAgentIds: assignees.ids,
+          layout: { x: 28 + index * 122, y: 28 + (index % 2) * 76 },
+        };
+      }),
+      edges: definition.edges.map(edge => ({
+        edgeId: edge.edge_id,
+        from: edge.from,
+        to: edge.to,
+        outcome: edge.when,
+      })),
+      entryNodeId: definition.entry_node_id,
+    },
+    nodeRuns: nodeRuns.map(({ completedBy: _completedBy, ...run }) => run),
+    approvals,
+    takenEdgeIds,
+  };
+}
+
 function activationNodeRunId(taskId: string, step: number, activation: number): string {
   return `${taskId}:${step}:${activation}`;
 }
@@ -285,6 +490,7 @@ function projectRunSummary(
     assigneeAgentIds: assignees.ids,
     awaitingCreator: task.status === 'proposing' || task.status === 'awaiting_approval',
     updatedAt,
+    ...taskWorkspace(task),
   };
 }
 
@@ -293,6 +499,8 @@ export function projectWorkflowRun(
   events: TaskEvent[],
   resolveAgent: AgentResolver,
 ): RunDetail | null {
+  const graph = parseGraphWorkflow(task.workflow_json);
+  if (graph) return projectGraphWorkflowRun(task, graph, events, resolveAgent);
   const steps = parseSteps(task);
   if (!task.workflow_json || steps.length === 0) return null;
 
@@ -445,6 +653,7 @@ function projectTaskSummary(task: Task, updatedAt: string, resolveAgent: AgentRe
     assigneeName: assignee?.display_name,
     assigneeAgentId: assignee?.id,
     updatedAt,
+    ...taskWorkspace(task),
   };
 }
 
@@ -458,6 +667,16 @@ function eventNodeRunId(taskId: string, step: number, events: TaskEvent[], throu
   return activation ? activationNodeRunId(taskId, step, activation) : undefined;
 }
 
+function graphEventNodeRunId(taskId: string, nodeId: string, events: TaskEvent[], throughSeq: number): string | undefined {
+  let activation = 0;
+  for (const event of events) {
+    if (event.seq > throughSeq || event.type !== 'node-start') continue;
+    const payload = parseObject(event.payload_json);
+    if (payload.node_id === nodeId) activation = Number(payload.activation) || activation + 1;
+  }
+  return activation ? graphNodeRunId(taskId, nodeId, activation) : undefined;
+}
+
 function mapWorkflowEvent(task: Task, event: TaskEvent, allEvents: TaskEvent[]): WorkflowEvent | null {
   const payload = parseObject(event.payload_json);
   const step = Number(payload.step);
@@ -465,6 +684,45 @@ function mapWorkflowEvent(task: Task, event: TaskEvent, allEvents: TaskEvent[]):
   switch (event.type) {
     case 'task-start': return { ...base, type: 'task_created', summary: `创建任务：${task.title}` };
     case 'task-claim': return { ...base, type: 'task_claimed', summary: '任务已领取' };
+    case 'workflow-start': return { ...base, type: 'task_created', summary: `启动工作流模板：${payload.template_name ?? payload.template_id ?? ''}` };
+    case 'node-start': {
+      const nodeId = String(payload.node_id || '');
+      const activation = Number(payload.activation) || 1;
+      return { ...base, type: 'node_activated', nodeRunId: graphNodeRunId(task.id, nodeId, activation), summary: `开始节点 ${nodeId}` };
+    }
+    case 'node-complete': {
+      const nodeId = String(payload.node_id || '');
+      const activation = Number(payload.activation) || 1;
+      return {
+        ...base,
+        type: 'node_finished',
+        nodeRunId: graphNodeRunId(task.id, nodeId, activation),
+        summary: typeof payload.result === 'string' ? payload.result : `${nodeId}: ${payload.outcome ?? 'passed'}`,
+      };
+    }
+    case 'edge-taken': {
+      const from = String(payload.from || '');
+      return {
+        ...base,
+        type: 'edge_taken',
+        nodeRunId: graphEventNodeRunId(task.id, from, allEvents, event.seq),
+        summary: `${from} → ${payload.to ?? ''} (${payload.outcome ?? ''})`,
+      };
+    }
+    case 'approval-request': {
+      const nodeId = String(payload.node_id || '');
+      const activation = Number(payload.activation) || 1;
+      return { ...base, type: 'approval_requested', nodeRunId: graphNodeRunId(task.id, nodeId, activation), summary: `节点 ${nodeId} 等待 Creator 批准` };
+    }
+    case 'approval-decision': {
+      const nodeId = String(payload.node_id || '');
+      return {
+        ...base,
+        type: 'approval_decided',
+        nodeRunId: graphEventNodeRunId(task.id, nodeId, allEvents, event.seq),
+        summary: `Creator: ${payload.decision ?? 'approved'}${payload.reason ? `：${payload.reason}` : ''}`,
+      };
+    }
     case 'task-propose': return { ...base, type: 'approval_requested', summary: '工作流已提案，等待 Creator 批准' };
     case 'task-approve': return { ...base, type: 'approval_decided', summary: 'Creator 已批准工作流' };
     case 'step-start': return { ...base, type: 'node_activated', nodeRunId: eventNodeRunId(task.id, step, allEvents, event.seq), summary: `开始步骤 ${step}` };
@@ -491,9 +749,12 @@ export function getSidecarSnapshot(limit = 200): SidecarSnapshot {
   for (const task of tasks) {
     const updatedAt = task.latest_event_ts ?? task.completed_at ?? task.created_at;
     if (task.workflow_json) {
-      const steps = parseSteps(task);
-      if (steps.length === 0) continue;
-      const summary = projectRunSummary(task, steps, updatedAt, resolveAgent);
+      const graph = parseGraphWorkflow(task.workflow_json);
+      const steps = graph ? [] : parseSteps(task);
+      if (!graph && steps.length === 0) continue;
+      const summary = graph
+        ? projectGraphRunSummary(task, graph, updatedAt, resolveAgent)
+        : projectRunSummary(task, steps, updatedAt, resolveAgent);
       runs.push(summary);
       if (!['completed', 'failed', 'canceled'].includes(task.status)) {
         const badgeTargets = task.status === 'proposing' || task.status === 'awaiting_approval'
@@ -529,7 +790,20 @@ export function getSidecarSnapshot(limit = 200): SidecarSnapshot {
     }
   }
 
-  return { version: 1, generatedAt: new Date().toISOString(), runs, tasks: standalone, agentBadges };
+  const agentPool: AgentPoolEntry[] = db.listAllAgents(false)
+    .filter(agent => !agent.origin_peer)
+    .map(agent => ({
+      agentId: agent.id,
+      displayName: agent.display_name,
+      tool: agent.tool,
+      roles: agent.roles.split(',').map(role => role.trim()).filter(Boolean),
+      expertise: agent.expertise || undefined,
+      status: agent.status,
+      projectDir: agent.project_dir || undefined,
+      launchMode: 'resident',
+    }));
+
+  return { version: 1, generatedAt: new Date().toISOString(), runs, tasks: standalone, agentBadges, agentPool };
 }
 
 export function getSidecarRun(taskId: string): RunDetail | null {
