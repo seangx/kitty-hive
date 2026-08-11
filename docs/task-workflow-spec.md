@@ -1,4 +1,9 @@
-# Task Workflow Spec
+# Legacy linear Task Workflow Spec
+
+> Compatibility document. New ordinary tasks start directly in `in_progress`;
+> new explicit multi-agent runs use the graph kernel documented in
+> `graph-workflow-kernel.md`. The proposal/numbered-step model below remains for
+> existing persisted workflows and explicit ad-hoc legacy use.
 
 ## 概述
 

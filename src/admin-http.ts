@@ -22,6 +22,13 @@ import {
   requestOpenCodeDaemonRespawn,
   switchOpenCodeSession,
 } from './opencode-supervisor.js';
+import { subscribeSidecarWakes } from './sidecar-events.js';
+import {
+  getSidecarRun,
+  getSidecarRunEvents,
+  getSidecarSnapshot,
+  getSidecarTask,
+} from './sidecar-read-model.js';
 
 // Per-agent serialization for persistent conversation changes. Concurrent
 // Codex respawns or OpenCode session switches must not race each other.
@@ -101,6 +108,79 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
   if (!isLoopback(req)) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Admin endpoints are loopback-only' }));
+    return;
+  }
+
+  // GET /admin/sidecar/snapshot — bounded authoritative state for Kitty's
+  // SessionDeck badges and Inspector lists. This is intentionally a read
+  // projection over the current task/event tables, not a second source of
+  // workflow truth.
+  if (url.pathname === '/admin/sidecar/snapshot' && req.method === 'GET') {
+    const limit = Number(url.searchParams.get('limit') || 200);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(getSidecarSnapshot(limit)));
+    return;
+  }
+
+  // GET /admin/sidecar/events — wake-only local SSE. Payloads never contain
+  // derived state; clients must re-read snapshot/detail/events after a wake.
+  if (url.pathname === '/admin/sidecar/events' && req.method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      'Connection': 'keep-alive',
+    });
+    res.write(`event: ready\ndata: ${JSON.stringify({ version: 1 })}\n\n`);
+
+    const unsubscribe = subscribeSidecarWakes((wake) => {
+      if (res.destroyed || res.writableEnded) return;
+      const task = db.getTaskById(wake.taskId);
+      res.write(`event: wake\ndata: ${JSON.stringify({
+        taskId: wake.taskId,
+        runId: task?.workflow_json ? wake.taskId : undefined,
+        cursor: wake.cursor,
+      })}\n\n`);
+    });
+    const heartbeat = setInterval(() => {
+      if (!res.destroyed && !res.writableEnded) res.write(': heartbeat\n\n');
+    }, 25_000);
+    let closed = false;
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      clearInterval(heartbeat);
+      unsubscribe();
+    };
+    // ServerResponse.close tracks the lifetime of the streaming response.
+    // IncomingMessage.close can describe request-body completion on some Node
+    // versions, which would unsubscribe an otherwise healthy SSE too early.
+    res.once('close', cleanup);
+    return;
+  }
+
+  const runEventsMatch = url.pathname.match(/^\/admin\/sidecar\/runs\/([^/]+)\/events$/);
+  if (runEventsMatch && req.method === 'GET') {
+    const taskId = decodeURIComponent(runEventsMatch[1]);
+    const since = Math.max(0, Number(url.searchParams.get('since') || 0) || 0);
+    const page = getSidecarRunEvents(taskId, since);
+    res.writeHead(page ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(page ?? { error: 'Workflow run not found' }));
+    return;
+  }
+
+  const runMatch = url.pathname.match(/^\/admin\/sidecar\/runs\/([^/]+)$/);
+  if (runMatch && req.method === 'GET') {
+    const detail = getSidecarRun(decodeURIComponent(runMatch[1]));
+    res.writeHead(detail ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(detail ?? { error: 'Workflow run not found' }));
+    return;
+  }
+
+  const taskMatch = url.pathname.match(/^\/admin\/sidecar\/tasks\/([^/]+)$/);
+  if (taskMatch && req.method === 'GET') {
+    const detail = getSidecarTask(decodeURIComponent(taskMatch[1]));
+    res.writeHead(detail ? 200 : 404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(detail ?? { error: 'Standalone task not found' }));
     return;
   }
 

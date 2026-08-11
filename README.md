@@ -159,7 +159,11 @@ Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case
 | `hive-task-cancel` | `hive_task_cancel` | Cancel a task (creator only; any non-terminal state) |
 | `hive-tasks` | `hive_tasks` | List your tasks |
 | `hive-check` | `hive_check` | Check task status |
-| `hive-workflow-propose` | `hive_workflow_propose` | Propose workflow steps; set `gate: true` per step to pause for creator review |
+| `hive-workflow-templates` | `hive_workflow_templates` | List predefined graph workflows |
+| `hive-workflow-start` | `hive_workflow_start` | Explicitly start a predefined graph workflow |
+| `hive-workflow-node-complete` | `hive_workflow_node_complete` | Complete a graph node with a conditional outcome |
+| `hive-workflow-gate-decide` | `hive_workflow_gate_decide` | Decide a gated graph node (creator only) |
+| `hive-workflow-propose` | `hive_workflow_propose` | Legacy: propose an ad-hoc linear workflow |
 | `hive-workflow-approve` | `hive_workflow_approve` | Approve the proposed workflow (creator only) |
 | `hive-workflow-step-complete` | `hive_workflow_step_complete` | Complete a step (gated step → enters `awaiting_approval`) |
 | `hive-workflow-step-approve` | `hive_workflow_step_approve` | Release a gated step's pause (creator only) |
@@ -213,18 +217,15 @@ hive-task({ title: "Review PR #42" })                   # unassigned, anyone can
 **Lifecycle:**
 
 ```
-created ──→ proposing ──→ approved ──→ in_progress ──→ completed
-  │            ↑    │                    │    ↑
-  │            └────┘                    │    │
-  │          (re-propose)            step flow (reject → rollback)
-  │
-  └──→ canceled (from any non-terminal)
+ordinary: created ──claim/assign──→ in_progress ──→ completed
+
+explicit graph: node ──outcome edge──→ node ──→ ... ──→ completed
+                    └──changes_requested──→ earlier node
 ```
 
-1. Creator assigns task → assignee proposes workflow steps
-2. Creator reviews and approves (human-in-the-loop)
-3. Steps execute in order, each can have multiple assignees
-4. Reject sends task back to a previous step
+Ordinary tasks start immediately. A predefined graph workflow starts only on
+an explicit request; legacy proposal/numbered-step tools remain for existing
+linear workflows.
 
 ## Federation
 

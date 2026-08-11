@@ -5,6 +5,7 @@ import { mkdirSync } from 'node:fs';
 import type { Agent, AgentEventMode, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
 import { ulid, generateToken, nowISO } from './utils.js';
 import { buildDMPreview, INBOX_PREVIEW_LEN } from './preview.js';
+import { publishSidecarWake } from './sidecar-events.js';
 
 let db: Database.Database;
 
@@ -932,6 +933,34 @@ export function getTeamTasks(teamId: string, status?: string): Task[] {
   return getDB().prepare(sql).all(...params) as Task[];
 }
 
+export interface TaskOverview extends Task {
+  latest_event_seq: number | null;
+  latest_event_ts: string | null;
+}
+
+/** Operator-facing task feed used by the local Kitty Sidecar. The limit is
+ * deliberately bounded: completed history remains available without making a
+ * long-lived desktop renderer ingest the entire task table on every wake. The
+ * latest event metadata is joined in one query so a wake-triggered snapshot
+ * never performs N full event-log reads. */
+export function listTaskOverviews(limit: number = 200): TaskOverview[] {
+  const safeLimit = Math.max(1, Math.min(Math.trunc(limit) || 200, 1000));
+  return getDB().prepare(`
+    SELECT tasks.*,
+           latest_event.seq AS latest_event_seq,
+           latest_event.ts AS latest_event_ts
+    FROM tasks
+    LEFT JOIN (
+      SELECT task_id, MAX(id) AS latest_event_id
+      FROM task_events
+      GROUP BY task_id
+    ) latest ON latest.task_id = tasks.id
+    LEFT JOIN task_events latest_event ON latest_event.id = latest.latest_event_id
+    ORDER BY COALESCE(latest.latest_event_id, 0) DESC, tasks.created_at DESC
+    LIMIT ?
+  `).all(safeLimit) as TaskOverview[];
+}
+
 // --- Task event queries ---
 
 export function appendTaskEvent(taskId: string, type: TaskEventType, actorAgentId: string | null, payload: object = {}): TaskEvent {
@@ -945,7 +974,13 @@ export function appendTaskEvent(taskId: string, type: TaskEventType, actorAgentI
     return { id: result.lastInsertRowid as number, seq };
   });
   const { id, seq } = insert();
-  return { id, task_id: taskId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
+  const event = { id, task_id: taskId, seq, type, actor_agent_id: actorAgentId, payload_json: payloadJson, ts };
+  // Some handlers append their semantic event immediately before the final
+  // status UPDATE (task-start/task-claim). Wake after the synchronous state
+  // machine stack settles so a client cannot re-pull the pre-transition row
+  // and then wait forever for a second signal that will never come.
+  queueMicrotask(() => publishSidecarWake({ taskId, cursor: seq }));
+  return event;
 }
 
 export function getTaskEvents(taskId: string, since: number = 0, limit: number = 100): TaskEvent[] {
