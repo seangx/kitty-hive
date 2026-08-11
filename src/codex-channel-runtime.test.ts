@@ -82,6 +82,11 @@ test('boot and in-process resume paths both use the metadata-only builder', () =
   assert.doesNotMatch(channelSource, /thread\?\.turns\?\.length/);
   assert.match(channelSource, /onAppserverFailure\('process', `codex app-server exited/);
   assert.match(channelSource, /onAppserverFailure\('transport', `WebSocket error/);
+  assert.match(
+    channelSource,
+    /finally\s*\{\s*await announceBootstrapComplete\(\)/,
+    'auto-mode bootstrap must release its supervisor queue slot after the turn settles',
+  );
   assert.doesNotMatch(channelSource, /appserver died:/);
 });
 

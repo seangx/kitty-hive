@@ -12,7 +12,7 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
 import { getPushDeliveryDecision } from './push-delivery.js';
-import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
+import { getDaemonSnapshots, markDaemonBootstrapComplete, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
 import {
   getOpenCodeDaemonForAgent,
   getOpenCodeDaemonSnapshots,
@@ -329,6 +329,29 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
       }
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, tracked: true }));
+    } catch (err: any) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
+  // POST /admin/codex-daemon-bootstrap-complete — releases one slot in the
+  // bounded boot restore queue after the daemon's intro/rebind turn settles.
+  // Dynamic/manual daemons may call this too; they are acknowledged without
+  // affecting the queue because they do not own a boot slot.
+  if (url.pathname === '/admin/codex-daemon-bootstrap-complete' && req.method === 'POST') {
+    try {
+      const body = JSON.parse(await readBody(req));
+      const { agent_id } = body;
+      if (typeof agent_id !== 'string' || !agent_id) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'agent_id required (string)' }));
+        return;
+      }
+      const tracked = markDaemonBootstrapComplete(agent_id);
+      res.writeHead(tracked ? 200 : 202, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: tracked, tracked }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));

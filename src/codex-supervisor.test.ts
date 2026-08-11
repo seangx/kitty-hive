@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
+  CODEX_BOOTSTRAP_CONCURRENCY,
+  StartupConcurrencyQueue,
   buildCodexDaemonEnv,
   daemonProjectDirHasDrifted,
   resolveDaemonProjectDir,
@@ -8,6 +10,42 @@ import {
   signalCodexAppserverProcessTree,
   signalDaemonProcessTree,
 } from './codex-supervisor.js';
+
+test('boot queue starts only the configured number until slots settle', () => {
+  const started: number[] = [];
+  const releases = new Map<number, () => void>();
+  const queue = new StartupConcurrencyQueue<number>(
+    CODEX_BOOTSTRAP_CONCURRENCY,
+    (item, release) => {
+      started.push(item);
+      releases.set(item, release);
+    },
+  );
+
+  for (let item = 1; item <= CODEX_BOOTSTRAP_CONCURRENCY + 2; item += 1) {
+    queue.enqueue(item);
+  }
+
+  assert.deepEqual(started, [1, 2, 3]);
+  assert.deepEqual(queue.snapshot(), { active: 3, pending: 2 });
+
+  releases.get(2)!();
+  assert.deepEqual(started, [1, 2, 3, 4]);
+  assert.deepEqual(queue.snapshot(), { active: 3, pending: 1 });
+
+  // Completion notices and process-exit cleanup may race; release is
+  // intentionally idempotent and must not consume another slot.
+  releases.get(2)!();
+  assert.deepEqual(started, [1, 2, 3, 4]);
+  assert.deepEqual(queue.snapshot(), { active: 3, pending: 1 });
+});
+
+test('boot queue rejects invalid concurrency limits', () => {
+  assert.throws(
+    () => new StartupConcurrencyQueue(0, () => undefined),
+    /positive integer/,
+  );
+});
 
 test('daemon env restores only the authoritative agent Kitty key', () => {
   const env = buildCodexDaemonEnv(

@@ -102,15 +102,10 @@ export interface AppServerInitializeParams {
 
 /** Build arguments for the long-lived Codex app-server owned by Hive.
  *
- * Codex prewarms a Responses WebSocket when a thread starts or resumes. That
- * is useful for an interactive CLI whose first turn follows immediately, but
- * a Hive daemon can sit idle for minutes before its first real turn. The
- * prewarmed socket may be closed upstream during that idle window, making the
- * first send fail with Broken pipe before Codex falls back to HTTPS.
- *
- * Keep this override process-local: interactive Codex sessions retain their
- * normal WebSocket transport, while the long-lived Hive app-server uses the
- * stable Responses-over-HTTPS path from the outset.
+ * Hive restores many persisted, often long-context threads at serve startup.
+ * Keep its Responses transport on HTTPS so a WebSocket interruption cannot
+ * take down that whole bootstrap turn. This override is process-local:
+ * interactive Codex sessions retain their configured transport.
  */
 export function buildCodexAppServerArgs(
   listenUrl: string,
