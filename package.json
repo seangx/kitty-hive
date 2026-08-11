@@ -13,6 +13,7 @@
     "codex-channel.ts",
     "opencode-channel.ts",
     "src/codex-channel-runtime.ts",
+    "src/kitty-wakeup.ts",
     "src/opencode-channel-runtime.ts",
     "workflows/",
     "README.md",
