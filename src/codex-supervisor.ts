@@ -55,6 +55,11 @@ interface DaemonInfo {
   // thread is created. null while the daemon is still booting.
   wsUrl: string | null;
   threadId: string | null;
+  // PID of the detached codex app-server process-group leader. Reported by
+  // codex-channel in its ready handshake so the supervisor can reap the
+  // app-server even when the channel itself is killed before its signal
+  // handler can run.
+  appserverPid: number | null;
   readyAt: Date | null;
   // Daemon's local control-server base URL (http://127.0.0.1:<port>), used
   // for in-process thread switches. null when the daemon predates the
@@ -161,6 +166,30 @@ export function signalDaemonProcessTree(
   try { directSignal(); } catch { /* exit handler / next reconcile recovers */ }
 }
 
+/** Reap a detached codex app-server using only the PID reported by its
+ *  channel. POSIX app-servers are process-group leaders; signal both the
+ *  group and the direct wrapper so the node launcher and vendor binary are
+ *  covered. Windows keeps the historical direct-process fallback. */
+export function signalCodexAppserverProcessTree(
+  pid: number | null | undefined,
+  signal: NodeJS.Signals,
+  kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+  platform = process.platform,
+): void {
+  if (!Number.isSafeInteger(pid) || (pid ?? 0) <= 0) return;
+  const safePid = pid as number;
+  if (shouldDetachDaemonProcess(platform)) {
+    try { kill(-safePid, signal); } catch { /* direct fallback below */ }
+  }
+  try { kill(safePid, signal); } catch { /* process may already be gone */ }
+}
+
+function reapTrackedAppserver(info: DaemonInfo, signal: NodeJS.Signals): void {
+  const pid = info.appserverPid;
+  info.appserverPid = null;
+  signalCodexAppserverProcessTree(pid, signal);
+}
+
 /** Retire a daemon without leaving its soon-to-close websocket discoverable. */
 function requestIntentionalDaemonExit(info: DaemonInfo): void {
   info.intentionalShutdown = true;
@@ -250,7 +279,8 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
   const info: DaemonInfo = {
     agentId, displayName, projectDir, child, pid: child.pid,
     startedAt: new Date(), restartCount,
-    wsUrl: null, threadId: null, readyAt: null, controlUrl: null,
+    wsUrl: null, threadId: null, appserverPid: null,
+    readyAt: null, controlUrl: null,
   };
   daemons.set(agentId, info);
 
@@ -266,6 +296,10 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0): vo
     // Cancel any pending health-timer — the DaemonInfo is about to be
     // deleted and we don't want the timer firing against a stale ref.
     if (info.healthTimer) clearTimeout(info.healthTimer);
+    // The channel normally reaps its own detached app-server in its signal
+    // handler. This is the supervisor's independent fallback for SIGKILL,
+    // abrupt runtime exits, or any failure before channel cleanup completed.
+    reapTrackedAppserver(info, 'SIGTERM');
     daemons.delete(agentId);
     log('info', `[codex-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal}, intentional=${wasIntentional})`);
     if (shuttingDown) return;
@@ -343,6 +377,7 @@ export function stopCodexSupervisor(): Promise<void> {
       log('warn', `[codex-supervisor] ${pending.size} daemon(s) didn't exit cleanly; SIGKILL`);
       for (const info of daemons.values()) {
         if (pending.has(info.agentId)) {
+          reapTrackedAppserver(info, 'SIGKILL');
           signalDaemonProcessTree(info.pid, 'SIGKILL', () => info.child.kill('SIGKILL'));
         }
       }
@@ -364,6 +399,7 @@ export interface DaemonSnapshot {
   // ws_url/thread_id are null (daemon still booting codex app-server).
   ws_url: string | null;
   thread_id: string | null;
+  appserver_pid: number | null;
   ready: boolean;
   control_url: string | null;
 }
@@ -379,6 +415,7 @@ export function getDaemonSnapshots(): DaemonSnapshot[] {
     restart_count: info.restartCount,
     ws_url: info.wsUrl,
     thread_id: info.threadId,
+    appserver_pid: info.appserverPid,
     ready: !!info.readyAt,
     control_url: info.controlUrl,
   }));
@@ -408,21 +445,29 @@ export function getDaemonForAgent(
     restart_count: info.restartCount,
     ws_url: info.wsUrl,
     thread_id: info.threadId,
+    appserver_pid: info.appserverPid,
     ready: !!info.readyAt,
     control_url: info.controlUrl,
   };
 }
 
 /** Called by /admin/codex-daemon-ready when a daemon's codex app-server is up
- *  and its thread is created. Stores ws_url + thread_id on the DaemonInfo so
- *  outside callers can attach via `codex --remote <ws_url>`. */
-export function markDaemonReady(agentId: string, wsUrl: string, threadId: string, controlUrl?: string | null): boolean {
+ *  and its thread is created. Stores ws_url + thread_id for attach, plus the
+ *  detached app-server PID for supervisor-side orphan cleanup. */
+export function markDaemonReady(
+  agentId: string,
+  wsUrl: string,
+  threadId: string,
+  controlUrl?: string | null,
+  appserverPid?: number | null,
+): boolean {
   const info = daemons.get(agentId);
   if (!info || info.intentionalShutdown) return false;
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
   if (controlUrl !== undefined) info.controlUrl = controlUrl;
+  if (appserverPid !== undefined) info.appserverPid = appserverPid;
   // Persist thread_id so next spawn (after daemon kill / serve restart) can
   // resume the same codex thread instead of starting fresh. Idempotent —
   // setting the same id is a cheap UPDATE.
@@ -618,6 +663,7 @@ export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000):
       restart_count: snap.restartCount,
       ws_url: snap.wsUrl,
       thread_id: snap.threadId,
+      appserver_pid: snap.appserverPid,
       ready: true,
       control_url: snap.controlUrl,
     };

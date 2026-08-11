@@ -188,6 +188,21 @@ async function run() {
     db.close();
     ok(row.thread_id === '', `DB not silently updated by untracked ready POST (got ${JSON.stringify(row.thread_id)})`);
   }
+  // 3c. A malformed app-server PID must be rejected instead of entering the
+  // supervisor's process-cleanup state.
+  {
+    const res = await fetch(`${ADMIN}/admin/codex-daemon-ready`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        agent_id: a.agent_id,
+        ws_url: 'ws://127.0.0.1:9999',
+        thread_id: '01999999-9999-7999-9999-999999999999',
+        appserver_pid: -1,
+      }),
+    });
+    ok(res.status === 400, `invalid appserver_pid → 400 (got ${res.status})`);
+  }
 
   console.log('\n=== Test 4: pre-v0.7 DB migration is idempotent ===');
   // Simulate an older DB without thread_id by opening directly and dropping
