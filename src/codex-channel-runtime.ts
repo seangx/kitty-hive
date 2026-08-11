@@ -109,12 +109,21 @@ export interface AppServerInitializeParams {
  */
 export function buildCodexAppServerArgs(
   listenUrl: string,
+  hiveMcpUrl: string,
   hiveToolNames: readonly string[],
 ): string[] {
   const args = [
     'app-server',
     '--listen', listenUrl,
-    '-c', 'model_providers.openai.supports_websockets=false',
+    // Codex 0.145+ reserves the built-in `openai` provider id, so attempting
+    // to override `model_providers.openai.supports_websockets` makes config
+    // loading fail. Define a complete process-local provider instead and
+    // select it only for this Hive-owned app-server.
+    '-c', 'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}',
+    '-c', 'model_provider="hive-openai-http"',
+    // Keep the CLI override layer transport-complete and bind the app-server
+    // to the supervisor that spawned it, not a possibly stale user URL.
+    '-c', `mcp_servers.hive.url=${JSON.stringify(hiveMcpUrl)}`,
   ];
   for (const toolName of hiveToolNames) {
     args.push('-c', `mcp_servers.hive.tools.${toolName}.approval_mode="auto"`);

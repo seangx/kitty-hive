@@ -423,6 +423,7 @@ async function setupAppserver(): Promise<void> {
   // per-tool "approve" entries, so we must override every tool by name.
   const appserverArgs = buildCodexAppServerArgs(
     `ws://127.0.0.1:${port}`,
+    ENV_URL,
     await listHiveToolNames(),
   );
   appserverProc = spawn(CODEX_CMD, appserverArgs, {
