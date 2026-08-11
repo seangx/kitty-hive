@@ -100,6 +100,28 @@ export interface AppServerInitializeParams {
   };
 }
 
+/** Build arguments for the long-lived Codex app-server owned by Hive.
+ *
+ * Hive restores many persisted, often long-context threads at serve startup.
+ * Keep its Responses transport on HTTPS so a WebSocket interruption cannot
+ * take down that whole bootstrap turn. This override is process-local:
+ * interactive Codex sessions retain their configured transport.
+ */
+export function buildCodexAppServerArgs(
+  listenUrl: string,
+  hiveToolNames: readonly string[],
+): string[] {
+  const args = [
+    'app-server',
+    '--listen', listenUrl,
+    '-c', 'model_providers.openai.supports_websockets=false',
+  ];
+  for (const toolName of hiveToolNames) {
+    args.push('-c', `mcp_servers.hive.tools.${toolName}.approval_mode="auto"`);
+  }
+  return args;
+}
+
 /** Opt in to Codex's experimental protocol surface.
  *
  * `thread/resume.excludeTurns` is experimental and Codex rejects the field

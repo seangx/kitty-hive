@@ -37,7 +37,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -421,15 +421,11 @@ async function setupAppserver(): Promise<void> {
   // NOTE codex config precedence: tool-level > server default. A single
   // `default_tools_approval_mode` override would LOSE to the user's explicit
   // per-tool "approve" entries, so we must override every tool by name.
-  const approvalOverrides: string[] = [];
-  for (const t of await listHiveToolNames()) {
-    approvalOverrides.push('-c', `mcp_servers.hive.tools.${t}.approval_mode="auto"`);
-  }
-  appserverProc = spawn(CODEX_CMD, [
-    'app-server',
-    '--listen', `ws://127.0.0.1:${port}`,
-    ...approvalOverrides,
-  ], {
+  const appserverArgs = buildCodexAppServerArgs(
+    `ws://127.0.0.1:${port}`,
+    await listHiveToolNames(),
+  );
+  appserverProc = spawn(CODEX_CMD, appserverArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
@@ -659,15 +655,24 @@ async function setupAppserver(): Promise<void> {
   // a fire-and-forget model turn. Foreground mode already persisted the same
   // policy above and deliberately creates no turn.
   if (HIVE_EVENT_MODE === 'auto') {
-    void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
-      .then((outcome) => {
+    void (async () => {
+      try {
+        const outcome = await sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
         if (outcome.kind !== 'completed') {
           console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind} — daemon already proceeded`);
         }
-      })
-      .catch((err) => {
+      } catch (err) {
         console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err);
-      });
+      } finally {
+        await announceBootstrapComplete().catch(err => {
+          console.error('[codex-channel] failed to release supervisor bootstrap slot:', err);
+        });
+      }
+    })();
+  } else {
+    await announceBootstrapComplete().catch(err => {
+      console.error('[codex-channel] failed to release supervisor bootstrap slot:', err);
+    });
   }
 }
 
@@ -878,6 +883,22 @@ async function announceReady(): Promise<void> {
     throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
   }
   console.error(`[codex-channel] announced ready: ws=${appserverWsUrl} thread=${threadId.slice(0, 8)}...`);
+}
+
+/** Tell the supervisor that this daemon's startup-only model work has
+ * settled, so another persisted daemon may begin bootstrapping. */
+async function announceBootstrapComplete(): Promise<void> {
+  if (!agentId) return;
+  const adminUrl = ENV_URL.replace(/\/mcp\/?$/, '') + '/admin/codex-daemon-bootstrap-complete';
+  const res = await fetch(adminUrl, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ agent_id: agentId }),
+  });
+  if (!res.ok && res.status !== 202) {
+    throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
+  }
+  console.error('[codex-channel] released supervisor bootstrap slot');
 }
 
 /** Answer a server→client JSON-RPC request from codex app-server. The

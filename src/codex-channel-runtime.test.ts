@@ -5,6 +5,7 @@ import {
   CodexTerminalNotificationTracker,
   TurnTracker,
   buildAppServerInitializeParams,
+  buildCodexAppServerArgs,
   buildThreadResumeParams,
   describeWebSocketEvent,
   supervisorProcessIsMissing,
@@ -46,6 +47,23 @@ test('app-server initialization enables the experimental resume field', () => {
   );
 });
 
+test('Hive app-server uses HTTPS Responses without changing interactive Codex', () => {
+  assert.deepEqual(
+    buildCodexAppServerArgs('ws://127.0.0.1:4567', ['hive_start', 'hive_inbox']),
+    [
+      'app-server',
+      '--listen',
+      'ws://127.0.0.1:4567',
+      '-c',
+      'model_providers.openai.supports_websockets=false',
+      '-c',
+      'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
+      '-c',
+      'mcp_servers.hive.tools.hive_inbox.approval_mode="auto"',
+    ],
+  );
+});
+
 test('boot and in-process resume paths both use the metadata-only builder', () => {
   const channelSource = readFileSync(
     new URL('../codex-channel.ts', import.meta.url),
@@ -64,6 +82,11 @@ test('boot and in-process resume paths both use the metadata-only builder', () =
   assert.doesNotMatch(channelSource, /thread\?\.turns\?\.length/);
   assert.match(channelSource, /onAppserverFailure\('process', `codex app-server exited/);
   assert.match(channelSource, /onAppserverFailure\('transport', `WebSocket error/);
+  assert.match(
+    channelSource,
+    /finally\s*\{\s*await announceBootstrapComplete\(\)/,
+    'auto-mode bootstrap must release its supervisor queue slot after the turn settles',
+  );
   assert.doesNotMatch(channelSource, /appserver died:/);
 });
 
