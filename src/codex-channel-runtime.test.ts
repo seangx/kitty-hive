@@ -49,13 +49,21 @@ test('app-server initialization enables the experimental resume field', () => {
 
 test('Hive app-server uses HTTPS Responses without changing interactive Codex', () => {
   assert.deepEqual(
-    buildCodexAppServerArgs('ws://127.0.0.1:4567', ['hive_start', 'hive_inbox']),
+    buildCodexAppServerArgs(
+      'ws://127.0.0.1:4567',
+      'http://127.0.0.1:4123/mcp',
+      ['hive_start', 'hive_inbox'],
+    ),
     [
       'app-server',
       '--listen',
       'ws://127.0.0.1:4567',
       '-c',
-      'model_providers.openai.supports_websockets=false',
+      'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}',
+      '-c',
+      'model_provider="hive-openai-http"',
+      '-c',
+      'mcp_servers.hive.url="http://127.0.0.1:4123/mcp"',
       '-c',
       'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
       '-c',
