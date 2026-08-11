@@ -871,6 +871,7 @@ async function announceReady(): Promise<void> {
       ws_url: appserverWsUrl,
       thread_id: threadId,
       control_url: controlUrl,
+      appserver_pid: appserverProc?.pid ?? null,
     }),
   });
   if (!res.ok) {

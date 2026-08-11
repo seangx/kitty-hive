@@ -5,6 +5,7 @@ import {
   daemonProjectDirHasDrifted,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
+  signalCodexAppserverProcessTree,
   signalDaemonProcessTree,
 } from './codex-supervisor.js';
 
@@ -122,4 +123,31 @@ test('signals only the direct wrapper on Windows', () => {
   );
 
   assert.deepEqual(calls, ['direct']);
+});
+
+test('reaps a reported codex app-server process group on POSIX', () => {
+  const calls: Array<[number, NodeJS.Signals]> = [];
+
+  signalCodexAppserverProcessTree(
+    456,
+    'SIGTERM',
+    (pid, signal) => calls.push([pid, signal]),
+    'darwin',
+  );
+
+  assert.deepEqual(calls, [
+    [-456, 'SIGTERM'],
+    [456, 'SIGTERM'],
+  ]);
+});
+
+test('ignores missing or invalid reported app-server pids', () => {
+  const calls: number[] = [];
+  const kill = (pid: number) => calls.push(pid);
+
+  signalCodexAppserverProcessTree(null, 'SIGTERM', kill, 'darwin');
+  signalCodexAppserverProcessTree(0, 'SIGTERM', kill, 'darwin');
+  signalCodexAppserverProcessTree(-1, 'SIGTERM', kill, 'darwin');
+
+  assert.deepEqual(calls, []);
 });

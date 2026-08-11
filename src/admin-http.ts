@@ -293,23 +293,31 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
-  // POST /admin/codex-daemon-ready — daemon announces (ws_url, thread_id) after
-  // its codex app-server is up. Lets external callers (kitty-kitty) discover
-  // where to point `codex --remote` to see the same thread the daemon is
-  // injecting into.
+  // POST /admin/codex-daemon-ready — daemon announces its attach metadata and
+  // detached app-server PID after startup. The PID lets the supervisor reap
+  // the app-server if the channel dies before its own cleanup handler runs.
   if (url.pathname === '/admin/codex-daemon-ready' && req.method === 'POST') {
     try {
       const body = JSON.parse(await readBody(req));
-      const { agent_id, ws_url, thread_id, control_url } = body;
+      const { agent_id, ws_url, thread_id, control_url, appserver_pid } = body;
       if (typeof agent_id !== 'string' || typeof ws_url !== 'string' || typeof thread_id !== 'string') {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'agent_id, ws_url, thread_id all required (strings)' }));
         return;
       }
+      if (
+        appserver_pid !== undefined && appserver_pid !== null &&
+        (!Number.isSafeInteger(appserver_pid) || appserver_pid <= 0)
+      ) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'appserver_pid must be a positive integer when provided' }));
+        return;
+      }
       // control_url is optional (older daemons don't send it; a daemon whose
       // control server failed to start sends null).
       const controlUrl = typeof control_url === 'string' && control_url ? control_url : null;
-      const ok = markDaemonReady(agent_id, ws_url, thread_id, controlUrl);
+      const appserverPid = typeof appserver_pid === 'number' ? appserver_pid : null;
+      const ok = markDaemonReady(agent_id, ws_url, thread_id, controlUrl, appserverPid);
       if (!ok) {
         // Daemon wasn't in the supervisor's map — could be a manually-started
         // codex-channel (not via supervisor). Accept the POST silently with a
