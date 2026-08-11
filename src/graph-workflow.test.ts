@@ -83,7 +83,9 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
   assert.equal(snapshot.agentPool.length, 4);
   assert.ok(snapshot.agentPool.every(agent => agent.launchMode === 'resident'));
   assert.deepEqual(snapshot.workflowTemplates.map(template => template.templateId), ['review-test-release']);
-  assert.equal(snapshot.workflowTemplates[0].graph.nodes[0].action?.length > 0, true);
+  const templatePreview = snapshot.workflowTemplates[0];
+  assert.ok(templatePreview);
+  assert.equal((templatePreview.graph.nodes[0]?.action?.length ?? 0) > 0, true);
 
   const gatedDefinition: GraphWorkflowDefinition = {
     kind: 'graph',
