@@ -1,0 +1,51 @@
+{
+  "template_id": "review-test-release",
+  "template_name": "开发 → Review → E2E → 发布复核",
+  "description": "Coder 完成后交 Reviewer；Review/E2E 均可打回 Coder；全部通过后由 Reviewer 执行最终上传流程。",
+  "version": 1,
+  "definition": {
+    "kind": "graph",
+    "version": 1,
+    "template_id": "review-test-release",
+    "template_name": "开发 → Review → E2E → 发布复核",
+    "entry_node_id": "implement",
+    "nodes": [
+      {
+        "node_id": "implement",
+        "title": "实现",
+        "assignees": ["$assignee"],
+        "action": "完成任务实现与对应回归测试，并提交可供 Review 的结果。",
+        "completion": "all"
+      },
+      {
+        "node_id": "review",
+        "title": "代码 Review",
+        "assignees": ["role:reviewer"],
+        "action": "审查实现、测试和边界；通过或带明确原因打回实现节点。",
+        "completion": "all"
+      },
+      {
+        "node_id": "e2e",
+        "title": "E2E 验证",
+        "assignees": ["role:tester"],
+        "action": "运行真实 E2E，记录证据；通过或带明确原因打回实现节点。",
+        "completion": "all"
+      },
+      {
+        "node_id": "release-review",
+        "title": "发布复核",
+        "assignees": ["role:reviewer"],
+        "action": "复核 Review 与 E2E 证据；仅在已有发布授权时执行上传/发布流程。",
+        "completion": "all"
+      }
+    ],
+    "edges": [
+      { "edge_id": "implement-passed-review", "from": "implement", "to": "review", "when": "passed" },
+      { "edge_id": "review-changes-implement", "from": "review", "to": "implement", "when": "changes_requested" },
+      { "edge_id": "review-passed-e2e", "from": "review", "to": "e2e", "when": "passed" },
+      { "edge_id": "e2e-changes-implement", "from": "e2e", "to": "implement", "when": "changes_requested" },
+      { "edge_id": "e2e-passed-release", "from": "e2e", "to": "release-review", "when": "passed" },
+      { "edge_id": "release-changes-implement", "from": "release-review", "to": "implement", "when": "changes_requested" }
+    ]
+  }
+}

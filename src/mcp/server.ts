@@ -74,7 +74,7 @@ export function createMcpServer(): McpServer {
       '## Workflow rules',
       '- Ordinary tasks are the default: start the work immediately and finish with hive_task_complete.',
       '- Do NOT create/propose a workflow merely because work has several implementation steps.',
-      '- Start a predefined graph workflow only when the user/creator explicitly asks for a workflow',
+      '- Start a configured graph workflow only when the user/creator explicitly asks for a workflow',
       '  (for example `/workflow`) or when you are already assigned to a graph node.',
       '- For graph runs, report the current node outcome with hive_workflow_node_complete.',
       '- hive_workflow_propose/approve/step_complete are legacy compatibility tools for an explicitly',

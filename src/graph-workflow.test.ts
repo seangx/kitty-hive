@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import * as db from './db.js';
 import {
   handleGraphGateDecision,
@@ -12,6 +15,13 @@ import {
 } from './tools/task.js';
 import { getSidecarRun, getSidecarSnapshot } from './sidecar-read-model.js';
 import type { GraphWorkflowDefinition } from './models.js';
+
+const workflowDir = mkdtempSync(join(tmpdir(), 'kitty-hive-graph-test-'));
+test.before(() => { process.env.KITTY_HIVE_WORKFLOWS_DIR = workflowDir; });
+test.after(() => {
+  delete process.env.KITTY_HIVE_WORKFLOWS_DIR;
+  rmSync(workflowDir, { recursive: true, force: true });
+});
 
 test('ordinary tasks start immediately while an explicit graph workflow preserves rollback activations', () => {
   db.initDB(':memory:');
@@ -72,6 +82,8 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
   const snapshot = getSidecarSnapshot();
   assert.equal(snapshot.agentPool.length, 4);
   assert.ok(snapshot.agentPool.every(agent => agent.launchMode === 'resident'));
+  assert.deepEqual(snapshot.workflowTemplates.map(template => template.templateId), ['review-test-release']);
+  assert.equal(snapshot.workflowTemplates[0].graph.nodes[0].action?.length > 0, true);
 
   const gatedDefinition: GraphWorkflowDefinition = {
     kind: 'graph',

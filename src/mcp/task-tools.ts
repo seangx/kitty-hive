@@ -225,7 +225,7 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_workflow_templates',
-    'List the predefined graph workflows available for explicit workflow runs. Reading this list does not create a task or workflow.',
+    'List the configured JSON graph workflows available for explicit workflow runs. Reading this list does not create a task or workflow.',
     { as: asParam },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
@@ -249,7 +249,7 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_workflow_start',
-    'Explicitly start a predefined graph workflow. Use only when the user/creator asks for a workflow (for example `/workflow`) — ordinary delegated tasks must use hive_task and start immediately. ' +
+    'Explicitly start a configured JSON graph workflow. Use only when the user/creator asks for a workflow (for example `/workflow`) — ordinary delegated tasks must use hive_task and start immediately. ' +
     'Template role placeholders are resolved to concrete active agents at start, making the run deterministic. No proposal/approval round-trip is inserted.',
     {
       as: asParam,
@@ -339,7 +339,7 @@ export function registerTaskTools(mcp: McpServer) {
 
   mcp.tool(
     'hive_workflow_propose',
-    'Legacy compatibility: propose an ad-hoc linear workflow for a task. Use only when the user explicitly asks for a custom workflow that no predefined graph template covers. ' +
+    'Legacy compatibility: propose an ad-hoc linear workflow for a task. Use only when the user explicitly asks for a custom workflow that no configured graph template covers. ' +
     'Most tasks do NOT need a workflow — just do the work and call hive_task_complete; this legacy path forces a creator-approval round-trip before work can start. ' +
     'Creator must approve before steps start. ' +
     'For multi-phase workflows where the user (creator) will want to review the output between phases, ' +

@@ -10,11 +10,15 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
 ## Reads
 
 - `GET /snapshot?limit=200`
-  - `{ version, generatedAt, runs, tasks, agentBadges, agentPool }`
+  - `{ version, generatedAt, runs, tasks, agentBadges, agentPool, workflowTemplates }`
   - `runs` contains tasks with `workflow_json`; `tasks` contains standalone
     tasks; `agentBadges` contains only non-terminal work.
   - `agentPool` contains authoritative local registered agents. Current entries
     are resident agents; no on-demand launcher is implied.
+  - `workflowTemplates` contains a read-only preview of the JSON templates
+    currently available to new Hive workflow runs. If a template file is
+    invalid, the list is empty and `workflowTemplatesError` explains the
+    problem without breaking task/pool snapshots.
 
 `agentPool[]` raw shape:
 
@@ -34,6 +38,12 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
 `status` is the Hive agent presence state (`active | idle | busy | offline`),
 not task execution state. Kitty should combine it with `agentBadges` when it
 needs to render `working` versus `idle`.
+
+`workflowTemplates[]` includes `templateId`, `templateName`, `description`,
+`version`, and a graph. Graph nodes include the unresolved assignee hints
+(`$assignee`, `role:reviewer`, etc.), action, completion mode, and gate flag.
+The Sidecar is read-only: operators mutate templates with the
+`kitty-hive workflow` CLI.
 - `GET /runs/:taskId`
   - graph, activation-preserving node runs, approvals, and taken edge ids.
 - `GET /runs/:taskId/events?since=<cursor>`

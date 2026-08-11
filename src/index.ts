@@ -16,6 +16,14 @@ import { homedir, hostname } from 'node:os';
 import { execSync } from 'node:child_process';
 import { buildPushMessage } from './preview.js';
 import { AGENT_EVENT_MODES, type AgentEventMode } from './models.js';
+import {
+  createWorkflowTemplate,
+  deleteWorkflowTemplate,
+  getWorkflowTemplate,
+  listWorkflowTemplates,
+  updateWorkflowTemplate,
+  workflowTemplatesDir,
+} from './graph-workflow.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -2560,6 +2568,68 @@ function getDefaultAgentName(): string {
   return basename(process.cwd()) || 'agent';
 }
 
+function readWorkflowTemplateInput(path: string): unknown {
+  try {
+    return JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    throw new Error(`Cannot read workflow JSON ${path}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+async function cmdWorkflowList(): Promise<void> {
+  const templates = listWorkflowTemplates();
+  if (args.includes('--json')) {
+    console.log(JSON.stringify(templates, null, 2));
+    return;
+  }
+  if (templates.length === 0) {
+    console.log(`No workflow templates in ${workflowTemplatesDir()}`);
+    return;
+  }
+  for (const template of templates) {
+    console.log(`${template.template_id}\t${template.template_name}\tv${template.version}`);
+    if (template.description) console.log(`  ${template.description}`);
+  }
+}
+
+async function cmdWorkflowGet(): Promise<void> {
+  const templateId = args[2];
+  if (!templateId) throw new Error('Usage: kitty-hive workflow get <template-id>');
+  const template = getWorkflowTemplate(templateId);
+  if (!template) throw new Error(`Workflow template not found: ${templateId}`);
+  console.log(JSON.stringify(template, null, 2));
+}
+
+async function cmdWorkflowCreate(): Promise<void> {
+  const path = args[2];
+  if (!path) throw new Error('Usage: kitty-hive workflow create <template.json>');
+  const template = createWorkflowTemplate(readWorkflowTemplateInput(path));
+  console.log(`Created workflow template ${template.template_id} at ${workflowTemplatesDir()}`);
+}
+
+async function cmdWorkflowUpdate(): Promise<void> {
+  const templateId = args[2];
+  const path = args[3];
+  if (!templateId || !path) throw new Error('Usage: kitty-hive workflow update <template-id> <template.json>');
+  const template = updateWorkflowTemplate(templateId, readWorkflowTemplateInput(path));
+  console.log(`Updated workflow template ${template.template_id}`);
+}
+
+async function cmdWorkflowDelete(): Promise<void> {
+  const templateId = args[2];
+  if (!templateId) throw new Error('Usage: kitty-hive workflow delete <template-id> [--yes]');
+  if (!args.includes('--yes')) {
+    if (!isInteractive()) throw new Error('Refusing to delete without --yes in non-interactive mode');
+    const confirmed = await askConfirm({ message: `Delete workflow template ${templateId}?` });
+    if (!confirmed) {
+      console.log('Canceled.');
+      return;
+    }
+  }
+  deleteWorkflowTemplate(templateId);
+  console.log(`Deleted workflow template ${templateId}`);
+}
+
 // --- Help (per-group + root) ---
 
 function showRootHelp() {
@@ -2581,6 +2651,7 @@ Top-level commands:
 Command groups:
   agent      Manage local agents       (list, rename, remove, register, event-mode)
   team       Inspect/maintain teams    (list, transfer)
+  workflow   Manage workflow JSON      (list, get, create, update, delete)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
   log        Inspect message history   (dm, team, task)
   tunnel     Cloudflare tunnel control (start, status)
@@ -2636,6 +2707,23 @@ Subcommands:
 
 Note: agents normally manage teams via the hive-team-* MCP tools.
 This group is for operator-level maintenance (e.g. before removing a host agent).`);
+}
+
+function showWorkflowHelp() {
+  console.log(`🐝 kitty-hive workflow — JSON workflow template management
+
+Templates are stored in ${workflowTemplatesDir()} and hot-reloaded for new runs.
+Running workflows keep their original definition snapshot.
+
+Usage:
+  kitty-hive workflow <subcommand> [args]
+
+Subcommands:
+  list [--json]                               List templates
+  get <template-id>                          Print one template as JSON
+  create <template.json>                     Validate and create a template
+  update <template-id> <template.json>       Validate and replace a template
+  delete <template-id> [--yes]               Delete a template`);
 }
 
 function showPeerHelp() {
@@ -2763,6 +2851,16 @@ switch (command) {
       case 'reopen':   run(cmdTeamReopen);   break;
       case 'delete':   run(cmdTeamDelete);   break;
       default:         showTeamHelp();        break;
+    }
+    break;
+  case 'workflow':
+    switch (args[1]) {
+      case 'list':   run(cmdWorkflowList);   break;
+      case 'get':    run(cmdWorkflowGet);    break;
+      case 'create': run(cmdWorkflowCreate); break;
+      case 'update': run(cmdWorkflowUpdate); break;
+      case 'delete': run(cmdWorkflowDelete); break;
+      default:       showWorkflowHelp();      break;
     }
     break;
   case 'peer':

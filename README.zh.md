@@ -159,8 +159,8 @@ npx kitty-hive init cursor
 | `hive-task-cancel` | `hive_task_cancel` | 取消任务（仅创建者；任何非终态都可用） |
 | `hive-tasks` | `hive_tasks` | 任务看板 |
 | `hive-check` | `hive_check` | 查看任务状态 |
-| `hive-workflow-templates` | `hive_workflow_templates` | 列出预定义图工作流 |
-| `hive-workflow-start` | `hive_workflow_start` | 显式启动预定义图工作流 |
+| `hive-workflow-templates` | `hive_workflow_templates` | 列出已配置的 JSON 图工作流 |
+| `hive-workflow-start` | `hive_workflow_start` | 显式启动已配置的 JSON 图工作流 |
 | `hive-workflow-node-complete` | `hive_workflow_node_complete` | 按条件结果完成当前图节点 |
 | `hive-workflow-gate-decide` | `hive_workflow_gate_decide` | 决定 gated 图节点（仅创建者） |
 | `hive-workflow-propose` | `hive_workflow_propose` | 兼容旧版：提出临时线性工作流 |
@@ -224,8 +224,11 @@ hive-task({ title: "Review PR #42" })                   # 未分配，任何人�
 ```
 
 普通任务创建/领取后直接进入 `in_progress`，完成后调用 `hive_task_complete`。
-仅当用户显式要求 Workflow 时，才用 `hive_workflow_start` 启动预定义图；
+仅当用户显式要求 Workflow 时，才用 `hive_workflow_start` 启动已配置的图；
 旧的提案/编号步骤流程只为已有线性工作流保留兼容。
+
+Workflow 模板是 `~/.kitty-hive/workflows` 下的 JSON 文件，新启动的任务会热加载最新版本。
+使用 `kitty-hive workflow list|get|create|update|delete` 完成增删改查。
 
 ## 联邦
 

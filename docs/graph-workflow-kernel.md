@@ -4,7 +4,7 @@ Hive now has two deliberately separate execution lanes:
 
 1. **Ordinary Task** — the default. An assigned or claimed task enters
    `in_progress` immediately and finishes with `hive_task_complete`.
-2. **Graph Workflow** — explicit only. The creator starts a predefined template
+2. **Graph Workflow** — explicit only. The creator starts a configured template
    with `hive_workflow_start`; there is no proposal/approval ceremony before
    the first node.
 
@@ -53,7 +53,25 @@ A gated node pauses in `awaiting_approval` after positive completion. Only the
 task creator can call `hive_workflow_gate_decide`; the decision then selects the
 corresponding edge.
 
-## Built-in template
+## JSON templates
+
+Templates live in `~/.kitty-hive/workflows/*.json` (override with
+`KITTY_HIVE_WORKFLOWS_DIR`). Packaged examples are copied there only on first
+initialization, so deleting one remains effective after restart. Hive reads
+the directory for every list/start request; new runs see edits immediately,
+while in-flight runs keep the definition snapshot stored in `workflow_json`.
+
+Use the operator CLI for CRUD:
+
+```text
+kitty-hive workflow list [--json]
+kitty-hive workflow get <id>
+kitty-hive workflow create <file.json>
+kitty-hive workflow update <id> <file.json>
+kitty-hive workflow delete <id> [--yes]
+```
+
+The packaged `review-test-release` example encodes:
 
 `review-test-release` encodes:
 
@@ -76,7 +94,7 @@ profile launch/destruction is intentionally not faked by this kernel.
 
 ## Tools
 
-- `hive_workflow_templates` — list predefined graph templates.
+- `hive_workflow_templates` — list configured JSON graph templates.
 - `hive_workflow_start` — explicitly create and start a graph run.
 - `hive_workflow_node_complete` — report the current node outcome.
 - `hive_workflow_gate_decide` — creator decision for a gated graph node.

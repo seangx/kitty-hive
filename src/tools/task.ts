@@ -6,13 +6,13 @@ import {
 } from '../db.js';
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
 import {
-  BUILTIN_WORKFLOW_TEMPLATES,
-  getBuiltinWorkflowTemplate,
+  getWorkflowTemplate,
   graphEdge,
   graphNodeAt,
   graphNodeIndex,
   parseGraphWorkflow,
   validateGraphWorkflow,
+  listWorkflowTemplates as loadWorkflowTemplates,
 } from '../graph-workflow.js';
 import type {
   GraphWorkflowDefinition,
@@ -496,7 +496,7 @@ export function handleWorkflowReject(taskId: string, agentId: string, stepNum: n
 // --- Graph workflow kernel ---
 
 export function listWorkflowTemplates(): readonly GraphWorkflowTemplate[] {
-  return BUILTIN_WORKFLOW_TEMPLATES;
+  return loadWorkflowTemplates();
 }
 
 export interface GraphWorkflowStartInput {
@@ -566,7 +566,7 @@ function resolvePrimaryAssignee(actorId: string, to: string, sourceTeamId?: stri
 export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowStartInput): TaskOutput & { action: GraphWorkflowAction } {
   const actor = getAgentById(actorId);
   if (!actor) throw new Error('Actor not found');
-  const template = getBuiltinWorkflowTemplate(input.template_id);
+  const template = getWorkflowTemplate(input.template_id);
   if (!template) throw new Error(`Workflow template not found: ${input.template_id}`);
 
   const primaryAssigneeId = resolvePrimaryAssignee(actorId, input.to, input.source_team_id);

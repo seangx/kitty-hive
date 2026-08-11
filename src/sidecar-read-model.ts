@@ -1,5 +1,5 @@
 import * as db from './db.js';
-import { graphNodeAt, parseGraphWorkflow } from './graph-workflow.js';
+import { graphNodeAt, listWorkflowTemplates, parseGraphWorkflow } from './graph-workflow.js';
 import type {
   Agent,
   GraphWorkflowDefinition,
@@ -25,6 +25,9 @@ export interface TemplateNode {
   label: string;
   assigneeHint?: string;
   assigneeAgentIds?: string[];
+  action?: string;
+  completion?: 'all' | 'any';
+  gate?: boolean;
   layout?: { x: number; y: number };
 }
 
@@ -155,6 +158,14 @@ export interface AgentPoolEntry {
   launchMode: 'resident';
 }
 
+export interface WorkflowTemplatePreview {
+  templateId: string;
+  templateName: string;
+  description: string;
+  version: number;
+  graph: TemplateGraph;
+}
+
 export interface SidecarSnapshot {
   version: 1;
   generatedAt: string;
@@ -162,6 +173,8 @@ export interface SidecarSnapshot {
   tasks: TaskSummary[];
   agentBadges: AgentTaskBadge[];
   agentPool: AgentPoolEntry[];
+  workflowTemplates: WorkflowTemplatePreview[];
+  workflowTemplatesError?: string;
 }
 
 type AgentResolver = (id: string) => Agent | undefined;
@@ -303,6 +316,33 @@ function resolveGraphAssignees(node: GraphWorkflowNode | undefined, resolveAgent
   };
 }
 
+function graphDefinitionPreview(definition: GraphWorkflowDefinition, resolveAgent?: AgentResolver): TemplateGraph {
+  return {
+    nodes: definition.nodes.map((node, index) => {
+      const assignees = resolveAgent
+        ? resolveGraphAssignees(node, resolveAgent)
+        : { ids: [] as string[], names: node.assignees };
+      return {
+        nodeId: node.node_id,
+        label: node.title,
+        assigneeHint: assignees.names.join(', ') || undefined,
+        assigneeAgentIds: assignees.ids.length ? assignees.ids : undefined,
+        action: node.action,
+        completion: node.completion,
+        gate: Boolean(node.gate),
+        layout: { x: 28 + index * 122, y: 28 + (index % 2) * 76 },
+      };
+    }),
+    edges: definition.edges.map(edge => ({
+      edgeId: edge.edge_id,
+      from: edge.from,
+      to: edge.to,
+      outcome: edge.when,
+    })),
+    entryNodeId: definition.entry_node_id,
+  };
+}
+
 function projectGraphRunSummary(
   task: Task,
   definition: GraphWorkflowDefinition,
@@ -438,25 +478,7 @@ function projectGraphWorkflowRun(
 
   return {
     summary: projectGraphRunSummary(task, definition, taskUpdatedAt(task, events), resolveAgent),
-    graph: {
-      nodes: definition.nodes.map((node, index) => {
-        const assignees = resolveGraphAssignees(node, resolveAgent);
-        return {
-          nodeId: node.node_id,
-          label: node.title,
-          assigneeHint: assignees.names.join(', ') || undefined,
-          assigneeAgentIds: assignees.ids,
-          layout: { x: 28 + index * 122, y: 28 + (index % 2) * 76 },
-        };
-      }),
-      edges: definition.edges.map(edge => ({
-        edgeId: edge.edge_id,
-        from: edge.from,
-        to: edge.to,
-        outcome: edge.when,
-      })),
-      entryNodeId: definition.entry_node_id,
-    },
+    graph: graphDefinitionPreview(definition, resolveAgent),
     nodeRuns: nodeRuns.map(({ completedBy: _completedBy, ...run }) => run),
     approvals,
     takenEdgeIds,
@@ -803,7 +825,30 @@ export function getSidecarSnapshot(limit = 200): SidecarSnapshot {
       launchMode: 'resident',
     }));
 
-  return { version: 1, generatedAt: new Date().toISOString(), runs, tasks: standalone, agentBadges, agentPool };
+  let workflowTemplates: WorkflowTemplatePreview[] = [];
+  let workflowTemplatesError: string | undefined;
+  try {
+    workflowTemplates = listWorkflowTemplates().map(template => ({
+      templateId: template.template_id,
+      templateName: template.template_name,
+      description: template.description,
+      version: template.version,
+      graph: graphDefinitionPreview(template.definition),
+    }));
+  } catch (error) {
+    workflowTemplatesError = error instanceof Error ? error.message : String(error);
+  }
+
+  return {
+    version: 1,
+    generatedAt: new Date().toISOString(),
+    runs,
+    tasks: standalone,
+    agentBadges,
+    agentPool,
+    workflowTemplates,
+    ...(workflowTemplatesError ? { workflowTemplatesError } : {}),
+  };
 }
 
 export function getSidecarRun(taskId: string): RunDetail | null {

@@ -5,63 +5,135 @@ import type {
   GraphWorkflowOutcome,
   GraphWorkflowTemplate,
 } from './models.js';
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { homedir } from 'node:os';
+import { basename, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const reviewTestRelease: GraphWorkflowTemplate = {
-  template_id: 'review-test-release',
-  template_name: '开发 → Review → E2E → 发布复核',
-  description: 'Coder 完成后交 Reviewer；Review/E2E 均可打回 Coder；全部通过后由 Reviewer 执行最终上传流程。',
-  version: 1,
-  definition: {
-    kind: 'graph',
-    version: 1,
-    template_id: 'review-test-release',
-    template_name: '开发 → Review → E2E → 发布复核',
-    entry_node_id: 'implement',
-    nodes: [
-      {
-        node_id: 'implement',
-        title: '实现',
-        assignees: ['$assignee'],
-        action: '完成任务实现与对应回归测试，并提交可供 Review 的结果。',
-        completion: 'all',
-      },
-      {
-        node_id: 'review',
-        title: '代码 Review',
-        assignees: ['role:reviewer'],
-        action: '审查实现、测试和边界；通过或带明确原因打回实现节点。',
-        completion: 'all',
-      },
-      {
-        node_id: 'e2e',
-        title: 'E2E 验证',
-        assignees: ['role:tester'],
-        action: '运行真实 E2E，记录证据；通过或带明确原因打回实现节点。',
-        completion: 'all',
-      },
-      {
-        node_id: 'release-review',
-        title: '发布复核',
-        assignees: ['role:reviewer'],
-        action: '复核 Review 与 E2E 证据；仅在已有发布授权时执行上传/发布流程。',
-        completion: 'all',
-      },
-    ],
-    edges: [
-      { edge_id: 'implement-passed-review', from: 'implement', to: 'review', when: 'passed' },
-      { edge_id: 'review-changes-implement', from: 'review', to: 'implement', when: 'changes_requested' },
-      { edge_id: 'review-passed-e2e', from: 'review', to: 'e2e', when: 'passed' },
-      { edge_id: 'e2e-changes-implement', from: 'e2e', to: 'implement', when: 'changes_requested' },
-      { edge_id: 'e2e-passed-release', from: 'e2e', to: 'release-review', when: 'passed' },
-      { edge_id: 'release-changes-implement', from: 'release-review', to: 'implement', when: 'changes_requested' },
-    ],
-  },
-};
+const STORE_MARKER = '.initialized-v1';
+const TEMPLATE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
-export const BUILTIN_WORKFLOW_TEMPLATES: readonly GraphWorkflowTemplate[] = [reviewTestRelease];
+function bundledTemplatesDir(): string {
+  return fileURLToPath(new URL('../workflows', import.meta.url));
+}
 
-export function getBuiltinWorkflowTemplate(templateId: string): GraphWorkflowTemplate | undefined {
-  return BUILTIN_WORKFLOW_TEMPLATES.find(template => template.template_id === templateId);
+export function workflowTemplatesDir(): string {
+  return process.env.KITTY_HIVE_WORKFLOWS_DIR || join(homedir(), '.kitty-hive', 'workflows');
+}
+
+function atomicWrite(path: string, content: string): void {
+  const temp = `${path}.tmp-${process.pid}-${Date.now()}`;
+  writeFileSync(temp, content, { encoding: 'utf8', mode: 0o600 });
+  renameSync(temp, path);
+}
+
+/** Seed packaged examples exactly once. The marker makes deleting a seeded
+ * template durable instead of silently restoring it on every restart. */
+export function ensureWorkflowTemplateStore(): string {
+  const dir = workflowTemplatesDir();
+  mkdirSync(dir, { recursive: true });
+  const marker = join(dir, STORE_MARKER);
+  if (existsSync(marker)) return dir;
+
+  const bundled = bundledTemplatesDir();
+  if (existsSync(bundled)) {
+    for (const file of readdirSync(bundled).filter(name => name.endsWith('.json')).sort()) {
+      const target = join(dir, basename(file));
+      if (!existsSync(target)) atomicWrite(target, readFileSync(join(bundled, file), 'utf8'));
+    }
+  }
+  atomicWrite(marker, 'Workflow templates initialized by kitty-hive.\n');
+  return dir;
+}
+
+function templatePath(templateId: string): string {
+  if (!TEMPLATE_ID_PATTERN.test(templateId)) {
+    throw new Error(`Invalid workflow template id: ${templateId}`);
+  }
+  return join(ensureWorkflowTemplateStore(), `${templateId}.json`);
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every(item => typeof item === 'string' && item.trim().length > 0);
+}
+
+export function parseWorkflowTemplate(value: unknown): GraphWorkflowTemplate {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Workflow template must be an object');
+  const template = value as Partial<GraphWorkflowTemplate>;
+  if (typeof template.template_id !== 'string' || !TEMPLATE_ID_PATTERN.test(template.template_id)) {
+    throw new Error('Workflow template_id must match /^[a-z0-9][a-z0-9._-]*$/');
+  }
+  if (typeof template.template_name !== 'string' || !template.template_name.trim()) throw new Error('Workflow template_name cannot be empty');
+  if (typeof template.description !== 'string') throw new Error('Workflow description must be a string');
+  if (template.version !== 1) throw new Error('Workflow template version must be 1');
+  if (!isGraphWorkflowDefinition(template.definition)) throw new Error('Workflow definition is not a graph v1 definition');
+  if (template.definition.template_id !== template.template_id) throw new Error('Workflow definition template_id does not match template_id');
+  if (template.definition.template_name !== template.template_name) throw new Error('Workflow definition template_name does not match template_name');
+  validateGraphWorkflow(template.definition);
+  return structuredClone(template as GraphWorkflowTemplate);
+}
+
+function readWorkflowTemplateFile(path: string): GraphWorkflowTemplate {
+  let value: unknown;
+  try {
+    value = JSON.parse(readFileSync(path, 'utf8'));
+  } catch (error) {
+    throw new Error(`Cannot parse workflow template ${basename(path)}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  try {
+    const template = parseWorkflowTemplate(value);
+    if (`${template.template_id}.json` !== basename(path)) {
+      throw new Error(`filename must be ${template.template_id}.json`);
+    }
+    return template;
+  } catch (error) {
+    throw new Error(`Invalid workflow template ${basename(path)}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
+/** Read on every call so CLI edits are hot-reloaded without restarting Hive. */
+export function listWorkflowTemplates(): GraphWorkflowTemplate[] {
+  const dir = ensureWorkflowTemplateStore();
+  return readdirSync(dir)
+    .filter(file => file.endsWith('.json'))
+    .sort()
+    .map(file => readWorkflowTemplateFile(join(dir, file)));
+}
+
+export function getWorkflowTemplate(templateId: string): GraphWorkflowTemplate | undefined {
+  const path = templatePath(templateId);
+  return existsSync(path) ? readWorkflowTemplateFile(path) : undefined;
+}
+
+export function createWorkflowTemplate(value: unknown): GraphWorkflowTemplate {
+  const template = parseWorkflowTemplate(value);
+  const path = templatePath(template.template_id);
+  if (existsSync(path)) throw new Error(`Workflow template already exists: ${template.template_id}`);
+  atomicWrite(path, `${JSON.stringify(template, null, 2)}\n`);
+  return template;
+}
+
+export function updateWorkflowTemplate(templateId: string, value: unknown): GraphWorkflowTemplate {
+  const template = parseWorkflowTemplate(value);
+  if (template.template_id !== templateId) throw new Error(`Workflow template id cannot change (${templateId} → ${template.template_id})`);
+  const path = templatePath(templateId);
+  if (!existsSync(path)) throw new Error(`Workflow template not found: ${templateId}`);
+  atomicWrite(path, `${JSON.stringify(template, null, 2)}\n`);
+  return template;
+}
+
+export function deleteWorkflowTemplate(templateId: string): void {
+  const path = templatePath(templateId);
+  if (!existsSync(path)) throw new Error(`Workflow template not found: ${templateId}`);
+  unlinkSync(path);
 }
 
 export function isGraphWorkflowDefinition(value: unknown): value is GraphWorkflowDefinition {
@@ -88,9 +160,15 @@ export function validateGraphWorkflow(definition: GraphWorkflowDefinition): void
   if (definition.nodes.length === 0) throw new Error('Graph workflow has no nodes');
   const nodeIds = new Set<string>();
   for (const node of definition.nodes) {
+    if (!node || typeof node !== 'object') throw new Error('Graph node must be an object');
+    if (typeof node.node_id !== 'string') throw new Error('Graph node_id must be a string');
     if (!node.node_id.trim()) throw new Error('Graph node_id cannot be empty');
     if (nodeIds.has(node.node_id)) throw new Error(`Duplicate graph node_id: ${node.node_id}`);
-    if (node.assignees.length === 0) throw new Error(`Graph node has no assignees: ${node.node_id}`);
+    if (typeof node.title !== 'string' || !node.title.trim()) throw new Error(`Graph node has no title: ${node.node_id}`);
+    if (!isStringArray(node.assignees)) throw new Error(`Graph node has invalid assignees: ${node.node_id}`);
+    if (typeof node.action !== 'string' || !node.action.trim()) throw new Error(`Graph node has no action: ${node.node_id}`);
+    if (node.completion !== 'all' && node.completion !== 'any') throw new Error(`Graph node has invalid completion: ${node.node_id}`);
+    if (node.gate !== undefined && typeof node.gate !== 'boolean') throw new Error(`Graph node has invalid gate: ${node.node_id}`);
     nodeIds.add(node.node_id);
   }
   if (!nodeIds.has(definition.entry_node_id)) throw new Error(`Entry node not found: ${definition.entry_node_id}`);
@@ -98,6 +176,10 @@ export function validateGraphWorkflow(definition: GraphWorkflowDefinition): void
   const edgeIds = new Set<string>();
   const conditions = new Set<string>();
   for (const edge of definition.edges) {
+    if (!edge || typeof edge !== 'object') throw new Error('Graph edge must be an object');
+    if (typeof edge.edge_id !== 'string' || !edge.edge_id.trim()) throw new Error('Graph edge_id cannot be empty');
+    if (typeof edge.from !== 'string' || typeof edge.to !== 'string') throw new Error(`Graph edge has invalid endpoints: ${edge.edge_id}`);
+    if (!['passed', 'changes_requested', 'failed'].includes(edge.when)) throw new Error(`Graph edge has invalid outcome: ${edge.edge_id}`);
     if (edgeIds.has(edge.edge_id)) throw new Error(`Duplicate graph edge_id: ${edge.edge_id}`);
     if (!nodeIds.has(edge.from)) throw new Error(`Graph edge source not found: ${edge.from}`);
     if (!nodeIds.has(edge.to)) throw new Error(`Graph edge target not found: ${edge.to}`);

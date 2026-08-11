@@ -159,8 +159,8 @@ Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case
 | `hive-task-cancel` | `hive_task_cancel` | Cancel a task (creator only; any non-terminal state) |
 | `hive-tasks` | `hive_tasks` | List your tasks |
 | `hive-check` | `hive_check` | Check task status |
-| `hive-workflow-templates` | `hive_workflow_templates` | List predefined graph workflows |
-| `hive-workflow-start` | `hive_workflow_start` | Explicitly start a predefined graph workflow |
+| `hive-workflow-templates` | `hive_workflow_templates` | List configured JSON graph workflows |
+| `hive-workflow-start` | `hive_workflow_start` | Explicitly start a configured JSON graph workflow |
 | `hive-workflow-node-complete` | `hive_workflow_node_complete` | Complete a graph node with a conditional outcome |
 | `hive-workflow-gate-decide` | `hive_workflow_gate_decide` | Decide a gated graph node (creator only) |
 | `hive-workflow-propose` | `hive_workflow_propose` | Legacy: propose an ad-hoc linear workflow |
@@ -223,9 +223,12 @@ explicit graph: node ──outcome edge──→ node ──→ ... ──→ co
                     └──changes_requested──→ earlier node
 ```
 
-Ordinary tasks start immediately. A predefined graph workflow starts only on
+Ordinary tasks start immediately. A configured graph workflow starts only on
 an explicit request; legacy proposal/numbered-step tools remain for existing
 linear workflows.
+
+Workflow templates are JSON files under `~/.kitty-hive/workflows` and are
+hot-reloaded for new runs. Manage them with `kitty-hive workflow list|get|create|update|delete`.
 
 ## Federation
 
