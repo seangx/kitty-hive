@@ -632,18 +632,17 @@ async function setupAppserver(): Promise<void> {
     console.error('[codex-channel] control server failed to start (set-thread falls back to respawn):', err);
   });
 
-  // 2b. In foreground mode the brief itself must not start a model turn.
-  // Persist it before ready is announced so an attached foreground cannot
-  // race its first user turn ahead of the ownership policy.
+  // 2b. Persist the brief without starting a model turn. Restarting Hive must
+  // restore session availability, not create one inference turn per agent.
+  // Persist before ready so neither an attached foreground nor an incoming
+  // Hive event can race ahead of the identity/event policy.
   const briefText = resumed ? buildRebindText() : buildIntroText();
   const briefKind = resumed ? 'daemon-rebind' : 'daemon-intro';
-  if (HIVE_EVENT_MODE === 'foreground') {
-    const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
-    if (outcome.kind === 'rpc_send_error') {
-      throw new Error(`foreground brief injection failed: ${outcome.error.message}`);
-    }
-    console.error(`[codex-channel] foreground policy persisted without model turn (${briefKind})`);
+  const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
+  if (outcome.kind === 'rpc_send_error') {
+    throw new Error(`session brief injection failed: ${outcome.error.message}`);
   }
+  console.error(`[codex-channel] session policy persisted without model turn (${briefKind})`);
 
   // Announce ready signal back to hive supervisor so kitty-kitty (or any
   // other launcher) can query the (ws_url, thread_id) pair. Also persists
@@ -652,29 +651,6 @@ async function setupAppserver(): Promise<void> {
     console.error('[codex-channel] failed to announce ready to supervisor:', err);
   });
 
-  // Auto mode preserves the autonomous worker behavior: the startup brief is
-  // a fire-and-forget model turn. Foreground mode already persisted the same
-  // policy above and deliberately creates no turn.
-  if (HIVE_EVENT_MODE === 'auto') {
-    void (async () => {
-      try {
-        const outcome = await sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
-        if (outcome.kind !== 'completed') {
-          console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind} — daemon already proceeded`);
-        }
-      } catch (err) {
-        console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err);
-      } finally {
-        await announceBootstrapComplete().catch(err => {
-          console.error('[codex-channel] failed to release supervisor bootstrap slot:', err);
-        });
-      }
-    })();
-  } else {
-    await announceBootstrapComplete().catch(err => {
-      console.error('[codex-channel] failed to release supervisor bootstrap slot:', err);
-    });
-  }
 }
 
 /** Full agent brief injected into a brand-new thread (first spawn, or an
@@ -723,7 +699,7 @@ function buildIntroText(): string {
     `- node-start: finish the graph node and call hive_workflow_node_complete.`,
     `- When done, just stop. The next event will arrive as a new turn.`,
     ``,
-    `Acknowledge readiness briefly, then wait for the first event.`,
+    `This setup item does not require a response. Wait for the first real Hive event.`,
   ].join('\n');
 }
 
@@ -743,13 +719,14 @@ function buildRebindText(): string {
   }
   return [
     `[kitty-hive] daemon restarted — your MCP session is fresh.`,
+    `This notice was persisted without starting a background model turn.`,
     `Call hive_start({ id: "${agentId}" }) again to re-bind your hive identity`,
-    `before handling the next event.`,
+    `when the next real Hive event arrives, before handling that event.`,
     `STALENESS WARNING: any turns completing around this restart may have been`,
     `stuck in-flight since long before it (each event carries a "received:"`,
     `timestamp — compare against the current time). For stale events, catch up`,
     `via hive_inbox and respond to the CURRENT state; do not reply to an old`,
-    `message as if it just arrived. Then wait silently for the next push.`,
+    `message as if it just arrived. Do not respond to this restart notice.`,
   ].join('\n');
 }
 
@@ -793,26 +770,15 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
     historyInjector?.setThreadId(threadId!);
     const briefText = target ? buildRebindText() : buildIntroText();
     const briefKind = target ? 'switch-rebind' : 'switch-intro';
-    if (HIVE_EVENT_MODE === 'foreground') {
-      const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
-      if (outcome.kind === 'rpc_send_error') {
-        return { ok: false, error: `foreground policy injection failed: ${outcome.error.message}` };
-      }
+    const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
+    if (outcome.kind === 'rpc_send_error') {
+      return { ok: false, error: `session policy injection failed: ${outcome.error.message}` };
     }
-    // Re-announce only after the foreground policy is persisted, so the
+    // Re-announce only after the session policy is persisted, so the
     // supervisor snapshot cannot expose a thread that lacks the safety rule.
     await announceReady().catch(err => {
       console.error('[codex-channel] switch: failed to re-announce ready:', err);
     });
-    if (HIVE_EVENT_MODE === 'auto') {
-      void sendTurn(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` })
-        .then((outcome) => {
-          if (outcome.kind !== 'completed') {
-            console.error(`[codex-channel] ${briefKind} turn outcome: ${outcome.kind}`);
-          }
-        })
-        .catch((err) => console.error(`[codex-channel] ${briefKind} turn promise rejected:`, err));
-    }
     return { ok: true, thread_id: threadId! };
   } catch (err: any) {
     return { ok: false, error: String(err?.message || err) };
@@ -884,22 +850,6 @@ async function announceReady(): Promise<void> {
     throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
   }
   console.error(`[codex-channel] announced ready: ws=${appserverWsUrl} thread=${threadId.slice(0, 8)}...`);
-}
-
-/** Tell the supervisor that this daemon's startup-only model work has
- * settled, so another persisted daemon may begin bootstrapping. */
-async function announceBootstrapComplete(): Promise<void> {
-  if (!agentId) return;
-  const adminUrl = ENV_URL.replace(/\/mcp\/?$/, '') + '/admin/codex-daemon-bootstrap-complete';
-  const res = await fetch(adminUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ agent_id: agentId }),
-  });
-  if (!res.ok && res.status !== 202) {
-    throw new Error(`POST ${adminUrl} → ${res.status} ${await res.text().catch(() => '')}`);
-  }
-  console.error('[codex-channel] released supervisor bootstrap slot');
 }
 
 /** Answer a server→client JSON-RPC request from codex app-server. The

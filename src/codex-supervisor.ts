@@ -84,18 +84,18 @@ interface DaemonInfo {
   // reference to a dead DaemonInfo. See markDaemonReady() below.
   healthTimer?: NodeJS.Timeout;
   // Present only for daemons launched through the bounded boot queue. The
-  // slot is released after the daemon's intro/rebind model turn settles, or
-  // earlier if the process exits during bootstrap.
-  releaseBootstrapSlot?: () => void;
-  bootstrapSlotTimer?: NodeJS.Timeout;
+  // slot protects app-server startup and is released as soon as the daemon
+  // announces ready (or earlier if the process exits during startup).
+  releaseStartupSlot?: () => void;
+  startupSlotTimer?: NodeJS.Timeout;
 }
 
 const daemons = new Map<string, DaemonInfo>();
 let shuttingDown = false;
 let supervisorPort = 4123;  // set by startCodexSupervisor
 
-export const CODEX_BOOTSTRAP_CONCURRENCY = 3;
-const CODEX_BOOTSTRAP_SLOT_TIMEOUT_MS = 13 * 60 * 1000;
+export const CODEX_DAEMON_START_CONCURRENCY = 3;
+const CODEX_DAEMON_READY_TIMEOUT_MS = 60 * 1000;
 
 /** Small synchronous concurrency gate used only for the boot-time daemon
  * restore burst. Every item receives an idempotent release callback; the
@@ -275,14 +275,14 @@ function spawnDaemon(
   agentId: string,
   displayName: string,
   restartCount = 0,
-  releaseBootstrapSlot?: () => void,
+  releaseStartupSlot?: () => void,
 ): void {
   if (shuttingDown) {
-    releaseBootstrapSlot?.();
+    releaseStartupSlot?.();
     return;
   }
   if (daemons.has(agentId)) {
-    releaseBootstrapSlot?.();
+    releaseStartupSlot?.();
     return; // already running
   }
 
@@ -293,7 +293,7 @@ function spawnDaemon(
   const eligible = getAgentById(agentId);
   if (!eligible || eligible.tool !== 'codex' || eligible.origin_peer !== '') {
     log('info', `[codex-supervisor] skip spawn for "${displayName}" (${agentId.slice(-12)}): agent deleted / tool changed / now remote`);
-    releaseBootstrapSlot?.();
+    releaseStartupSlot?.();
     return;
   }
 
@@ -302,7 +302,7 @@ function spawnDaemon(
     scriptPath = locateCodexChannelScript();
   } catch (err) {
     log('warn', `[codex-supervisor] ${err}`);
-    releaseBootstrapSlot?.();
+    releaseStartupSlot?.();
     return;
   }
 
@@ -340,7 +340,7 @@ function spawnDaemon(
 
   if (!child.pid) {
     log('warn', `[codex-supervisor] failed to spawn daemon for ${displayName}: no pid`);
-    releaseBootstrapSlot?.();
+    releaseStartupSlot?.();
     return;
   }
 
@@ -349,16 +349,16 @@ function spawnDaemon(
     startedAt: new Date(), restartCount,
     wsUrl: null, threadId: null, appserverPid: null,
     readyAt: null, controlUrl: null,
-    releaseBootstrapSlot,
+    releaseStartupSlot,
   };
   daemons.set(agentId, info);
 
-  if (releaseBootstrapSlot) {
-    info.bootstrapSlotTimer = setTimeout(() => {
-      log('warn', `[codex-supervisor] bootstrap slot timed out for "${displayName}"; releasing queue slot`);
-      releaseDaemonBootstrapSlot(info);
-    }, CODEX_BOOTSTRAP_SLOT_TIMEOUT_MS);
-    info.bootstrapSlotTimer.unref?.();
+  if (releaseStartupSlot) {
+    info.startupSlotTimer = setTimeout(() => {
+      log('warn', `[codex-supervisor] daemon ready timed out for "${displayName}"; releasing startup queue slot`);
+      releaseDaemonStartupSlot(info);
+    }, CODEX_DAEMON_READY_TIMEOUT_MS);
+    info.startupSlotTimer.unref?.();
   }
 
   // Tee daemon output into serve's stderr with a label so user can see what
@@ -377,7 +377,7 @@ function spawnDaemon(
     // handler. This is the supervisor's independent fallback for SIGKILL,
     // abrupt runtime exits, or any failure before channel cleanup completed.
     reapTrackedAppserver(info, 'SIGTERM');
-    releaseDaemonBootstrapSlot(info);
+    releaseDaemonStartupSlot(info);
     daemons.delete(agentId);
     log('info', `[codex-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal}, intentional=${wasIntentional})`);
     if (shuttingDown) return;
@@ -417,9 +417,9 @@ export function startCodexSupervisor(port: number = 4123): void {
   if (agents.length === 0) {
     log('info', '[codex-supervisor] no local tool=codex agents — nothing to spawn at boot');
   } else {
-    log('info', `[codex-supervisor] starting ${agents.length} codex daemon(s) with bootstrap concurrency=${CODEX_BOOTSTRAP_CONCURRENCY}: ${agents.map(a => a.display_name).join(', ')}`);
+    log('info', `[codex-supervisor] starting ${agents.length} codex daemon(s) with app-server startup concurrency=${CODEX_DAEMON_START_CONCURRENCY}: ${agents.map(a => a.display_name).join(', ')}`);
     const bootQueue = new StartupConcurrencyQueue<Agent>(
-      CODEX_BOOTSTRAP_CONCURRENCY,
+      CODEX_DAEMON_START_CONCURRENCY,
       (agent, release) => spawnDaemon(agent.id, agent.display_name, 0, release),
     );
     for (const agent of agents) {
@@ -439,24 +439,14 @@ export function startCodexSupervisor(port: number = 4123): void {
   });
 }
 
-function releaseDaemonBootstrapSlot(info: DaemonInfo): void {
-  if (info.bootstrapSlotTimer) {
-    clearTimeout(info.bootstrapSlotTimer);
-    info.bootstrapSlotTimer = undefined;
+function releaseDaemonStartupSlot(info: DaemonInfo): void {
+  if (info.startupSlotTimer) {
+    clearTimeout(info.startupSlotTimer);
+    info.startupSlotTimer = undefined;
   }
-  const release = info.releaseBootstrapSlot;
-  info.releaseBootstrapSlot = undefined;
+  const release = info.releaseStartupSlot;
+  info.releaseStartupSlot = undefined;
   release?.();
-}
-
-/** Called after the boot-time intro/rebind model turn reaches any terminal
- * outcome. Failures still release the slot: the queue bounds concurrency; it
- * must not turn one failed agent into a global startup deadlock. */
-export function markDaemonBootstrapComplete(agentId: string): boolean {
-  const info = daemons.get(agentId);
-  if (!info || info.intentionalShutdown) return false;
-  releaseDaemonBootstrapSlot(info);
-  return true;
 }
 
 export function stopCodexSupervisor(): Promise<void> {
@@ -570,6 +560,10 @@ export function markDaemonReady(
   info.readyAt = new Date();
   if (controlUrl !== undefined) info.controlUrl = controlUrl;
   if (appserverPid !== undefined) info.appserverPid = appserverPid;
+  // The bounded boot queue protects only process/app-server startup. Session
+  // availability must never wait for a model turn: after ready, Kitty can
+  // attach immediately and the next queued daemon may start.
+  releaseDaemonStartupSlot(info);
   // Persist thread_id so next spawn (after daemon kill / serve restart) can
   // resume the same codex thread instead of starting fresh. Idempotent —
   // setting the same id is a cheap UPDATE.
