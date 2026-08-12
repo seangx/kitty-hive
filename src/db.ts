@@ -2,7 +2,7 @@ import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
-import type { Agent, AgentEventMode, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
+import type { Agent, AgentEventMode, AgentRuntimeScope, Team, TeamMember, TeamEvent, TeamEventType, DMMessage, Task, TaskEvent, TaskEventType } from './models.js';
 import { ulid, generateToken, nowISO } from './utils.js';
 import { buildDMPreview, INBOX_PREVIEW_LEN } from './preview.js';
 import { publishSidecarWake } from './sidecar-events.js';
@@ -189,6 +189,26 @@ export function initDB(dbPath?: string): Database.Database {
   // history without inference, leaving read cursors untouched until the next
   // user-authored foreground turn handles them.
   addColumnIfMissing('agents', 'event_mode', "TEXT NOT NULL DEFAULT 'auto'");
+  // Pool membership is a routing concern, not a runtime concern: disabled
+  // resident agents keep their daemon/session and remain explicitly
+  // addressable, but role:* lookup must not select them automatically.
+  addColumnIfMissing('agents', 'pool_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  // Workflow fresh contexts are ordinary supervised agent rows with a short
+  // runtime lifecycle. Keeping this separate from pool_enabled prevents a
+  // disabled pool agent from unexpectedly losing its resident daemon.
+  addColumnIfMissing('agents', 'runtime_enabled', 'INTEGER NOT NULL DEFAULT 1');
+  addColumnIfMissing('agents', 'parent_agent_id', "TEXT NOT NULL DEFAULT ''");
+  addColumnIfMissing('agents', 'runtime_scope', "TEXT NOT NULL DEFAULT 'resident'");
+  addColumnIfMissing('agents', 'runtime_ref', "TEXT NOT NULL DEFAULT ''");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_runtime_ref
+      ON agents(runtime_ref) WHERE runtime_ref != '';
+  `);
+  // A crash can happen after a workflow reaches a terminal state but before
+  // the in-process retirement callback kills its fresh context. Reconcile
+  // before supervisors boot so those contexts never become resident after a
+  // Hive restart.
+  reconcileWorkflowRuntimeAgents(db);
 
   // Migrate tasks.status CHECK constraint when an older DB lacks
   // 'awaiting_approval' (added in v0.5.6 but the schema migration was missed
@@ -210,6 +230,35 @@ export function initDB(dbPath?: string): Database.Database {
 export function getDB(): Database.Database {
   if (!db) throw new Error('Database not initialized. Call initDB() first.');
   return db;
+}
+
+/** Recover ephemeral runtime lifecycle after an unclean Hive exit. Run-scoped
+ * contexts survive while their task is active. Activation-scoped contexts
+ * survive only when they are still assigned to the task's current graph
+ * node; older loop activations are retired before supervisors boot. */
+function reconcileWorkflowRuntimeAgents(database: Database.Database): void {
+  const agents = database.prepare(
+    "SELECT id, runtime_scope, runtime_ref FROM agents WHERE parent_agent_id != '' AND runtime_enabled = 1",
+  ).all() as Array<{ id: string; runtime_scope: AgentRuntimeScope; runtime_ref: string }>;
+  const retire = database.prepare("UPDATE agents SET runtime_enabled = 0, status = 'offline' WHERE id = ?");
+  for (const agent of agents) {
+    const parts = agent.runtime_ref.split(':');
+    const taskId = parts[0] === 'workflow' ? parts[2] : '';
+    const task = taskId
+      ? database.prepare("SELECT status, workflow_json, current_step FROM tasks WHERE id = ?").get(taskId) as Pick<Task, 'status' | 'workflow_json' | 'current_step'> | undefined
+      : undefined;
+    if (!task || ['completed', 'failed', 'canceled'].includes(task.status)) {
+      retire.run(agent.id);
+      continue;
+    }
+    if (agent.runtime_scope !== 'workflow_activation') continue;
+    let assignedToCurrentNode = false;
+    try {
+      const definition = JSON.parse(task.workflow_json || '{}') as { nodes?: Array<{ assignees?: string[] }> };
+      assignedToCurrentNode = definition.nodes?.[task.current_step - 1]?.assignees?.includes(agent.id) === true;
+    } catch { /* malformed workflow cannot safely retain a runtime */ }
+    if (!assignedToCurrentNode) retire.run(agent.id);
+  }
 }
 
 // --- Persistent push queue ---
@@ -369,6 +418,11 @@ export interface CreateAgentOpts {
   remoteId?: string;
   projectDir?: string;    // working directory hint for codex agents (supervisor cwd)
   eventMode?: AgentEventMode;
+  poolEnabled?: boolean;
+  runtimeEnabled?: boolean;
+  parentAgentId?: string;
+  runtimeScope?: AgentRuntimeScope;
+  runtimeRef?: string;
 }
 
 // Hook: subscribers (e.g. codex-supervisor) get notified after a new agent
@@ -378,9 +432,15 @@ export interface CreateAgentOpts {
 // origin_peer); db.ts just fires the event.
 type AgentCreateListener = (agent: Agent) => void;
 const agentCreateListeners: AgentCreateListener[] = [];
+type AgentRuntimeListener = (agent: Agent) => void;
+const agentRuntimeListeners: AgentRuntimeListener[] = [];
 
 export function onAgentCreated(fn: AgentCreateListener): void {
   agentCreateListeners.push(fn);
+}
+
+export function onAgentRuntimeChanged(fn: AgentRuntimeListener): void {
+  agentRuntimeListeners.push(fn);
 }
 
 function emitAgentCreated(agent: Agent): void {
@@ -412,10 +472,15 @@ export function createAgent(
     project_dir: opts.projectDir || '',
     thread_id: '',
     event_mode: opts.eventMode || 'auto',
+    pool_enabled: opts.poolEnabled === false ? 0 : 1,
+    runtime_enabled: opts.runtimeEnabled === false ? 0 : 1,
+    parent_agent_id: opts.parentAgentId || '',
+    runtime_scope: opts.runtimeScope || 'resident',
+    runtime_ref: opts.runtimeRef || '',
   };
   getDB().prepare(`
-    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir, event_mode)
-    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key, @project_dir, @event_mode)
+    INSERT INTO agents (id, display_name, token, tool, roles, expertise, status, created_at, last_seen, origin_peer, remote_id, external_key, project_dir, event_mode, pool_enabled, runtime_enabled, parent_agent_id, runtime_scope, runtime_ref)
+    VALUES (@id, @display_name, @token, @tool, @roles, @expertise, @status, @created_at, @last_seen, @origin_peer, @remote_id, @external_key, @project_dir, @event_mode, @pool_enabled, @runtime_enabled, @parent_agent_id, @runtime_scope, @runtime_ref)
   `).run(agent);
   emitAgentCreated(agent);
   return agent;
@@ -443,6 +508,46 @@ export function setAgentThreadId(agentId: string, threadId: string): void {
  *  closed value set; keeping this narrow avoids free-form daemon behavior. */
 export function setAgentEventMode(agentId: string, eventMode: AgentEventMode): void {
   getDB().prepare('UPDATE agents SET event_mode = ? WHERE id = ?').run(eventMode, agentId);
+}
+
+/** Enable/disable automatic role routing. Explicit id/name assignment is
+ * intentionally unaffected so operators can keep a resident specialist
+ * available without letting workflows claim it automatically. */
+export function setAgentPoolEnabled(agentId: string, enabled: boolean): void {
+  getDB().prepare('UPDATE agents SET pool_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, agentId);
+}
+
+/** Enable/disable a supervised runtime and notify live supervisors. Used by
+ * ephemeral workflow contexts; resident Pool toggles must not call this. */
+export function setAgentRuntimeEnabled(agentId: string, enabled: boolean): void {
+  getDB().prepare(
+    "UPDATE agents SET runtime_enabled = ?, status = ? WHERE id = ?",
+  ).run(enabled ? 1 : 0, enabled ? 'active' : 'offline', agentId);
+  const emit = () => {
+    const agent = getAgentById(agentId);
+    if (!agent) return;
+    for (const fn of agentRuntimeListeners) {
+      try { fn(agent); } catch (err) {
+        console.error('[db] onAgentRuntimeChanged listener threw:', err);
+      }
+    }
+  };
+  // A workflow execution agent often disables itself from inside the
+  // node-complete MCP call. Give that response time to flush before its
+  // supervisor terminates the daemon/app-server process tree.
+  if (enabled) emit();
+  else setTimeout(emit, 10_000).unref?.();
+}
+
+export function getAgentByRuntimeRef(runtimeRef: string): Agent | undefined {
+  if (!runtimeRef) return undefined;
+  return getDB().prepare('SELECT * FROM agents WHERE runtime_ref = ?').get(runtimeRef) as Agent | undefined;
+}
+
+export function listWorkflowRuntimeAgents(taskId: string): Agent[] {
+  return getDB().prepare(
+    "SELECT * FROM agents WHERE runtime_ref LIKE ? AND parent_agent_id != '' ORDER BY created_at",
+  ).all(`workflow:%:${taskId}:%`) as Agent[];
 }
 
 /** Try to set agent.external_key. Silently no-ops on UNIQUE conflict (another
@@ -508,14 +613,14 @@ export function listAllAgents(activeOnly: boolean = false): Agent[] {
  */
 export function listLocalCodexAgents(): Agent[] {
   return getDB().prepare(
-    "SELECT * FROM agents WHERE tool = 'codex' AND origin_peer = '' ORDER BY display_name"
+    "SELECT * FROM agents WHERE tool = 'codex' AND origin_peer = '' AND runtime_enabled = 1 ORDER BY display_name"
   ).all() as Agent[];
 }
 
 /** Local agents whose persistent runtime is an OpenCode server/session. */
 export function listLocalOpenCodeAgents(): Agent[] {
   return getDB().prepare(
-    "SELECT * FROM agents WHERE tool = 'opencode' AND origin_peer = '' ORDER BY display_name"
+    "SELECT * FROM agents WHERE tool = 'opencode' AND origin_peer = '' AND runtime_enabled = 1 ORDER BY display_name"
   ).all() as Agent[];
 }
 
@@ -542,25 +647,25 @@ export function findAgentByRole(role: string, opts?: { teamId?: string }): Agent
     const teamRolesMatch = d.prepare(`
       SELECT a.* FROM agents a
       JOIN team_members m ON m.agent_id = a.id
-      WHERE m.team_id = ? AND a.roles LIKE ? AND a.status = 'active' AND a.origin_peer = ''
+      WHERE m.team_id = ? AND a.roles LIKE ? AND a.status = 'active' AND a.origin_peer = '' AND a.pool_enabled = 1 AND a.parent_agent_id = ''
       ORDER BY a.last_seen DESC LIMIT 1
     `).get(opts.teamId, r) as Agent | undefined;
     if (teamRolesMatch) return teamRolesMatch;
     const teamNameMatch = d.prepare(`
       SELECT a.* FROM agents a
       JOIN team_members m ON m.agent_id = a.id
-      WHERE m.team_id = ? AND a.display_name LIKE ? AND a.status = 'active' AND a.origin_peer = ''
+      WHERE m.team_id = ? AND a.display_name LIKE ? AND a.status = 'active' AND a.origin_peer = '' AND a.pool_enabled = 1 AND a.parent_agent_id = ''
       ORDER BY a.last_seen DESC LIMIT 1
     `).get(opts.teamId, r) as Agent | undefined;
     if (teamNameMatch) return teamNameMatch;
   }
   // Global fallback. Local agents only — remote placeholders aren't claimable.
   const globalRolesMatch = d.prepare(
-    "SELECT * FROM agents WHERE roles LIKE ? AND status = 'active' AND origin_peer = '' ORDER BY last_seen DESC LIMIT 1"
+    "SELECT * FROM agents WHERE roles LIKE ? AND status = 'active' AND origin_peer = '' AND pool_enabled = 1 AND parent_agent_id = '' ORDER BY last_seen DESC LIMIT 1"
   ).get(r) as Agent | undefined;
   if (globalRolesMatch) return globalRolesMatch;
   return d.prepare(
-    "SELECT * FROM agents WHERE display_name LIKE ? AND status = 'active' AND origin_peer = '' ORDER BY last_seen DESC LIMIT 1"
+    "SELECT * FROM agents WHERE display_name LIKE ? AND status = 'active' AND origin_peer = '' AND pool_enabled = 1 AND parent_agent_id = '' ORDER BY last_seen DESC LIMIT 1"
   ).get(r) as Agent | undefined;
 }
 
@@ -614,17 +719,22 @@ export function resolveAddressee(callerAgentId: string, target: string): Resolve
   if (byId) return { agent: byId, source: 'id' };
 
   // 2) nickname in caller's teams
+  const caller = getAgentById(callerAgentId);
+  const effectiveCallerId = caller?.parent_agent_id || callerAgentId;
   const nickMatches = getDB().prepare(`
     SELECT DISTINCT a.* FROM agents a
     JOIN team_members tm ON tm.agent_id = a.id
     WHERE tm.nickname = ?
       AND tm.team_id IN (SELECT team_id FROM team_members WHERE agent_id = ?)
-  `).all(target, callerAgentId) as Agent[];
+  `).all(target, effectiveCallerId) as Agent[];
   if (nickMatches.length === 1) return { agent: nickMatches[0], source: 'team-nickname' };
   if (nickMatches.length > 1) return { error: `Nickname "${target}" matches multiple agents in your teams. Use agent id instead.` };
 
   // 3) global display_name
-  const nameMatches = getAgentsByName(target);
+  // Runtime/audit identities remain addressable by their exact id, but are
+  // excluded from human-friendly name fallback so they cannot make a stable
+  // resident agent's display name ambiguous over time.
+  const nameMatches = getAgentsByName(target).filter(agent => !agent.parent_agent_id);
   if (nameMatches.length === 1) return { agent: nameMatches[0], source: 'display-name' };
   if (nameMatches.length > 1) return { error: `Display name "${target}" matches multiple agents. Use agent id instead.` };
 
@@ -715,10 +825,12 @@ export function setTeamRules(teamId: string, rules: string): void {
 }
 
 export function getAgentTeams(agentId: string, activeOnly: boolean = true): Team[] {
+  const agent = getAgentById(agentId);
+  const effectiveAgentId = agent?.parent_agent_id || agentId;
   const sql = activeOnly
     ? `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.agent_id = ? AND t.closed_at IS NULL ORDER BY tm.joined_at DESC`
     : `SELECT t.* FROM teams t JOIN team_members tm ON tm.team_id = t.id WHERE tm.agent_id = ? ORDER BY tm.joined_at DESC`;
-  return getDB().prepare(sql).all(agentId) as Team[];
+  return getDB().prepare(sql).all(effectiveAgentId) as Team[];
 }
 
 // --- Team membership ---
@@ -756,7 +868,9 @@ export function renameTeamMember(teamId: string, agentId: string, nickname: stri
 }
 
 export function isTeamMember(teamId: string, agentId: string): boolean {
-  const row = getDB().prepare('SELECT 1 FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, agentId);
+  const agent = getAgentById(agentId);
+  const effectiveAgentId = agent?.parent_agent_id || agentId;
+  const row = getDB().prepare('SELECT 1 FROM team_members WHERE team_id = ? AND agent_id = ?').get(teamId, effectiveAgentId);
   return !!row;
 }
 
@@ -1258,9 +1372,20 @@ export function cleanupStaleTasks(maxAgeDays: number = 7): number {
     "SELECT id FROM tasks WHERE status IN ('completed','failed','canceled') AND completed_at IS NOT NULL AND completed_at < ?"
   ).all(cutoff) as Array<{ id: string }>;
   for (const t of stale) {
+    const runtimeAgents = d.prepare(
+      "SELECT id FROM agents WHERE parent_agent_id != '' AND instr(runtime_ref, ':' || ? || ':') > 0",
+    ).all(t.id) as Array<{ id: string }>;
+    for (const agent of runtimeAgents) {
+      d.prepare('DELETE FROM pending_pushes WHERE agent_id = ?').run(agent.id);
+      d.prepare('DELETE FROM read_cursors WHERE agent_id = ?').run(agent.id);
+    }
     d.prepare('DELETE FROM read_cursors WHERE target_type = ? AND target_id = ?').run('task', t.id);
     d.prepare('DELETE FROM task_events WHERE task_id = ?').run(t.id);
     d.prepare('DELETE FROM tasks WHERE id = ?').run(t.id);
+    // Keep the offline agent row as an audit identity. It may be referenced by
+    // DMs/team events created during the workflow; deleting it here would
+    // either violate FKs or erase useful provenance. Sidecar and supervisors
+    // already filter these rows from normal Pool/runtime views.
   }
   return stale.length;
 }

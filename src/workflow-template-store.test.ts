@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -36,6 +36,7 @@ function template(description = 'first') {
         assignees: ['$assignee'],
         action: 'Implement the task',
         completion: 'all' as const,
+        context: { mode: 'fresh_per_activation' as const },
       }],
       edges: [],
     },
@@ -44,6 +45,13 @@ function template(description = 'first') {
 
 test('seeds packaged JSON once and supports hot CRUD without resurrecting deleted defaults', () => {
   assert.deepEqual(listWorkflowTemplates().map(item => item.template_id), ['review-test-release']);
+  const defaultPath = join(workflowDir, 'review-test-release.json');
+  const legacy = JSON.parse(readFileSync(defaultPath, 'utf8'));
+  for (const node of legacy.definition.nodes) delete node.context;
+  writeFileSync(defaultPath, `${JSON.stringify(legacy, null, 2)}\n`);
+  unlinkSync(join(workflowDir, '.migrated-context-v1'));
+  const migrated = listWorkflowTemplates().find(item => item.template_id === 'review-test-release');
+  assert.equal(migrated?.definition.nodes.find(node => node.node_id === 'review')?.context?.mode, 'fresh_per_activation');
 
   createWorkflowTemplate(template());
   assert.equal(getWorkflowTemplate('custom-review')?.description, 'first');
@@ -60,4 +68,9 @@ test('rejects invalid ids, mismatched updates, and duplicate creates', () => {
   assert.throws(() => createWorkflowTemplate(template()), /already exists/);
   assert.throws(() => getWorkflowTemplate('../escape'), /Invalid workflow template id/);
   assert.throws(() => updateWorkflowTemplate('other-id', template()), /cannot change/);
+  const invalidContext = template() as any;
+  invalidContext.template_id = 'invalid-context';
+  invalidContext.definition.template_id = 'invalid-context';
+  invalidContext.definition.nodes[0].context.mode = 'reuse-maybe';
+  assert.throws(() => createWorkflowTemplate(invalidContext), /invalid context mode/);
 });

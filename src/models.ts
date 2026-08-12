@@ -1,6 +1,12 @@
 export const AGENT_EVENT_MODES = ['auto', 'foreground'] as const;
 export type AgentEventMode = typeof AGENT_EVENT_MODES[number];
 
+export const AGENT_CONTEXT_MODES = ['resident', 'fresh_per_run', 'fresh_per_activation'] as const;
+export type AgentContextMode = typeof AGENT_CONTEXT_MODES[number];
+
+export const AGENT_RUNTIME_SCOPES = ['resident', 'workflow_run', 'workflow_activation'] as const;
+export type AgentRuntimeScope = typeof AGENT_RUNTIME_SCOPES[number];
+
 export interface Agent {
   id: string;
   display_name: string;
@@ -17,6 +23,11 @@ export interface Agent {
   project_dir: string;   // working directory hint (operator-supplied). Persistent Codex/OpenCode supervisors use it as the backend cwd. Empty falls back to serve's cwd.
   thread_id: string;     // persisted conversation id. Codex stores a thread UUID; OpenCode stores a session id. agent.tool disambiguates the value. Empty = first-time spawn.
   event_mode: AgentEventMode; // auto = daemon starts model turns; foreground = persist notifications without background inference.
+  pool_enabled: 0 | 1;   // disabled agents remain manually addressable but are excluded from role:* auto-routing.
+  runtime_enabled: 0 | 1; // controls persistent supervisor lifecycle independently from pool routing.
+  parent_agent_id: string; // non-empty for ephemeral workflow contexts cloned from a resident agent.
+  runtime_scope: AgentRuntimeScope;
+  runtime_ref: string;    // deterministic workflow run/activation key; unique when populated.
 }
 
 export interface Team {
@@ -142,6 +153,13 @@ export interface GraphWorkflowNode {
   action: string;
   completion: 'all' | 'any';
   gate?: boolean;
+  context?: {
+    mode: AgentContextMode;
+  };
+  /** Runtime-only logical assignees. Templates omit this field; an
+   * instantiated run stores it so fresh execution agents may be replaced on
+   * every activation without losing the originally selected pool agents. */
+  base_assignees?: string[];
 }
 
 export interface GraphWorkflowEdge {

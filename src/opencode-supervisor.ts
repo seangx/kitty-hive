@@ -2,7 +2,7 @@ import { execSync, spawn, type ChildProcess } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { getAgentById, listLocalOpenCodeAgents, onAgentCreated, setAgentThreadId } from './db.js';
+import { getAgentById, listLocalOpenCodeAgents, onAgentCreated, onAgentRuntimeChanged, setAgentThreadId } from './db.js';
 import { log } from './log.js';
 import type { Agent } from './models.js';
 
@@ -83,7 +83,7 @@ function snapshot(info: OpenCodeDaemonInfo): OpenCodeDaemonSnapshot {
 function spawnDaemon(agentId: string, displayName: string, restartCount = 0) {
   if (shuttingDown || daemons.has(agentId)) return;
   const eligible = getAgentById(agentId);
-  if (!eligible || eligible.tool !== 'opencode' || eligible.origin_peer !== '') return;
+  if (!eligible || eligible.tool !== 'opencode' || eligible.origin_peer !== '' || eligible.runtime_enabled !== 1) return;
 
   let script: string;
   try {
@@ -142,7 +142,7 @@ function spawnDaemon(agentId: string, displayName: string, restartCount = 0) {
     log('info', `[opencode-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal}, intentional=${intentional})`);
     if (shuttingDown) return;
     const fresh = getAgentById(agentId);
-    if (!fresh || fresh.tool !== 'opencode' || fresh.origin_peer !== '') return;
+    if (!fresh || fresh.tool !== 'opencode' || fresh.origin_peer !== '' || fresh.runtime_enabled !== 1) return;
     const delayMs = intentional ? 0 : Math.min(60_000, 1_000 * Math.pow(2, restartCount));
     const nextCount = intentional ? 0 : restartCount + 1;
     setTimeout(() => spawnDaemon(fresh.id, fresh.display_name, nextCount), delayMs).unref?.();
@@ -159,7 +159,12 @@ export function startOpenCodeSupervisor(port = 4123) {
     for (const agent of agents) spawnDaemon(agent.id, agent.display_name);
   }
   onAgentCreated((agent: Agent) => {
-    if (agent.tool === 'opencode' && agent.origin_peer === '') spawnDaemon(agent.id, agent.display_name);
+    if (agent.tool === 'opencode' && agent.origin_peer === '' && agent.runtime_enabled === 1) spawnDaemon(agent.id, agent.display_name);
+  });
+  onAgentRuntimeChanged((agent: Agent) => {
+    if (agent.tool !== 'opencode' || agent.origin_peer !== '') return;
+    if (agent.runtime_enabled === 1) notifyOpenCodeAgentCreated(agent.id);
+    else notifyOpenCodeAgentRemoved(agent.id);
   });
 }
 
@@ -228,7 +233,7 @@ export function markOpenCodeDaemonReady(input: {
 export function notifyOpenCodeAgentCreated(agentId: string): boolean {
   if (daemons.has(agentId)) return false;
   const agent = getAgentById(agentId);
-  if (!agent || agent.tool !== 'opencode' || agent.origin_peer !== '') return false;
+  if (!agent || agent.tool !== 'opencode' || agent.origin_peer !== '' || agent.runtime_enabled !== 1) return false;
   spawnDaemon(agent.id, agent.display_name);
   return true;
 }

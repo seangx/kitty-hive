@@ -51,3 +51,22 @@ test('workflow CLI performs JSON CRUD against the configured template directory'
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('agent CLI toggles Pool routing without deleting the resident agent', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kitty-hive-agent-pool-cli-'));
+  const dbPath = join(dir, 'hive.db');
+  const env = { ...process.env };
+  const run = (...args: string[]) => spawnSync(process.execPath, [cli, 'agent', ...args, '--db', dbPath], { env, encoding: 'utf8' });
+  try {
+    const registered = run('register', '--key', 'pool-test', '--display-name', 'Pool Reviewer', '--tool', 'codex', '--roles', 'reviewer');
+    assert.equal(registered.status, 0);
+    const agentId = registered.stdout.trim();
+    assert.equal(run('disable', agentId).status, 0);
+    const disabled = run('list');
+    assert.match(disabled.stdout, /disabled/);
+    assert.equal(run('enable', agentId).status, 0);
+    assert.match(run('list').stdout, /enabled/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

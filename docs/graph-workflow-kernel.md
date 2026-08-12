@@ -13,8 +13,8 @@ tasks, but are no longer the default behavior or prompt.
 
 ## Persistence boundary
 
-No database schema is added. A graph definition is stored in the existing
-`tasks.workflow_json` column with the discriminant:
+A graph definition is stored in the existing `tasks.workflow_json` column
+with the discriminant:
 
 ```json
 {
@@ -85,12 +85,37 @@ implement → review → e2e → release-review → success
 ids when the run starts. A later change to pool membership cannot silently
 change an in-flight run.
 
+Each node may additionally declare a runtime context policy:
+
+```json
+"context": { "mode": "fresh_per_activation" }
+```
+
+- `resident` (default) executes on the selected agent's persistent thread.
+- `fresh_per_run` creates one isolated execution identity per workflow run and
+  reuses it when the graph loops back.
+- `fresh_per_activation` creates a new isolated identity on every node
+  activation. It is suitable for independent review passes.
+
+Fresh identities inherit the base agent's tool, roles, expertise, and the
+workflow `workspace_dir` (falling back to the base project directory). They
+are excluded from Pool routing and Sidecar Pool lists, and their runtime is
+retired when its scope ends. The offline row remains as event/message audit
+provenance.
+
 ## Agent Pool boundary
 
-The Sidecar snapshot exposes the real registered local agents as `agentPool`.
-These entries are `launchMode: resident`; their tool, roles, status, expertise,
-and project directory come from Hive's authoritative agent records. On-demand
-profile launch/destruction is intentionally not faked by this kernel.
+The Sidecar snapshot exposes resident local agents as `agentPool`. Entries are
+`launchMode: resident` and include `enabled`. Disabled agents keep their
+resident daemon and remain manually addressable by id/name, but `role:*`
+selection excludes them. Operators can use:
+
+```text
+kitty-hive agent enable <agent>
+kitty-hive agent disable <agent>
+```
+
+Kitty Inspector uses the equivalent loopback-only Pool endpoint.
 
 ## Tools
 

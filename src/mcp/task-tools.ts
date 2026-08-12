@@ -240,6 +240,7 @@ export function registerTaskTools(mcp: McpServer) {
           title: node.title,
           assignees: node.assignees,
           gate: Boolean(node.gate),
+          context: node.context ?? { mode: 'resident' },
         })),
         edges: template.definition.edges,
       }));

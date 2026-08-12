@@ -13,8 +13,8 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
   - `{ version, generatedAt, runs, tasks, agentBadges, agentPool, workflowTemplates }`
   - `runs` contains tasks with `workflow_json`; `tasks` contains standalone
     tasks; `agentBadges` contains only non-terminal work.
-  - `agentPool` contains authoritative local registered agents. Current entries
-    are resident agents; no on-demand launcher is implied.
+  - `agentPool` contains local resident agents. Ephemeral workflow execution
+    identities are omitted. `enabled` controls automatic `role:*` routing.
   - `workflowTemplates` contains a read-only preview of the JSON templates
     currently available to new Hive workflow runs. If a template file is
     invalid, the list is empty and `workflowTemplatesError` explains the
@@ -31,7 +31,8 @@ Base URL: `http://127.0.0.1:4123/admin/sidecar`
   "expertise": "optional",
   "status": "active",
   "projectDir": "/repo",
-  "launchMode": "resident"
+  "launchMode": "resident",
+  "enabled": true
 }
 ```
 
@@ -41,9 +42,29 @@ needs to render `working` versus `idle`.
 
 `workflowTemplates[]` includes `templateId`, `templateName`, `description`,
 `version`, and a graph. Graph nodes include the unresolved assignee hints
-(`$assignee`, `role:reviewer`, etc.), action, completion mode, and gate flag.
-The Sidecar is read-only: operators mutate templates with the
-`kitty-hive workflow` CLI.
+(`$assignee`, `role:reviewer`, or a concrete agent id), action, completion
+mode, gate flag, and `contextMode`:
+
+- `resident`: use the selected agent's current persistent context.
+- `fresh_per_run`: create one isolated context and reuse it for that workflow run.
+- `fresh_per_activation`: create a new isolated context whenever the node is activated.
+
+Fresh contexts are removed from routing immediately when their scope ends,
+then their process is stopped after a short grace period so the completing
+model turn can flush its final response. The offline identity row remains for
+event/message provenance and is never shown as another Pool member.
+
+Templates remain read-only here; operators mutate them with the
+`kitty-hive workflow` CLI. Kitty may toggle Pool routing through the
+loopback-only operator endpoint below. This never stops the resident daemon
+or removes explicit id/name assignment.
+
+```http
+PATCH /admin/sidecar/agents/:agentId/pool
+Content-Type: application/json
+
+{"enabled":false}
+```
 - `GET /runs/:taskId`
   - graph, activation-preserving node runs, approvals, and taken edge ids.
 - `GET /runs/:taskId/events?since=<cursor>`

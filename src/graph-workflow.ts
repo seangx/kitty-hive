@@ -19,6 +19,7 @@ import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const STORE_MARKER = '.initialized-v1';
+const CONTEXT_MIGRATION_MARKER = '.migrated-context-v1';
 const TEMPLATE_ID_PATTERN = /^[a-z0-9][a-z0-9._-]*$/;
 
 function bundledTemplatesDir(): string {
@@ -41,17 +42,42 @@ export function ensureWorkflowTemplateStore(): string {
   const dir = workflowTemplatesDir();
   mkdirSync(dir, { recursive: true });
   const marker = join(dir, STORE_MARKER);
-  if (existsSync(marker)) return dir;
-
-  const bundled = bundledTemplatesDir();
-  if (existsSync(bundled)) {
-    for (const file of readdirSync(bundled).filter(name => name.endsWith('.json')).sort()) {
-      const target = join(dir, basename(file));
-      if (!existsSync(target)) atomicWrite(target, readFileSync(join(bundled, file), 'utf8'));
+  if (!existsSync(marker)) {
+    const bundled = bundledTemplatesDir();
+    if (existsSync(bundled)) {
+      for (const file of readdirSync(bundled).filter(name => name.endsWith('.json')).sort()) {
+        const target = join(dir, basename(file));
+        if (!existsSync(target)) atomicWrite(target, readFileSync(join(bundled, file), 'utf8'));
+      }
     }
+    atomicWrite(marker, 'Workflow templates initialized by kitty-hive.\n');
   }
-  atomicWrite(marker, 'Workflow templates initialized by kitty-hive.\n');
+  migrateBundledTemplateContexts(dir);
   return dir;
+}
+
+/** Upgrade only the exact legacy packaged example. A user-edited or deleted
+ * template is never replaced: the comparison removes context from the new
+ * bundled JSON and requires every other byte-independent JSON value to match
+ * the installed template before writing the upgrade. */
+function migrateBundledTemplateContexts(dir: string): void {
+  const marker = join(dir, CONTEXT_MIGRATION_MARKER);
+  if (existsSync(marker)) return;
+  const filename = 'review-test-release.json';
+  const installedPath = join(dir, filename);
+  const bundledPath = join(bundledTemplatesDir(), filename);
+  if (existsSync(installedPath) && existsSync(bundledPath)) {
+    try {
+      const installed = JSON.parse(readFileSync(installedPath, 'utf8')) as GraphWorkflowTemplate;
+      const current = JSON.parse(readFileSync(bundledPath, 'utf8')) as GraphWorkflowTemplate;
+      const legacyShape = structuredClone(current);
+      for (const node of legacyShape.definition.nodes) delete node.context;
+      if (JSON.stringify(installed) === JSON.stringify(legacyShape)) {
+        atomicWrite(installedPath, `${JSON.stringify(current, null, 2)}\n`);
+      }
+    } catch { /* invalid/custom templates remain untouched and surface via list */ }
+  }
+  atomicWrite(marker, 'Bundled workflow context migration checked.\n');
 }
 
 function templatePath(templateId: string): string {
@@ -169,6 +195,17 @@ export function validateGraphWorkflow(definition: GraphWorkflowDefinition): void
     if (typeof node.action !== 'string' || !node.action.trim()) throw new Error(`Graph node has no action: ${node.node_id}`);
     if (node.completion !== 'all' && node.completion !== 'any') throw new Error(`Graph node has invalid completion: ${node.node_id}`);
     if (node.gate !== undefined && typeof node.gate !== 'boolean') throw new Error(`Graph node has invalid gate: ${node.node_id}`);
+    if (node.context !== undefined) {
+      if (!node.context || typeof node.context !== 'object' || Array.isArray(node.context)) {
+        throw new Error(`Graph node has invalid context: ${node.node_id}`);
+      }
+      if (!['resident', 'fresh_per_run', 'fresh_per_activation'].includes(node.context.mode)) {
+        throw new Error(`Graph node has invalid context mode: ${node.node_id}`);
+      }
+    }
+    if (node.base_assignees !== undefined && !isStringArray(node.base_assignees)) {
+      throw new Error(`Graph node has invalid base_assignees: ${node.node_id}`);
+    }
     nodeIds.add(node.node_id);
   }
   if (!nodeIds.has(definition.entry_node_id)) throw new Error(`Entry node not found: ${definition.entry_node_id}`);

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { startServer, setLogLevel } from './server.js';
-import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents, renameAgent, setAgentEventMode } from './db.js';
+import { initDB, addPeer, listPeers, removePeer, updatePeerExposed, getPeerByName, setPeerNodeName, setPeerStatus, touchPeer, setPeerUrl, createPendingInvite, deletePendingInvite, cleanupExpiredInvites, getNodeState, getDMLog, getAgentById, listAllAgents, getTeamEvents, getTeamByName, getTeamById, getTaskById, getTaskEvents, renameAgent, setAgentEventMode, setAgentPoolEnabled } from './db.js';
 import { pingPeer } from './federation-heartbeat.js';
 import { TunnelManager, findCloudflared } from './tunnel.js';
 import { generateToken } from './utils.js';
@@ -576,6 +576,7 @@ function agentRows(db: ReturnType<typeof initDB>, agents: any[]): string[][] {
       a.display_name,
       a.tool || '-',
       a.status,
+      a.origin_peer ? '-' : a.pool_enabled === 1 ? 'enabled' : 'disabled',
       a.roles || '-',
       teamLabels,
       relativeTime(a.last_seen),
@@ -583,7 +584,7 @@ function agentRows(db: ReturnType<typeof initDB>, agents: any[]): string[][] {
   });
 }
 
-const AGENT_HEADERS = ['ID', 'NAME', 'TOOL', 'STATUS', 'ROLES', 'TEAMS', 'LAST SEEN'];
+const AGENT_HEADERS = ['ID', 'NAME', 'TOOL', 'STATUS', 'POOL', 'ROLES', 'TEAMS', 'LAST SEEN'];
 
 async function cmdStatus() {
   const { port, dbPath } = parseFlags(1);
@@ -603,8 +604,8 @@ async function cmdStatus() {
 
   try {
     const db = initDB(dbPath);
-    const agents = db.prepare("SELECT id, display_name, tool, roles, status, last_seen FROM agents WHERE origin_peer = '' ORDER BY last_seen DESC").all() as any[];
-    const remotes = db.prepare("SELECT id, display_name, tool, roles, status, last_seen, origin_peer FROM agents WHERE origin_peer != '' ORDER BY last_seen DESC").all() as any[];
+    const agents = db.prepare("SELECT id, display_name, tool, roles, status, last_seen, origin_peer, pool_enabled FROM agents WHERE origin_peer = '' AND parent_agent_id = '' ORDER BY last_seen DESC").all() as any[];
+    const remotes = db.prepare("SELECT id, display_name, tool, roles, status, last_seen, origin_peer, pool_enabled FROM agents WHERE origin_peer != '' AND parent_agent_id = '' ORDER BY last_seen DESC").all() as any[];
     const teams = db.prepare("SELECT id, name FROM teams WHERE closed_at IS NULL ORDER BY name").all() as any[];
     const tasks = db.prepare("SELECT count(*) as cnt FROM tasks WHERE status NOT IN ('completed','failed','canceled')").get() as { cnt: number };
     const peers = listPeers();
@@ -1059,6 +1060,31 @@ async function cmdAgentEventMode() {
   console.error('Restart kitty-hive serve to apply the mode to its persistent daemon.');
 }
 
+async function cmdAgentPoolEnabled(enabled: boolean) {
+  const { dbPath } = parseFlags(1);
+  const target = args[2];
+  if (!target) {
+    console.error(`Usage: kitty-hive agent ${enabled ? 'enable' : 'disable'} <name-or-id>`);
+    process.exit(1);
+  }
+  const database = initDB(dbPath);
+  const byId = database.prepare("SELECT * FROM agents WHERE id = ? AND origin_peer = '' AND parent_agent_id = ''").get(target) as any;
+  const matches = byId
+    ? [byId]
+    : database.prepare("SELECT * FROM agents WHERE display_name = ? AND origin_peer = '' AND parent_agent_id = ''").all(target) as any[];
+  if (matches.length === 0) {
+    console.error(`Local resident agent ${JSON.stringify(target)} not found.`);
+    process.exit(1);
+  }
+  if (matches.length > 1) {
+    console.error(`${JSON.stringify(target)} matches ${matches.length} agents. Use agent id to disambiguate.`);
+    process.exit(1);
+  }
+  const agent = matches[0];
+  setAgentPoolEnabled(agent.id, enabled);
+  console.log(`${agent.display_name} (${agent.id}) pool=${enabled ? 'enabled' : 'disabled'}`);
+}
+
 async function cmdAgentRename() {
   const { dbPath } = parseFlags(1);
   const oldName = args[2];
@@ -1114,7 +1140,7 @@ async function cmdAgentRename() {
 async function cmdAgentList() {
   const { dbPath } = parseFlags(1);
   const db = initDB(dbPath);
-  const agents = db.prepare('SELECT id, display_name, tool, roles, status, last_seen FROM agents ORDER BY last_seen DESC').all() as any[];
+  const agents = db.prepare('SELECT id, display_name, tool, roles, status, last_seen, origin_peer, pool_enabled FROM agents WHERE parent_agent_id = \'\' ORDER BY last_seen DESC').all() as any[];
   if (agents.length === 0) {
     console.log('No agents registered.');
     return;
@@ -2649,7 +2675,7 @@ Top-level commands:
   version | --version | -V                   Print version (bare semver on stdout)
 
 Command groups:
-  agent      Manage local agents       (list, rename, remove, register, event-mode)
+  agent      Manage local agents       (list, rename, remove, register, enable, disable, event-mode)
   team       Inspect/maintain teams    (list, transfer)
   workflow   Manage workflow JSON      (list, get, create, update, delete)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
@@ -2679,6 +2705,8 @@ Subcommands:
                                                       Stdout = agent_id (one line). Designed for orchestrator scripts.
                                                       --switch-tool allows changing tool on a key-matched agent
                                                       (claude/codex/opencode morph); daemon is spawned/killed to match.
+  enable <agent>                                      Include a resident agent in role:* Pool routing.
+  disable <agent>                                     Exclude from Pool routing; explicit assignment and its session still work.
   event-mode <agent> <auto|foreground>                Choose background handling or foreground-only unread delivery.
                                                       Restart serve after changing an existing daemon.`);
 }
@@ -2834,6 +2862,8 @@ switch (command) {
   case 'agent':
     switch (args[1]) {
       case 'register': run(cmdAgentRegister); break;
+      case 'enable':   run(() => cmdAgentPoolEnabled(true)); break;
+      case 'disable':  run(() => cmdAgentPoolEnabled(false)); break;
       case 'event-mode': run(cmdAgentEventMode); break;
       case 'remove':   run(cmdAgentRemove);   break;
       case 'rename':   run(cmdAgentRename);   break;

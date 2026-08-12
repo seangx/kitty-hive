@@ -2,7 +2,8 @@ import {
   getAgentById, findAgentByRole, resolveAddressee,
   createTask, getTaskById, updateTaskStatus, setTaskDelegation,
   appendTaskEvent, getTaskEvents, getPeerByName,
-  ensureRemoteAgentByRemoteId,
+  ensureRemoteAgentByRemoteId, createAgent, getAgentByRuntimeRef,
+  listWorkflowRuntimeAgents, setAgentRuntimeEnabled,
 } from '../db.js';
 import { validateTransition, validateWorkflowTransition, shouldAdvanceStep, getRejectTarget } from '../state-machine.js';
 import {
@@ -19,6 +20,7 @@ import type {
   GraphWorkflowNode,
   GraphWorkflowOutcome,
   GraphWorkflowTemplate,
+  AgentContextMode,
   Task,
   TaskEvent,
   TaskStatus,
@@ -517,6 +519,8 @@ export interface GraphWorkflowAction {
   edge_id?: string;
   outcome?: GraphWorkflowOutcome;
   approver?: string;
+  context_mode?: AgentContextMode;
+  context_bindings?: WorkflowContextBinding[];
 }
 
 function resolveWorkflowAssignee(
@@ -543,13 +547,105 @@ function instantiateGraphTemplate(
   sourceTeamId?: string,
 ): GraphWorkflowDefinition {
   const definition = structuredClone(template.definition);
-  definition.nodes = definition.nodes.map(node => ({
-    ...node,
-    assignees: [...new Set(node.assignees.map(reference =>
-      resolveWorkflowAssignee(actorId, reference, primaryAssigneeId, sourceTeamId)))],
-  }));
+  definition.nodes = definition.nodes.map(node => {
+    const baseAssignees = [...new Set(node.assignees.map(reference =>
+      resolveWorkflowAssignee(actorId, reference, primaryAssigneeId, sourceTeamId)))];
+    return { ...node, assignees: baseAssignees, base_assignees: baseAssignees };
+  });
   validateGraphWorkflow(definition);
   return definition;
+}
+
+export interface WorkflowContextBinding {
+  base_agent_id: string;
+  execution_agent_id: string;
+  mode: AgentContextMode;
+  runtime_ref?: string;
+}
+
+function workflowWorkspace(task: Task, baseProjectDir: string): string {
+  try {
+    const input = JSON.parse(task.input_json) as { workspace_dir?: unknown };
+    if (typeof input.workspace_dir === 'string' && input.workspace_dir.trim()) return input.workspace_dir;
+  } catch { /* use the base agent cwd */ }
+  return baseProjectDir;
+}
+
+function workflowRuntimeRef(
+  mode: Exclude<AgentContextMode, 'resident'>,
+  taskId: string,
+  nodeId: string,
+  activation: number,
+  baseAgentId: string,
+): string {
+  return mode === 'fresh_per_run'
+    ? `workflow:run:${taskId}:${baseAgentId}`
+    : `workflow:activation:${taskId}:${nodeId}:${activation}:${baseAgentId}`;
+}
+
+/** Materialize the execution identity for one graph activation. Fresh
+ * contexts are separate supervised agents, so the resident reviewer's TUI,
+ * cwd and thread are never switched underneath the operator. */
+function materializeGraphNode(
+  task: Task,
+  node: GraphWorkflowNode,
+  activation: number,
+): WorkflowContextBinding[] {
+  const mode = node.context?.mode ?? 'resident';
+  const baseAssignees = node.base_assignees ?? node.assignees;
+  const bindings = baseAssignees.map(baseAgentId => {
+    if (mode === 'resident') {
+      return { base_agent_id: baseAgentId, execution_agent_id: baseAgentId, mode };
+    }
+    const base = getAgentById(baseAgentId);
+    if (!base) throw new Error(`Workflow base agent not found: ${baseAgentId}`);
+    if (base.parent_agent_id) throw new Error(`Workflow fresh context cannot clone another runtime agent: ${baseAgentId}`);
+    if (base.tool !== 'codex' && base.tool !== 'opencode') {
+      throw new Error(`Workflow context ${mode} requires a supervised codex/opencode agent (got ${base.tool || 'unknown'} for ${base.display_name})`);
+    }
+    const runtimeRef = workflowRuntimeRef(mode, task.id, node.node_id, activation, base.id);
+    let execution = getAgentByRuntimeRef(runtimeRef);
+    if (!execution) {
+      const suffix = mode === 'fresh_per_run' ? 'run' : `#${activation}`;
+      execution = createAgent(
+        `${base.display_name} · ${node.title} ${suffix}`,
+        base.tool,
+        base.roles,
+        base.expertise,
+        {
+          projectDir: workflowWorkspace(task, base.project_dir),
+          eventMode: 'auto',
+          poolEnabled: false,
+          runtimeEnabled: true,
+          parentAgentId: base.id,
+          runtimeScope: mode === 'fresh_per_run' ? 'workflow_run' : 'workflow_activation',
+          runtimeRef,
+        },
+      );
+    } else if (execution.runtime_enabled !== 1) {
+      setAgentRuntimeEnabled(execution.id, true);
+      execution = getAgentById(execution.id)!;
+    }
+    return {
+      base_agent_id: base.id,
+      execution_agent_id: execution.id,
+      mode,
+      runtime_ref: runtimeRef,
+    };
+  });
+  node.assignees = bindings.map(binding => binding.execution_agent_id);
+  return bindings;
+}
+
+function retireActivationContexts(node: GraphWorkflowNode): void {
+  if (node.context?.mode !== 'fresh_per_activation') return;
+  for (const agentId of node.assignees) setAgentRuntimeEnabled(agentId, false);
+}
+
+function retireRunContexts(taskId: string): void {
+  for (const agent of listWorkflowRuntimeAgents(taskId)) {
+    if (agent.runtime_enabled === 1) setAgentRuntimeEnabled(agent.id, false);
+  }
 }
 
 function resolvePrimaryAssignee(actorId: string, to: string, sourceTeamId?: string): string {
@@ -563,6 +659,21 @@ function resolvePrimaryAssignee(actorId: string, to: string, sourceTeamId?: stri
   return resolved.agent!.id;
 }
 
+function validateGraphContextAgents(definition: GraphWorkflowDefinition): void {
+  for (const node of definition.nodes) {
+    const mode = node.context?.mode ?? 'resident';
+    if (mode === 'resident') continue;
+    for (const agentId of node.base_assignees ?? node.assignees) {
+      const agent = getAgentById(agentId);
+      if (!agent) throw new Error(`Workflow base agent not found: ${agentId}`);
+      if (agent.parent_agent_id) throw new Error(`Workflow fresh context cannot clone another runtime agent: ${agentId}`);
+      if (agent.tool !== 'codex' && agent.tool !== 'opencode') {
+        throw new Error(`Workflow context ${mode} requires a supervised codex/opencode agent (got ${agent.tool || 'unknown'} for ${agent.display_name})`);
+      }
+    }
+  }
+}
+
 export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowStartInput): TaskOutput & { action: GraphWorkflowAction } {
   const actor = getAgentById(actorId);
   if (!actor) throw new Error('Actor not found');
@@ -571,6 +682,7 @@ export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowSt
 
   const primaryAssigneeId = resolvePrimaryAssignee(actorId, input.to, input.source_team_id);
   const definition = instantiateGraphTemplate(actorId, template, primaryAssigneeId, input.source_team_id);
+  validateGraphContextAgents(definition);
   const entryIndex = graphNodeIndex(definition, definition.entry_node_id);
   const entry = graphNodeAt(definition, entryIndex);
   const taskInput = {
@@ -584,6 +696,7 @@ export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowSt
     sourceTeamId: input.source_team_id,
     input: taskInput,
   });
+  const entryBindings = materializeGraphNode(task, entry, 1);
   updateTaskStatus(task.id, 'in_progress', {
     workflow_json: JSON.stringify(definition),
     current_step: entryIndex,
@@ -603,6 +716,9 @@ export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowSt
     node_id: entry.node_id,
     activation: 1,
     assignees: entry.assignees,
+    base_assignees: entry.base_assignees,
+    context_mode: entry.context?.mode ?? 'resident',
+    context_bindings: entryBindings,
   });
 
   const assignee = getAgentById(entry.assignees[0]);
@@ -616,6 +732,8 @@ export function handleGraphWorkflowStart(actorId: string, input: GraphWorkflowSt
       node_id: entry.node_id,
       activation: 1,
       assignees: entry.assignees,
+      context_mode: entry.context?.mode ?? 'resident',
+      context_bindings: entryBindings,
     },
   };
 }
@@ -660,6 +778,7 @@ function startGraphNode(
   const target = graphNodeAt(definition, targetIndex);
   const priorEvents = getTaskEvents(task.id, 0, 10_000);
   const activation = graphActivation(priorEvents, nodeId) + 1;
+  const bindings = materializeGraphNode(task, target, activation);
   appendTaskEvent(task.id, 'edge-taken', null, {
     edge_id: edgeId,
     from: graphNodeAt(definition, task.current_step).node_id,
@@ -669,11 +788,15 @@ function startGraphNode(
   updateTaskStatus(task.id, 'in_progress', {
     current_step: targetIndex,
     assignee_agent_id: target.assignees[0],
+    workflow_json: JSON.stringify(definition),
   });
   appendTaskEvent(task.id, 'node-start', null, {
     node_id: target.node_id,
     activation,
     assignees: target.assignees,
+    base_assignees: target.base_assignees,
+    context_mode: target.context?.mode ?? 'resident',
+    context_bindings: bindings,
   });
   return {
     type: 'node-start',
@@ -682,6 +805,8 @@ function startGraphNode(
     assignees: target.assignees,
     edge_id: edgeId,
     outcome,
+    context_mode: target.context?.mode ?? 'resident',
+    context_bindings: bindings,
   };
 }
 
@@ -699,6 +824,7 @@ function finishOrAdvanceGraph(
   if (outcome === 'passed') {
     updateTaskStatus(task.id, 'completed', { completed_at: completedAt });
     appendTaskEvent(task.id, 'task-complete', null, { result, final_node_id: current.node_id });
+    retireRunContexts(task.id);
     return { type: 'task-complete', node_id: current.node_id, outcome };
   }
   updateTaskStatus(task.id, 'failed', { completed_at: completedAt });
@@ -707,6 +833,7 @@ function finishOrAdvanceGraph(
     final_node_id: current.node_id,
     outcome,
   });
+  retireRunContexts(task.id);
   return { type: 'task-fail', node_id: current.node_id, outcome };
 }
 
@@ -743,6 +870,7 @@ export function handleGraphNodeComplete(
   if (outcome === 'passed') {
     const ready = node.completion === 'any' || completed.size >= node.assignees.length;
     if (!ready) return { type: 'waiting', node_id: node.node_id, activation, assignees: node.assignees, outcome };
+    retireActivationContexts(node);
     if (node.gate) {
       updateTaskStatus(taskId, 'awaiting_approval');
       appendTaskEvent(taskId, 'approval-request', null, {
@@ -759,6 +887,7 @@ export function handleGraphNodeComplete(
       };
     }
   }
+  if (outcome !== 'passed') retireActivationContexts(node);
   return finishOrAdvanceGraph(task, definition, outcome, result);
 }
 
@@ -809,6 +938,7 @@ export function handleTaskCancel(taskId: string, agentId: string, reason?: strin
 
   updateTaskStatus(taskId, 'canceled', { completed_at: new Date().toISOString() });
   appendTaskEvent(taskId, 'task-cancel', agentId, { reason });
+  if (parseGraphWorkflow(task.workflow_json)) retireRunContexts(taskId);
 }
 
 // --- Task: complete (simple, no-workflow path) ---
