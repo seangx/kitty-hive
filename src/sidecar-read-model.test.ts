@@ -27,6 +27,11 @@ function makeAgent(id: string, displayName: string): Agent {
     project_dir: '/tmp/project',
     thread_id: '',
     event_mode: 'foreground',
+    pool_enabled: 1,
+    runtime_enabled: 1,
+    parent_agent_id: '',
+    runtime_scope: 'resident',
+    runtime_ref: '',
   };
 }
 

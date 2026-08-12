@@ -14,6 +14,7 @@ import {
   handleTaskCreate,
 } from './tools/task.js';
 import { getSidecarRun, getSidecarSnapshot } from './sidecar-read-model.js';
+import { createWorkflowTemplate } from './graph-workflow.js';
 import type { GraphWorkflowDefinition } from './models.js';
 
 const workflowDir = mkdtempSync(join(tmpdir(), 'kitty-hive-graph-test-'));
@@ -49,16 +50,35 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
   assert.equal(run.status, 'in_progress');
   assert.equal(run.action.node_id, 'implement');
 
-  assert.equal(handleGraphNodeComplete(run.task_id, coder.id, 'passed').node_id, 'review');
-  assert.equal(handleGraphNodeComplete(run.task_id, reviewer.id, 'changes_requested', 'fix boundary').node_id, 'implement');
-  assert.equal(handleGraphNodeComplete(run.task_id, coder.id, 'passed').node_id, 'review');
-  assert.equal(handleGraphNodeComplete(run.task_id, reviewer.id, 'passed').node_id, 'e2e');
-  assert.equal(handleGraphNodeComplete(run.task_id, tester.id, 'changes_requested', 'browser regression').node_id, 'implement');
-  assert.equal(handleGraphNodeComplete(run.task_id, coder.id, 'passed').node_id, 'review');
-  assert.equal(handleGraphNodeComplete(run.task_id, reviewer.id, 'passed').node_id, 'e2e');
-  assert.equal(handleGraphNodeComplete(run.task_id, tester.id, 'passed').node_id, 'release-review');
-  assert.equal(handleGraphNodeComplete(run.task_id, reviewer.id, 'passed').type, 'task-complete');
+  const review1 = handleGraphNodeComplete(run.task_id, coder.id, 'passed');
+  assert.equal(review1.node_id, 'review');
+  const reviewAgent1 = review1.assignees![0];
+  assert.notEqual(reviewAgent1, reviewer.id);
+  assert.equal(db.getAgentById(reviewAgent1)?.parent_agent_id, reviewer.id);
+  assert.equal(db.getAgentById(reviewAgent1)?.pool_enabled, 0);
+  assert.equal(handleGraphNodeComplete(run.task_id, reviewAgent1, 'changes_requested', 'fix boundary').node_id, 'implement');
+
+  const review2 = handleGraphNodeComplete(run.task_id, coder.id, 'passed');
+  const reviewAgent2 = review2.assignees![0];
+  assert.notEqual(reviewAgent2, reviewAgent1, 'fresh_per_activation must rotate the reviewer context');
+  const e2e1 = handleGraphNodeComplete(run.task_id, reviewAgent2, 'passed');
+  assert.equal(e2e1.node_id, 'e2e');
+  const testerRunAgent = e2e1.assignees![0];
+  assert.notEqual(testerRunAgent, tester.id);
+  assert.equal(db.getAgentById(testerRunAgent)?.parent_agent_id, tester.id);
+  assert.equal(handleGraphNodeComplete(run.task_id, testerRunAgent, 'changes_requested', 'browser regression').node_id, 'implement');
+
+  const review3 = handleGraphNodeComplete(run.task_id, coder.id, 'passed');
+  const reviewAgent3 = review3.assignees![0];
+  const e2e2 = handleGraphNodeComplete(run.task_id, reviewAgent3, 'passed');
+  assert.equal(e2e2.assignees![0], testerRunAgent, 'fresh_per_run must reuse its context after a workflow loop');
+  const release = handleGraphNodeComplete(run.task_id, testerRunAgent, 'passed');
+  assert.equal(release.node_id, 'release-review');
+  const releaseReviewer = release.assignees![0];
+  assert.notEqual(releaseReviewer, reviewAgent3);
+  assert.equal(handleGraphNodeComplete(run.task_id, releaseReviewer, 'passed').type, 'task-complete');
   assert.equal(db.getTaskById(run.task_id)?.status, 'completed');
+  assert.ok(db.listWorkflowRuntimeAgents(run.task_id).every(agent => agent.runtime_enabled === 0));
 
   const detail = getSidecarRun(run.task_id);
   assert.ok(detail);
@@ -82,6 +102,7 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
   const snapshot = getSidecarSnapshot();
   assert.equal(snapshot.agentPool.length, 4);
   assert.ok(snapshot.agentPool.every(agent => agent.launchMode === 'resident'));
+  assert.ok(snapshot.agentPool.every(agent => agent.enabled));
   assert.deepEqual(snapshot.workflowTemplates.map(template => template.templateId), ['review-test-release']);
   const templatePreview = snapshot.workflowTemplates[0];
   assert.ok(templatePreview);
@@ -116,4 +137,58 @@ test('ordinary tasks start immediately while an explicit graph workflow preserve
   const gatedDetail = getSidecarRun(gatedTask.id);
   assert.equal(gatedDetail?.approvals.at(-1)?.status, 'approved');
   assert.equal(gatedDetail?.nodeRuns.at(-1)?.status, 'succeeded');
+});
+
+test('pool disable only affects role routing while concrete workflow assignment remains available', () => {
+  db.initDB(':memory:');
+  const creator = db.createAgent('Creator', 'codex', 'master', '');
+  const coder = db.createAgent('Coder', 'codex', 'coder', '');
+  const reviewer = db.createAgent('Reviewer', 'codex', 'reviewer', '');
+  db.createAgent('Tester', 'codex', 'tester', '');
+
+  db.setAgentPoolEnabled(reviewer.id, false);
+  assert.equal(db.findAgentByRole('reviewer'), undefined);
+  assert.equal(db.getAgentById(reviewer.id)?.runtime_enabled, 1, 'Pool disable must keep the resident runtime alive');
+
+  assert.throws(() => handleGraphWorkflowStart(creator.id, {
+    template_id: 'review-test-release',
+    to: coder.id,
+    title: 'Role routing should reject disabled reviewer',
+  }), /No active agent found for role:reviewer/);
+
+  const explicit = handleTaskCreate(creator.id, { to: reviewer.id, title: 'Manual review' });
+  assert.equal(explicit.assignee?.id, reviewer.id);
+
+  createWorkflowTemplate({
+    template_id: 'explicit-disabled-reviewer',
+    template_name: 'Explicit disabled reviewer',
+    description: 'Concrete assignment bypasses Pool routing',
+    version: 1,
+    definition: {
+      kind: 'graph',
+      version: 1,
+      template_id: 'explicit-disabled-reviewer',
+      template_name: 'Explicit disabled reviewer',
+      entry_node_id: 'review',
+      nodes: [{
+        node_id: 'review',
+        title: 'Review',
+        assignees: [reviewer.id],
+        action: 'Review independently',
+        completion: 'all',
+        context: { mode: 'fresh_per_activation' },
+      }],
+      edges: [],
+    },
+  });
+  const concreteRun = handleGraphWorkflowStart(creator.id, {
+    template_id: 'explicit-disabled-reviewer',
+    to: coder.id,
+    title: 'Explicit disabled reviewer still works',
+  });
+  assert.equal(concreteRun.action.context_bindings?.[0].base_agent_id, reviewer.id);
+  assert.notEqual(concreteRun.action.assignees?.[0], reviewer.id);
+
+  const snapshot = getSidecarSnapshot();
+  assert.equal(snapshot.agentPool.find(agent => agent.agentId === reviewer.id)?.enabled, false);
 });

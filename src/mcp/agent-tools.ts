@@ -233,9 +233,10 @@ export function registerAgentTools(mcp: McpServer) {
       const agents = params.name
         ? getAgentsByName(params.name)
         : listAllAgents(params.active_only ?? false);
-      const result = agents.map(a => ({
+      const result = agents.filter(a => !a.parent_agent_id).map(a => ({
         id: a.id, display_name: a.display_name, roles: a.roles,
         tool: a.tool, status: a.status, last_seen: a.last_seen,
+        pool_enabled: a.origin_peer ? undefined : a.pool_enabled === 1,
       }));
       return { content: [{ type: 'text', text: JSON.stringify(result, null, 2) }] };
     },

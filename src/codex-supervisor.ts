@@ -33,7 +33,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { log } from './log.js';
-import { listLocalCodexAgents, getAgentById, onAgentCreated, setAgentThreadId } from './db.js';
+import { listLocalCodexAgents, getAgentById, onAgentCreated, onAgentRuntimeChanged, setAgentThreadId } from './db.js';
 import type { Agent } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -291,7 +291,7 @@ function spawnDaemon(
   // switched away from codex in that window (claude⇄codex morph via
   // `agent register --switch-tool`), the deferred spawn must not fire.
   const eligible = getAgentById(agentId);
-  if (!eligible || eligible.tool !== 'codex' || eligible.origin_peer !== '') {
+  if (!eligible || eligible.tool !== 'codex' || eligible.origin_peer !== '' || eligible.runtime_enabled !== 1) {
     log('info', `[codex-supervisor] skip spawn for "${displayName}" (${agentId.slice(-12)}): agent deleted / tool changed / now remote`);
     releaseStartupSlot?.();
     return;
@@ -384,7 +384,7 @@ function spawnDaemon(
 
     // Refresh agent record — it may have been removed or modified
     const fresh = getAgentById(agentId);
-    if (!fresh || fresh.tool !== 'codex' || fresh.origin_peer !== '') {
+    if (!fresh || fresh.tool !== 'codex' || fresh.origin_peer !== '' || fresh.runtime_enabled !== 1) {
       log('info', `[codex-supervisor] daemon "${displayName}" no longer eligible for spawn (deleted / tool changed / now remote); not restarting`);
       return;
     }
@@ -432,10 +432,15 @@ export function startCodexSupervisor(port: number = 4123): void {
   // on the fly so the launcher doesn't have to restart serve. Subscribe AFTER
   // initial boot scan so we don't double-spawn the already-spawned set above.
   onAgentCreated((agent: Agent) => {
-    if (agent.tool !== 'codex' || agent.origin_peer !== '') return;
+    if (agent.tool !== 'codex' || agent.origin_peer !== '' || agent.runtime_enabled !== 1) return;
     if (daemons.has(agent.id)) return; // already spawning
     log('info', `[codex-supervisor] new local tool=codex agent registered: "${agent.display_name}" (${agent.id.slice(-12)}) → spawning daemon`);
     spawnDaemon(agent.id, agent.display_name, 0);
+  });
+  onAgentRuntimeChanged((agent: Agent) => {
+    if (agent.tool !== 'codex' || agent.origin_peer !== '') return;
+    if (agent.runtime_enabled === 1) notifyAgentCreated(agent.id);
+    else notifyAgentRemoved(agent.id);
   });
 }
 
@@ -608,7 +613,7 @@ export function markDaemonReady(
 export function notifyAgentCreated(agentId: string): boolean {
   const agent = getAgentById(agentId);
   if (!agent) return false;
-  if (agent.tool !== 'codex' || agent.origin_peer !== '') return false;
+  if (agent.tool !== 'codex' || agent.origin_peer !== '' || agent.runtime_enabled !== 1) return false;
   const existing = daemons.get(agentId);
   if (existing) {
     if (!daemonProjectDirHasDrifted(existing.projectDir, agent.project_dir)) return false;

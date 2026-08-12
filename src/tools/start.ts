@@ -89,7 +89,7 @@ export function handleStart(input: StartInput): StartOutput {
   }
   // 3. name (fuzzy, reuse latest match — local only)
   if (!agent && input.name) {
-    const matches = getAgentsByName(input.name).filter(a => a.origin_peer === '');
+    const matches = getAgentsByName(input.name).filter(a => a.origin_peer === '' && !a.parent_agent_id);
     if (matches.length > 0) {
       agent = matches.sort((a, b) => b.last_seen.localeCompare(a.last_seen))[0];
       matchedVia = 'name';

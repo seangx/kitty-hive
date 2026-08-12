@@ -22,21 +22,24 @@
         "title": "代码 Review",
         "assignees": ["role:reviewer"],
         "action": "审查实现、测试和边界；通过或带明确原因打回实现节点。",
-        "completion": "all"
+        "completion": "all",
+        "context": { "mode": "fresh_per_activation" }
       },
       {
         "node_id": "e2e",
         "title": "E2E 验证",
         "assignees": ["role:tester"],
         "action": "运行真实 E2E，记录证据；通过或带明确原因打回实现节点。",
-        "completion": "all"
+        "completion": "all",
+        "context": { "mode": "fresh_per_run" }
       },
       {
         "node_id": "release-review",
         "title": "发布复核",
         "assignees": ["role:reviewer"],
         "action": "复核 Review 与 E2E 证据；仅在已有发布授权时执行上传/发布流程。",
-        "completion": "all"
+        "completion": "all",
+        "context": { "mode": "fresh_per_activation" }
       }
     ],
     "edges": [

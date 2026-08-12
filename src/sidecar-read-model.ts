@@ -4,6 +4,7 @@ import type {
   Agent,
   GraphWorkflowDefinition,
   GraphWorkflowNode,
+  AgentContextMode,
   Task,
   TaskEvent,
   TaskStatus as HiveTaskStatus,
@@ -28,6 +29,7 @@ export interface TemplateNode {
   action?: string;
   completion?: 'all' | 'any';
   gate?: boolean;
+  contextMode?: AgentContextMode;
   layout?: { x: number; y: number };
 }
 
@@ -52,6 +54,8 @@ export interface NodeRun {
   taskId?: string;
   assigneeName?: string;
   assigneeAgentId?: string;
+  baseAssigneeAgentId?: string;
+  contextMode?: AgentContextMode;
   revision?: number;
   startedAt?: string;
   finishedAt?: string;
@@ -156,6 +160,7 @@ export interface AgentPoolEntry {
   status: Agent['status'];
   projectDir?: string;
   launchMode: 'resident';
+  enabled: boolean;
 }
 
 export interface WorkflowTemplatePreview {
@@ -310,18 +315,20 @@ function graphNodeRunId(taskId: string, nodeId: string, activation: number): str
 
 function resolveGraphAssignees(node: GraphWorkflowNode | undefined, resolveAgent: AgentResolver): { ids: string[]; names: string[] } {
   if (!node) return { ids: [], names: [] };
+  const ids = node.base_assignees ?? node.assignees;
   return {
-    ids: node.assignees,
-    names: node.assignees.map(id => resolveAgent(id)?.display_name ?? id),
+    ids,
+    names: ids.map(id => resolveAgent(id)?.display_name ?? id),
   };
 }
 
 function graphDefinitionPreview(definition: GraphWorkflowDefinition, resolveAgent?: AgentResolver): TemplateGraph {
   return {
     nodes: definition.nodes.map((node, index) => {
+      const concreteIds = node.assignees.filter(reference => reference !== '$assignee' && !reference.startsWith('role:'));
       const assignees = resolveAgent
         ? resolveGraphAssignees(node, resolveAgent)
-        : { ids: [] as string[], names: node.assignees };
+        : { ids: concreteIds, names: node.assignees };
       return {
         nodeId: node.node_id,
         label: node.title,
@@ -330,6 +337,7 @@ function graphDefinitionPreview(definition: GraphWorkflowDefinition, resolveAgen
         action: node.action,
         completion: node.completion,
         gate: Boolean(node.gate),
+        contextMode: node.context?.mode ?? 'resident',
         layout: { x: 28 + index * 122, y: 28 + (index % 2) * 76 },
       };
     }),
@@ -389,15 +397,25 @@ function projectGraphWorkflowRun(
       if (!node) continue;
       const activation = Number(payload.activation) || (activations.get(nodeId) ?? 0) + 1;
       activations.set(nodeId, Math.max(activation, activations.get(nodeId) ?? 0));
-      const assignees = resolveGraphAssignees(node, resolveAgent);
+      const executionIds = Array.isArray(payload.assignees)
+        ? payload.assignees.filter((id): id is string => typeof id === 'string')
+        : node.assignees;
+      const baseIds = Array.isArray(payload.base_assignees)
+        ? payload.base_assignees.filter((id): id is string => typeof id === 'string')
+        : node.base_assignees ?? executionIds;
+      const assigneeNames = baseIds.map(id => resolveAgent(id)?.display_name ?? id);
       nodeRuns.push({
         nodeRunId: graphNodeRunId(task.id, nodeId, activation),
         nodeId,
         activation,
         status: 'running',
         taskId: task.id,
-        assigneeName: assignees.names.join(', ') || undefined,
-        assigneeAgentId: assignees.ids.length === 1 ? assignees.ids[0] : undefined,
+        assigneeName: assigneeNames.join(', ') || undefined,
+        assigneeAgentId: executionIds.length === 1 ? executionIds[0] : undefined,
+        baseAssigneeAgentId: baseIds.length === 1 ? baseIds[0] : undefined,
+        contextMode: ['resident', 'fresh_per_run', 'fresh_per_activation'].includes(String(payload.context_mode))
+          ? payload.context_mode
+          : node.context?.mode ?? 'resident',
         startedAt: event.ts,
         completedBy: new Set(),
       });
@@ -415,7 +433,14 @@ function projectGraphWorkflowRun(
         run.status = 'failed';
         run.finishedAt = event.ts;
       } else {
-        const complete = node.completion === 'any' || run.completedBy.size >= node.assignees.length;
+        const startEvent = events.find(candidate => {
+          if (candidate.type !== 'node-start') return false;
+          const startPayload = parseObject(candidate.payload_json);
+          return startPayload.node_id === nodeId && Number(startPayload.activation) === run.activation;
+        });
+        const startPayload = startEvent ? parseObject(startEvent.payload_json) : {};
+        const required = Array.isArray(startPayload.assignees) ? startPayload.assignees.length : node.assignees.length;
+        const complete = node.completion === 'any' || run.completedBy.size >= required;
         if (complete) {
           run.status = node.gate ? 'waiting_approval' : 'succeeded';
           run.finishedAt = event.ts;
@@ -813,7 +838,7 @@ export function getSidecarSnapshot(limit = 200): SidecarSnapshot {
   }
 
   const agentPool: AgentPoolEntry[] = db.listAllAgents(false)
-    .filter(agent => !agent.origin_peer)
+    .filter(agent => !agent.origin_peer && !agent.parent_agent_id)
     .map(agent => ({
       agentId: agent.id,
       displayName: agent.display_name,
@@ -823,6 +848,7 @@ export function getSidecarSnapshot(limit = 200): SidecarSnapshot {
       status: agent.status,
       projectDir: agent.project_dir || undefined,
       launchMode: 'resident',
+      enabled: agent.pool_enabled === 1,
     }));
 
   let workflowTemplates: WorkflowTemplatePreview[] = [];

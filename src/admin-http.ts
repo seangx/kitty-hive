@@ -122,6 +122,35 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
+  // PATCH /admin/sidecar/agents/:id/pool — local operator control used by
+  // Kitty Inspector. Pool membership only affects automatic role routing;
+  // it never stops the resident agent's daemon or removes manual addressing.
+  const agentPoolMatch = url.pathname.match(/^\/admin\/sidecar\/agents\/([^/]+)\/pool$/);
+  if (agentPoolMatch && req.method === 'PATCH') {
+    try {
+      const agentId = decodeURIComponent(agentPoolMatch[1]);
+      const body = JSON.parse(await readBody(req));
+      if (typeof body.enabled !== 'boolean') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'enabled (boolean) required' }));
+        return;
+      }
+      const agent = db.getAgentById(agentId);
+      if (!agent || agent.origin_peer || agent.parent_agent_id) {
+        res.writeHead(404, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: `local resident agent not found: ${agentId}` }));
+        return;
+      }
+      db.setAgentPoolEnabled(agent.id, body.enabled);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, agent_id: agent.id, enabled: body.enabled }));
+    } catch (err: any) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
+    return;
+  }
+
   // GET /admin/sidecar/events — wake-only local SSE. Payloads never contain
   // derived state; clients must re-read snapshot/detail/events after a wake.
   if (url.pathname === '/admin/sidecar/events' && req.method === 'GET') {
