@@ -86,6 +86,7 @@ export interface RpcTransport {
 
 export interface ThreadResumeParams {
   threadId: string;
+  modelProvider: string;
   cwd: string;
   excludeTurns: true;
 }
@@ -99,6 +100,8 @@ export interface AppServerInitializeParams {
     experimentalApi: true;
   };
 }
+
+export const HIVE_HTTP_MODEL_PROVIDER_ID = 'hive-openai-http';
 
 /** Build arguments for the long-lived Codex app-server owned by Hive.
  *
@@ -119,8 +122,8 @@ export function buildCodexAppServerArgs(
     // to override `model_providers.openai.supports_websockets` makes config
     // loading fail. Define a complete process-local provider instead and
     // select it only for this Hive-owned app-server.
-    '-c', 'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}',
-    '-c', 'model_provider="hive-openai-http"',
+    '-c', `model_providers.${HIVE_HTTP_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}`,
+    '-c', `model_provider=${JSON.stringify(HIVE_HTTP_MODEL_PROVIDER_ID)}`,
     // Keep the CLI override layer transport-complete and bind the app-server
     // to the supervisor that spawned it, not a possibly stale user URL.
     '-c', `mcp_servers.hive.url=${JSON.stringify(hiveMcpUrl)}`,
@@ -172,16 +175,24 @@ export function supervisorProcessIsMissing(
 /** Build resume overrides for a supervised Codex thread.
  *
  * A rollout's original session_meta cwd is immutable, so resuming with only
- * threadId restores that stale cwd and hides project-local skills deployed
- * after the thread was first created. Codex app-server supports cwd as a
- * thread/resume override; always carry the daemon's authoritative project cwd
- * on both boot-time resume and in-process thread switches. `excludeTurns`
+ * threadId restores stale per-rollout settings. In addition to hiding
+ * project-local skills deployed after the thread was first created, an old
+ * built-in `openai` provider re-enables Responses WebSockets even though this
+ * Hive-owned app-server is configured for HTTPS. Codex app-server supports
+ * cwd and modelProvider as thread/resume overrides; always carry the daemon's
+ * authoritative settings on both boot-time resume and in-process thread
+ * switches. `excludeTurns`
  * omits the potentially enormous serialized history from the RPC response;
  * it does not discard the history Codex loads internally for the resumed
  * thread.
  */
 export function buildThreadResumeParams(threadId: string, cwd: string): ThreadResumeParams {
-  return { threadId, cwd, excludeTurns: true };
+  return {
+    threadId,
+    modelProvider: HIVE_HTTP_MODEL_PROVIDER_ID,
+    cwd,
+    excludeTurns: true,
+  };
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {
