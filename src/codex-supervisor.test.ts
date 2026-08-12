@@ -1,7 +1,8 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
-  CODEX_BOOTSTRAP_CONCURRENCY,
+  CODEX_DAEMON_START_CONCURRENCY,
   StartupConcurrencyQueue,
   buildCodexDaemonEnv,
   daemonProjectDirHasDrifted,
@@ -15,14 +16,14 @@ test('boot queue starts only the configured number until slots settle', () => {
   const started: number[] = [];
   const releases = new Map<number, () => void>();
   const queue = new StartupConcurrencyQueue<number>(
-    CODEX_BOOTSTRAP_CONCURRENCY,
+    CODEX_DAEMON_START_CONCURRENCY,
     (item, release) => {
       started.push(item);
       releases.set(item, release);
     },
   );
 
-  for (let item = 1; item <= CODEX_BOOTSTRAP_CONCURRENCY + 2; item += 1) {
+  for (let item = 1; item <= CODEX_DAEMON_START_CONCURRENCY + 2; item += 1) {
     queue.enqueue(item);
   }
 
@@ -38,6 +39,17 @@ test('boot queue starts only the configured number until slots settle', () => {
   releases.get(2)!();
   assert.deepEqual(started, [1, 2, 3, 4]);
   assert.deepEqual(queue.snapshot(), { active: 3, pending: 1 });
+});
+
+test('supervisor releases boot queue capacity when daemon becomes ready', () => {
+  const source = readFileSync(new URL('../src/codex-supervisor.ts', import.meta.url), 'utf8');
+  const readyFunction = source.slice(
+    source.indexOf('export function markDaemonReady('),
+    source.indexOf('/** Called by /admin/notify-agent-created'),
+  );
+
+  assert.match(readyFunction, /releaseDaemonStartupSlot\(info\)/);
+  assert.doesNotMatch(source, /markDaemonBootstrapComplete|codex-daemon-bootstrap-complete/);
 });
 
 test('boot queue rejects invalid concurrency limits', () => {

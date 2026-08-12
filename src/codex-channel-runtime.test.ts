@@ -72,7 +72,7 @@ test('Hive app-server uses HTTPS Responses without changing interactive Codex', 
   );
 });
 
-test('boot and in-process resume paths both use the metadata-only builder', () => {
+test('boot and in-process resume persist policy without starting model turns', () => {
   const channelSource = readFileSync(
     new URL('../codex-channel.ts', import.meta.url),
     'utf8',
@@ -90,11 +90,13 @@ test('boot and in-process resume paths both use the metadata-only builder', () =
   assert.doesNotMatch(channelSource, /thread\?\.turns\?\.length/);
   assert.match(channelSource, /onAppserverFailure\('process', `codex app-server exited/);
   assert.match(channelSource, /onAppserverFailure\('transport', `WebSocket error/);
-  assert.match(
-    channelSource,
-    /finally\s*\{\s*await announceBootstrapComplete\(\)/,
-    'auto-mode bootstrap must release its supervisor queue slot after the turn settles',
+  assert.equal(
+    channelSource.match(/injectHistory\(briefText/g)?.length,
+    2,
+    'boot and in-process switch must both inject the session brief as history',
   );
+  assert.doesNotMatch(channelSource, /sendTurn\(briefText/);
+  assert.doesNotMatch(channelSource, /announceBootstrapComplete|codex-daemon-bootstrap-complete/);
   assert.doesNotMatch(channelSource, /appserver died:/);
 });
 
