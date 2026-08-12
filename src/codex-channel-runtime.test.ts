@@ -17,7 +17,7 @@ function ignoredReason(decision: CodexTerminalDecision): string | undefined {
   return decision.kind === 'ignored' ? decision.reason : undefined;
 }
 
-test('thread resume keeps server-side history without returning serialized turns', () => {
+test('thread resume overrides stale rollout cwd and model transport without returning turns', () => {
   assert.deepEqual(
     buildThreadResumeParams(
       '019fa11b-79eb-79e3-8628-863405bf27de',
@@ -25,6 +25,7 @@ test('thread resume keeps server-side history without returning serialized turns
     ),
     {
       threadId: '019fa11b-79eb-79e3-8628-863405bf27de',
+      modelProvider: 'hive-openai-http',
       cwd: '/Users/example/.kitty-kitty/sessions/e2f81622',
       excludeTurns: true,
     },
