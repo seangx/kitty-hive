@@ -102,6 +102,7 @@ export interface AppServerInitializeParams {
 }
 
 export const HIVE_MODEL_PROVIDER_ID = 'hive-openai';
+export const HIVE_HTTP_MODEL_PROVIDER_ID = 'hive-openai-http';
 export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 1;
 export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 1;
 export const DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT = 160_000;
@@ -161,8 +162,11 @@ export function buildCodexAppServerArgs(
     // Codex 0.145+ reserves the built-in `openai` provider id, so attempting
     // to override `model_providers.openai.supports_websockets` makes config
     // loading fail. Define a complete process-local provider instead and
-    // select it only for this Hive-owned app-server.
+    // select it only for this Hive-owned app-server. Keep a second HTTPS-only
+    // provider for cold-resume compaction: a large thread must not first send
+    // the same full prompt over WS before falling back to HTTP.
     '-c', `model_providers.${HIVE_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=${supportsWebsockets},request_max_retries=${requestMaxRetries},stream_max_retries=${streamMaxRetries},supports_standalone_web_search=true}`,
+    '-c', `model_providers.${HIVE_HTTP_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=${requestMaxRetries},stream_max_retries=${streamMaxRetries},supports_standalone_web_search=true}`,
     '-c', `model_provider=${JSON.stringify(HIVE_MODEL_PROVIDER_ID)}`,
     '-c', `model_auto_compact_token_limit=${autoCompactTokenLimit}`,
     '-c', 'model_auto_compact_token_limit_scope="total"',
@@ -227,10 +231,14 @@ export function supervisorProcessIsMissing(
  * it does not discard the history Codex loads internally for the resumed
  * thread.
  */
-export function buildThreadResumeParams(threadId: string, cwd: string): ThreadResumeParams {
+export function buildThreadResumeParams(
+  threadId: string,
+  cwd: string,
+  modelProvider = HIVE_MODEL_PROVIDER_ID,
+): ThreadResumeParams {
   return {
     threadId,
-    modelProvider: HIVE_MODEL_PROVIDER_ID,
+    modelProvider,
     cwd,
     excludeTurns: true,
   };
@@ -252,7 +260,7 @@ export interface ThreadTokenUsageSnapshot {
 export type PostTurnCompactionOutcome =
   | { kind: 'compacted'; threadId: string; turnId: string; inputTokens: number }
   | { kind: 'failed'; threadId: string; turnId: string; inputTokens: number; status: string }
-  | { kind: 'skipped_no_usage'; threadId: string; turnId: string }
+  | { kind: 'skipped_no_usage'; threadId: string; turnId?: string }
   | { kind: 'skipped_below_threshold'; threadId: string; turnId: string; inputTokens: number }
   | { kind: 'skipped_in_progress'; threadId: string; turnId: string }
   | { kind: 'rpc_error'; threadId: string; turnId: string; inputTokens: number; error: Error }
@@ -264,6 +272,22 @@ interface CompactionWaiter {
   compactionTurnId?: string;
   itemCompleted: boolean;
   terminalCompleted: boolean;
+}
+
+interface UsageWaiter {
+  resolve: (usage: ThreadTokenUsageSnapshot | null) => void;
+  timer: NodeJS.Timeout;
+}
+
+/** Only promote a cold-resumed thread to the WebSocket provider after its
+ * initial full-history risk is known to be bounded. Missing usage and failed
+ * compaction stay on the bootstrap HTTPS provider so availability is fail-open
+ * without paying a duplicate WS-then-HTTPS upload.
+ */
+export function shouldPromoteColdResumeToWebsocket(
+  outcome: PostTurnCompactionOutcome,
+): boolean {
+  return outcome.kind === 'compacted' || outcome.kind === 'skipped_below_threshold';
 }
 
 /** Parse the app-server token notification without trusting its shape.
@@ -324,6 +348,7 @@ export function parseThreadTokenUsage(
  */
 export class PostTurnCompactionCoordinator {
   private readonly latestUsageByThread = new Map<string, ThreadTokenUsageSnapshot>();
+  private readonly usageWaitersByThread = new Map<string, Set<UsageWaiter>>();
   private readonly waitersByThread = new Map<string, CompactionWaiter>();
   private readonly ownedCompactionTurns = new Set<string>();
 
@@ -338,7 +363,17 @@ export class PostTurnCompactionCoordinator {
 
   observeNotification(method: string, params: unknown): boolean {
     const usage = parseThreadTokenUsage(method, params);
-    if (usage) this.latestUsageByThread.set(usage.threadId, usage);
+    if (usage) {
+      this.latestUsageByThread.set(usage.threadId, usage);
+      const usageWaiters = this.usageWaitersByThread.get(usage.threadId);
+      if (usageWaiters) {
+        this.usageWaitersByThread.delete(usage.threadId);
+        for (const waiter of usageWaiters) {
+          clearTimeout(waiter.timer);
+          waiter.resolve(usage);
+        }
+      }
+    }
 
     const p = recordOf(params);
     const item = recordOf(p?.item);
@@ -405,6 +440,28 @@ export class PostTurnCompactionCoordinator {
     if (!usage || usage.turnId !== turnId) {
       return { kind: 'skipped_no_usage', threadId, turnId };
     }
+    return this.compactWithUsage(usage);
+  }
+
+  /** Compact a restored thread before it is exposed to foreground or queued
+   * turns. Codex sends the persisted token snapshot immediately after the
+   * metadata-only thread/resume response, so wait briefly for that ordered
+   * replay instead of reading the full rollout through thread/read.
+   */
+  async compactColdResume(
+    threadId: string,
+    usageTimeoutMs = 2_000,
+  ): Promise<PostTurnCompactionOutcome> {
+    positiveInteger(usageTimeoutMs, 'usageTimeoutMs');
+    const usage = await this.waitForLatestUsage(threadId, usageTimeoutMs);
+    if (!usage) return { kind: 'skipped_no_usage', threadId };
+    return this.compactWithUsage(usage);
+  }
+
+  private async compactWithUsage(
+    usage: ThreadTokenUsageSnapshot,
+  ): Promise<PostTurnCompactionOutcome> {
+    const { threadId, turnId } = usage;
     // Match Codex's configured AutoCompactTokenLimitScope::Total semantics.
     if (usage.totalTokens < this.threshold) {
       return { kind: 'skipped_below_threshold', threadId, turnId, inputTokens: usage.inputTokens };
@@ -481,9 +538,42 @@ export class PostTurnCompactionCoordinator {
 
   clear(): void {
     this.latestUsageByThread.clear();
+    for (const waiters of this.usageWaitersByThread.values()) {
+      for (const waiter of waiters) {
+        clearTimeout(waiter.timer);
+        waiter.resolve(null);
+      }
+    }
+    this.usageWaitersByThread.clear();
     for (const waiter of this.waitersByThread.values()) clearTimeout(waiter.timer);
     this.waitersByThread.clear();
     this.ownedCompactionTurns.clear();
+  }
+
+  private waitForLatestUsage(
+    threadId: string,
+    timeoutMs: number,
+  ): Promise<ThreadTokenUsageSnapshot | null> {
+    const current = this.latestUsageByThread.get(threadId);
+    if (current) return Promise.resolve(current);
+
+    return new Promise((resolve) => {
+      const waiter: UsageWaiter = {
+        resolve,
+        timer: setTimeout(() => {
+          const waiters = this.usageWaitersByThread.get(threadId);
+          waiters?.delete(waiter);
+          if (waiters?.size === 0) this.usageWaitersByThread.delete(threadId);
+          resolve(null);
+        }, timeoutMs),
+      };
+      let waiters = this.usageWaitersByThread.get(threadId);
+      if (!waiters) {
+        waiters = new Set<UsageWaiter>();
+        this.usageWaitersByThread.set(threadId, waiters);
+      }
+      waiters.add(waiter);
+    });
   }
 
   private finishSuccessfulCompactionIfReady(threadId: string, waiter: CompactionWaiter): void {

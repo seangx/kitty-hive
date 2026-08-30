@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   CodexTerminalNotificationTracker,
+  HIVE_HTTP_MODEL_PROVIDER_ID,
   PostTurnCompactionCoordinator,
   TurnTracker,
   buildAppServerInitializeParams,
@@ -11,6 +12,7 @@ import {
   detectResponsesTransportFallback,
   describeWebSocketEvent,
   parseThreadTokenUsage,
+  shouldPromoteColdResumeToWebsocket,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
   type RpcTransport,
@@ -29,6 +31,19 @@ test('thread resume overrides stale rollout cwd and model transport without retu
     {
       threadId: '019fa11b-79eb-79e3-8628-863405bf27de',
       modelProvider: 'hive-openai',
+      cwd: '/Users/example/.kitty-kitty/sessions/e2f81622',
+      excludeTurns: true,
+    },
+  );
+  assert.deepEqual(
+    buildThreadResumeParams(
+      '019fa11b-79eb-79e3-8628-863405bf27de',
+      '/Users/example/.kitty-kitty/sessions/e2f81622',
+      HIVE_HTTP_MODEL_PROVIDER_ID,
+    ),
+    {
+      threadId: '019fa11b-79eb-79e3-8628-863405bf27de',
+      modelProvider: 'hive-openai-http',
       cwd: '/Users/example/.kitty-kitty/sessions/e2f81622',
       excludeTurns: true,
     },
@@ -65,6 +80,8 @@ test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS f
       '-c',
       'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=true,request_max_retries=1,stream_max_retries=1,supports_standalone_web_search=true}',
       '-c',
+      'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=1,stream_max_retries=1,supports_standalone_web_search=true}',
+      '-c',
       'model_provider="hive-openai"',
       '-c',
       'model_auto_compact_token_limit=160000',
@@ -94,6 +111,9 @@ test('Hive app-server transport remains rollback-configurable without reopening 
   );
   assert.ok(args.includes(
     'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=0,stream_max_retries=0,supports_standalone_web_search=true}',
+  ));
+  assert.ok(args.includes(
+    'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=0,stream_max_retries=0,supports_standalone_web_search=true}',
   ));
   assert.ok(args.includes('model_auto_compact_token_limit=120000'));
   assert.ok(args.includes('model_auto_compact_token_limit_scope="total"'));
@@ -233,6 +253,95 @@ test('large completed turns compact before the event queue can continue', async 
   assert.equal(compactor.isOwnedTurn('turn-compact'), false);
 });
 
+test('cold resume waits for persisted usage replay before compacting', async () => {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const compactor = new PostTurnCompactionCoordinator({
+    async call(method, params) {
+      calls.push({ method, params });
+      return {};
+    },
+  }, 160_000, 1000);
+
+  const pending = compactor.compactColdResume('thread-current', 1000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [], 'compact must wait for the post-resume usage replay');
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+    },
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [{
+    method: 'thread/compact/start',
+    params: { threadId: 'thread-current' },
+  }]);
+  compactor.observeNotification('turn/started', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'inProgress' },
+  });
+  compactor.observeNotification('item/completed', {
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    item: { type: 'contextCompaction', id: 'compact-1' },
+  });
+  compactor.observeNotification('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'completed' },
+  });
+  const outcome = await pending;
+  assert.deepEqual(outcome, {
+    kind: 'compacted',
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    inputTokens: 175_000,
+  });
+  assert.equal(shouldPromoteColdResumeToWebsocket(outcome), true);
+});
+
+test('cold resume stays on guarded HTTPS when usage replay is unavailable', async () => {
+  let calls = 0;
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      calls += 1;
+      return {};
+    },
+  }, 160_000, 1000);
+
+  const outcome = await compactor.compactColdResume('thread-current', 5);
+  assert.deepEqual(outcome, {
+    kind: 'skipped_no_usage',
+    threadId: 'thread-current',
+  });
+  assert.equal(calls, 0);
+  assert.equal(shouldPromoteColdResumeToWebsocket(outcome), false);
+});
+
+test('cold resume below threshold may establish a fresh WebSocket baseline', async () => {
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      throw new Error('must not compact');
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-small',
+    tokenUsage: {
+      last: { inputTokens: 80_000, cachedInputTokens: 70_000, totalTokens: 81_000 },
+    },
+  });
+
+  const outcome = await compactor.compactColdResume('thread-current', 5);
+  assert.deepEqual(outcome, {
+    kind: 'skipped_below_threshold',
+    threadId: 'thread-current',
+    turnId: 'turn-small',
+    inputTokens: 80_000,
+  });
+  assert.equal(shouldPromoteColdResumeToWebsocket(outcome), true);
+});
+
 test('post-turn compaction ignores stale or below-threshold usage', async () => {
   let calls = 0;
   const compactor = new PostTurnCompactionCoordinator({
@@ -354,11 +463,15 @@ test('boot and in-process resume persist policy without starting model turns', (
     new URL('../codex-channel.ts', import.meta.url),
     'utf8',
   );
-  const cwdAwareResumeCalls = channelSource.match(
-    /buildThreadResumeParams\([^,]+,\s*CODEX_APPSERVER_CWD\)/g,
-  );
 
-  assert.equal(cwdAwareResumeCalls?.length, 2);
+  assert.match(
+    channelSource,
+    /buildThreadResumeParams\(persistedThreadId,\s*CODEX_APPSERVER_CWD,\s*bootstrapProvider\)/,
+  );
+  assert.match(
+    channelSource,
+    /buildThreadResumeParams\(target,\s*CODEX_APPSERVER_CWD\)/,
+  );
   assert.match(channelSource, /rpcCall\(\s*['"]initialize['"]\s*,\s*buildAppServerInitializeParams\(/);
   assert.doesNotMatch(
     channelSource,
@@ -375,6 +488,27 @@ test('boot and in-process resume persist policy without starting model turns', (
   assert.doesNotMatch(channelSource, /sendTurn\(briefText/);
   assert.doesNotMatch(channelSource, /announceBootstrapComplete|codex-daemon-bootstrap-complete/);
   assert.doesNotMatch(channelSource, /appserver died:/);
+});
+
+test('cold resume compacts on HTTPS before ready and only then promotes to WebSockets', () => {
+  const channelSource = readFileSync(
+    new URL('../codex-channel.ts', import.meta.url),
+    'utf8',
+  );
+  const coordinatorIndex = channelSource.indexOf('postTurnCompactor = new PostTurnCompactionCoordinator');
+  const bootstrapResumeIndex = channelSource.indexOf("buildThreadResumeParams(persistedThreadId, CODEX_APPSERVER_CWD, bootstrapProvider)");
+  const compactIndex = channelSource.indexOf('postTurnCompactor.compactColdResume');
+  const readyIndex = channelSource.indexOf('await announceReady()');
+
+  assert.ok(coordinatorIndex >= 0 && coordinatorIndex < bootstrapResumeIndex);
+  assert.ok(bootstrapResumeIndex < compactIndex && compactIndex < readyIndex);
+  assert.match(channelSource, /bootstrapProvider = CODEX_MODEL_WEBSOCKETS\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
+  assert.match(channelSource, /rpcCall\(['"]thread\/unsubscribe['"], \{ threadId: resumedThreadId \}/);
+  assert.match(
+    channelSource,
+    /buildThreadResumeParams\(resumedThreadId,\s*CODEX_APPSERVER_CWD,\s*HIVE_MODEL_PROVIDER_ID\)/,
+  );
+  assert.doesNotMatch(channelSource, /thread\/read/);
 });
 
 test('WebSocket diagnostics expose nested Undici errors and close details', () => {

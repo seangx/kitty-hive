@@ -415,6 +415,12 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex 流重试预算（默认 `1`；Codex 上游默认 `5`） |
 | `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex 自动压缩阈值（默认 `160000`） |
 
+开启 WebSocket 时，Hive 会先用仅 HTTPS 的引导 provider 恢复持久化 Codex
+线程，并读取 Codex 回放的轻量 token usage。达到压缩阈值的上下文会在 channel
+宣告 ready 前完成压缩；已确认体量安全的线程再重新加载到常规 WebSocket
+provider。若 usage 不可用或压缩失败，本次 daemon 生命周期会继续使用 HTTPS，
+避免先上传一次完整 WS 历史、失败后又通过 HTTPS 重复上传。
+
 **优先级 ID → KEY → NAME**。多个同时给的话，高优先级决定 agent；低优先级值还会用来更新 display_name / 附加 external_key。
 
 ## 外部 orchestrator 接入

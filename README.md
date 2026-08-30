@@ -416,6 +416,14 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
 | `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex auto-compaction threshold (default `160000`) |
 
+When a persisted Codex thread is restored with WebSockets enabled, Hive first
+resumes it on an HTTPS-only bootstrap provider and consumes Codex's lightweight
+persisted token-usage replay. Contexts at or above the compaction threshold are
+compacted before the channel announces ready; bounded contexts are then reloaded
+on the ordinary WebSocket provider. If usage is unavailable or compaction fails,
+the thread remains on HTTPS for that daemon lifetime instead of risking a
+duplicate full-history WS upload followed by HTTPS fallback.
+
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 
 ## External orchestrator integration
