@@ -42,7 +42,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, supervisorProcessIsMissing, type CodexModelTransport, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, supervisorProcessIsMissing, type CodexModelTransport, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -355,6 +355,7 @@ let appserverDeathHandled = false;  // guard so multiple death signals only exit
 let turnTracker: TurnTracker | null = null;
 let terminalNotificationTracker: CodexTerminalNotificationTracker | null = null;
 let historyInjector: HistoryItemInjector | null = null;
+let postTurnCompactor: PostTurnCompactionCoordinator | null = null;
 let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
 let supervisorWatchdog: NodeJS.Timeout | null = null;
@@ -562,12 +563,13 @@ async function setupAppserver(): Promise<void> {
       return;
     }
     if (msg.method) {
-      if (detectResponsesTransportFallback(msg.method, msg.params)) {
+      if (detectResponsesTransportFallback(msg.method, msg.params, threadId ?? undefined)) {
         modelTransport = 'https-fallback';
         console.error(
           `[codex-channel] model transport fallback: thread=${threadId ?? 'unknown'} appserverPid=${appserverProc?.pid ?? 'unknown'} transport=${modelTransport} requestRetries=${CODEX_REQUEST_MAX_RETRIES} streamRetries=${CODEX_STREAM_MAX_RETRIES}`,
         );
       }
+      postTurnCompactor?.observeNotification(msg.method, msg.params);
       const tokenUsage = parseThreadTokenUsage(msg.method, msg.params, threadId ?? undefined);
       if (tokenUsage && tokenUsage.inputTokens >= 100_000) {
         const contextPercent = tokenUsage.contextUtilization == null
@@ -583,7 +585,8 @@ async function setupAppserver(): Promise<void> {
       // an attached remote TUI; only non-daemon turns become Kitty completion
       // notifications.
       const terminalNotice = parseCodexTerminalNotice(msg.method, msg.params);
-      const daemonOwned = turnTracker?.isOwnedTurn(terminalNotice?.turnId) ?? false;
+      const daemonOwned = (turnTracker?.isOwnedTurn(terminalNotice?.turnId) ?? false)
+        || (postTurnCompactor?.isOwnedTurn(terminalNotice?.turnId) ?? false);
       const matched = turnTracker?.handleNotification(msg.method, msg.params) ?? false;
       const terminalDecision = terminalNotificationTracker?.observeNotice(
         terminalNotice,
@@ -599,6 +602,7 @@ async function setupAppserver(): Promise<void> {
       }
       if (terminalNotice && daemonOwned) {
         turnTracker?.releaseOwnedTurn(terminalNotice.turnId);
+        postTurnCompactor?.releaseOwnedTurn(terminalNotice.turnId);
       }
       if (terminalDecision?.kind === 'notify') {
         void notifyKittyCodexTurnCompleted(ENV_KEY, terminalDecision.notice)
@@ -695,6 +699,10 @@ async function setupAppserver(): Promise<void> {
   historyInjector = new HistoryItemInjector(
     { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
     threadId!,
+  );
+  postTurnCompactor = new PostTurnCompactionCoordinator(
+    { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+    CODEX_AUTO_COMPACT_TOKEN_LIMIT,
   );
 
   // 2a. Start the control server (in-process thread switch entry point), then
@@ -833,6 +841,7 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = resumedId;
       threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
+      modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
       console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (metadata-only response)`);
     } else {
       const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
@@ -840,6 +849,7 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = newId;
       threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
+      modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
     }
     turnTracker?.setThreadId(threadId!);
@@ -1138,7 +1148,8 @@ async function processNextEvent() {
     } else if (pushMode === 'appserver') {
       const text = buildEventTurnText(next);
       const eventId = eventDedupKey(next);
-      console.error(`[codex-channel] inject turn (${text.length} chars) eventId=${eventId} into thread ${threadId?.slice(-8)}`);
+      const turnThreadId = threadId;
+      console.error(`[codex-channel] inject turn (${text.length} chars) eventId=${eventId} into thread ${turnThreadId?.slice(-8)}`);
       const outcome = await sendTurn(text, { eventId });
       // TurnOutcome is a closed union — each kind reflects a known terminal
       // state observed at codex's side. We DON'T retry locally on any of
@@ -1148,7 +1159,33 @@ async function processNextEvent() {
       // respawn delivers missed events again.
       switch (outcome.kind) {
         case 'completed':
-          // Normal path. Nothing more to do.
+          // Built-in auto-compaction only runs when the same turn needs
+          // another sampling. If this completed turn is still above the
+          // threshold, compact it now and keep the event queue serialized so
+          // the next Hive event cannot upload the oversized history first.
+          if (turnThreadId && postTurnCompactor) {
+            const compact = await postTurnCompactor.compactAfterTurn(turnThreadId, outcome.turnId);
+            switch (compact.kind) {
+              case 'compacted':
+                console.error(`[codex-channel] post-turn compact completed: thread=${compact.threadId} turn=${compact.turnId} inputTokens=${compact.inputTokens}`);
+                break;
+              case 'rpc_error':
+                console.error(`[codex-channel] post-turn compact start failed: thread=${compact.threadId} turn=${compact.turnId} inputTokens=${compact.inputTokens} error=${compact.error.message}`);
+                break;
+              case 'failed':
+                console.error(`[codex-channel] post-turn compact failed: thread=${compact.threadId} turn=${compact.turnId} inputTokens=${compact.inputTokens} status=${compact.status}`);
+                break;
+              case 'timeout':
+                console.error(`[codex-channel] post-turn compact timed out: thread=${compact.threadId} turn=${compact.turnId} inputTokens=${compact.inputTokens} afterMs=${compact.afterMs}`);
+                break;
+              case 'skipped_in_progress':
+                console.error(`[codex-channel] post-turn compact skipped: thread=${compact.threadId} turn=${compact.turnId} reason=in-progress`);
+                break;
+              case 'skipped_no_usage':
+              case 'skipped_below_threshold':
+                break;
+            }
+          }
           break;
         case 'failed':
           console.error(`[codex-channel] turn failed on codex (turnId=${outcome.turnId} willRetry=${outcome.willRetry}): ${JSON.stringify(outcome.error)}`);
@@ -1317,6 +1354,8 @@ function cleanupAppserver() {
   turnTracker = null;
   terminalNotificationTracker = null;
   historyInjector = null;
+  postTurnCompactor?.clear();
+  postTurnCompactor = null;
   threadId = null;
   threadRolloutPath = null;
   modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
