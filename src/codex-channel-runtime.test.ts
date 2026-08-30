@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import test from 'node:test';
 import {
   CodexTerminalNotificationTracker,
@@ -11,7 +13,9 @@ import {
   buildThreadResumeParams,
   detectResponsesTransportFallback,
   describeWebSocketEvent,
+  inspectPersistedRolloutRisk,
   parseThreadTokenUsage,
+  promoteColdResumeProvider,
   shouldPromoteColdResumeToWebsocket,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
@@ -262,7 +266,7 @@ test('cold resume waits for persisted usage replay before compacting', async () 
     },
   }, 160_000, 1000);
 
-  const pending = compactor.compactColdResume('thread-current', 1000);
+  const pending = compactor.compactColdResume('thread-current', { usageTimeoutMs: 1000 });
   await new Promise<void>((resolve) => setImmediate(resolve));
   assert.deepEqual(calls, [], 'compact must wait for the post-resume usage replay');
   compactor.observeNotification('thread/tokenUsage/updated', {
@@ -309,7 +313,7 @@ test('cold resume stays on guarded HTTPS when usage replay is unavailable', asyn
     },
   }, 160_000, 1000);
 
-  const outcome = await compactor.compactColdResume('thread-current', 5);
+  const outcome = await compactor.compactColdResume('thread-current', { usageTimeoutMs: 5 });
   assert.deepEqual(outcome, {
     kind: 'skipped_no_usage',
     threadId: 'thread-current',
@@ -332,7 +336,7 @@ test('cold resume below threshold may establish a fresh WebSocket baseline', asy
     },
   });
 
-  const outcome = await compactor.compactColdResume('thread-current', 5);
+  const outcome = await compactor.compactColdResume('thread-current', { usageTimeoutMs: 5 });
   assert.deepEqual(outcome, {
     kind: 'skipped_below_threshold',
     threadId: 'thread-current',
@@ -340,6 +344,263 @@ test('cold resume below threshold may establish a fresh WebSocket baseline', asy
     inputTokens: 80_000,
   });
   assert.equal(shouldPromoteColdResumeToWebsocket(outcome), true);
+});
+
+test('legacy excludeTurns resume recovers token usage from a bounded rollout tail', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kitty-hive-rollout-'));
+  const path = join(dir, 'rollout.jsonl');
+  try {
+    writeFileSync(path, [
+      JSON.stringify({ type: 'session_meta', payload: { id: 'thread-legacy' } }),
+      JSON.stringify({
+        timestamp: '2026-08-30T01:02:03.000Z',
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          info: {
+            last_token_usage: {
+              input_tokens: 175_000,
+              cached_input_tokens: 160_000,
+              total_tokens: 176_000,
+            },
+            model_context_window: 250_000,
+          },
+        },
+      }),
+      JSON.stringify({ type: 'event_msg', payload: { type: 'task_complete' } }),
+      '',
+    ].join('\n'));
+
+    const risk = inspectPersistedRolloutRisk(path, 'thread-legacy', {
+      maxScanBytes: 64 * 1024,
+      oversizedGuardBytes: 1024 * 1024,
+    });
+    assert.equal(risk.kind, 'usage');
+    if (risk.kind !== 'usage') return;
+    assert.deepEqual(risk.usage, {
+      threadId: 'thread-legacy',
+      turnId: 'persisted-rollout:2026-08-30T01:02:03.000Z',
+      inputTokens: 175_000,
+      cachedInputTokens: 160_000,
+      totalTokens: 176_000,
+      modelContextWindow: 250_000,
+      contextUtilization: 0.7,
+      approximateTokenTextBytes: 700_000,
+    });
+    assert.ok(risk.scannedBytes <= 64 * 1024);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('large legacy rollout without tail usage activates the HTTPS size guard', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'kitty-hive-rollout-'));
+  const path = join(dir, 'rollout.jsonl');
+  try {
+    writeFileSync(path, `${'x'.repeat(128)}\n`);
+    const risk = inspectPersistedRolloutRisk(path, 'thread-legacy', {
+      maxScanBytes: 32,
+      oversizedGuardBytes: 64,
+    });
+    assert.equal(risk.kind, 'oversized');
+    if (risk.kind !== 'oversized') return;
+    assert.equal(risk.rolloutBytes, 129);
+    assert.equal(risk.scannedBytes, 32);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('paginated live usage wins over a stale legacy rollout fallback', async () => {
+  let calls = 0;
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      calls += 1;
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-live-small',
+    tokenUsage: {
+      last: { inputTokens: 80_000, cachedInputTokens: 70_000, totalTokens: 81_000 },
+    },
+  });
+
+  const outcome = await compactor.compactColdResume('thread-current', {
+    usageTimeoutMs: 5,
+    fallbackUsage: {
+      threadId: 'thread-current',
+      turnId: 'persisted-rollout:stale',
+      inputTokens: 200_000,
+      cachedInputTokens: 190_000,
+      totalTokens: 201_000,
+      modelContextWindow: null,
+      contextUtilization: null,
+      approximateTokenTextBytes: 800_000,
+    },
+  });
+  assert.deepEqual(outcome, {
+    kind: 'skipped_below_threshold',
+    threadId: 'thread-current',
+    turnId: 'turn-live-small',
+    inputTokens: 80_000,
+  });
+  assert.equal(calls, 0);
+});
+
+test('in-process cold resume can discard usage from an earlier subscription', async () => {
+  let calls = 0;
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      calls += 1;
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-returning',
+    turnId: 'turn-old-large',
+    tokenUsage: {
+      last: { inputTokens: 200_000, cachedInputTokens: 190_000, totalTokens: 201_000 },
+    },
+  });
+
+  compactor.forgetThreadUsage('thread-returning');
+  const pending = compactor.compactColdResume('thread-returning', { usageTimeoutMs: 1000 });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(calls, 0, 'stale usage must not start a compaction');
+
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-returning',
+    turnId: 'turn-replayed-small',
+    tokenUsage: {
+      last: { inputTokens: 80_000, cachedInputTokens: 70_000, totalTokens: 81_000 },
+    },
+  });
+  assert.deepEqual(await pending, {
+    kind: 'skipped_below_threshold',
+    threadId: 'thread-returning',
+    turnId: 'turn-replayed-small',
+    inputTokens: 80_000,
+  });
+  assert.equal(calls, 0);
+});
+
+test('oversized unknown rollout compacts on HTTPS within the cold-start SLA', async () => {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const compactor = new PostTurnCompactionCoordinator({
+    async call(method, params) {
+      calls.push({ method, params });
+      return {};
+    },
+  }, 160_000, 1000);
+  const pending = compactor.compactColdResume('thread-current', {
+    usageTimeoutMs: 5,
+    completionTimeoutMs: 1000,
+    forceCompactRolloutBytes: 70 * 1024 * 1024,
+  });
+  await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  assert.deepEqual(calls, [{
+    method: 'thread/compact/start',
+    params: { threadId: 'thread-current' },
+  }]);
+  compactor.observeNotification('turn/started', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'inProgress' },
+  });
+  compactor.observeNotification('item/completed', {
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    item: { type: 'contextCompaction', id: 'compact-1' },
+  });
+  compactor.observeNotification('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'completed' },
+  });
+  assert.deepEqual(await pending, {
+    kind: 'compacted',
+    threadId: 'thread-current',
+    turnId: 'persisted-rollout:size-guard',
+    inputTokens: null,
+    rolloutBytes: 70 * 1024 * 1024,
+  });
+});
+
+test('cold-resume provider promotion is successful only after a confirmed resume', async () => {
+  const calls: Array<{ method: string; params: any }> = [];
+  const outcome = await promoteColdResumeProvider({
+    async call(method, params) {
+      calls.push({ method, params });
+      if (method === 'thread/resume') {
+        return { thread: { id: 'thread-current' }, modelProvider: 'hive-openai' };
+      }
+      return { status: 'unsubscribed' };
+    },
+  }, 'thread-current', '/workspace', (response: any, expectedProvider) => {
+    assert.equal(response.thread.id, 'thread-current');
+    assert.equal(response.modelProvider, expectedProvider);
+  }, 1000);
+
+  assert.deepEqual(outcome, { kind: 'promoted_websocket' });
+  assert.deepEqual(calls.map((call) => call.method), ['thread/unsubscribe', 'thread/resume']);
+  assert.equal(calls[1]?.params.modelProvider, 'hive-openai');
+});
+
+test('response-uncertain WS promotion unsubscribes again before restoring HTTPS', async () => {
+  const calls: Array<{ method: string; params: any }> = [];
+  let resumeCount = 0;
+  const outcome = await promoteColdResumeProvider({
+    async call(method, params) {
+      calls.push({ method, params });
+      if (method !== 'thread/resume') return { status: 'unsubscribed' };
+      resumeCount += 1;
+      if (resumeCount === 1) throw new Error('response lost after server accepted resume');
+      return { thread: { id: 'thread-current' }, modelProvider: 'hive-openai-http' };
+    },
+  }, 'thread-current', '/workspace', (response: any, expectedProvider) => {
+    assert.equal(response.thread.id, 'thread-current');
+    assert.equal(response.modelProvider, expectedProvider);
+  }, 1000);
+
+  assert.equal(outcome.kind, 'retained_https');
+  assert.deepEqual(calls.map((call) => call.method), [
+    'thread/unsubscribe',
+    'thread/resume',
+    'thread/unsubscribe',
+    'thread/resume',
+  ]);
+  assert.equal(calls[1]?.params.modelProvider, 'hive-openai');
+  assert.equal(calls[3]?.params.modelProvider, 'hive-openai-http');
+});
+
+test('uncertain promotion requests a clean HTTPS restart when repair cannot be proved', async () => {
+  let callCount = 0;
+  const outcome = await promoteColdResumeProvider({
+    async call(method) {
+      callCount += 1;
+      if (callCount === 1) return { status: 'unsubscribed' };
+      if (method === 'thread/resume') throw new Error('promotion response lost');
+      throw new Error('repair unsubscribe timed out');
+    },
+  }, 'thread-current', '/workspace', () => {}, 1000);
+
+  assert.equal(outcome.kind, 'restart_https');
+  if (outcome.kind !== 'restart_https') return;
+  assert.equal(outcome.stage, 'repair_unsubscribe');
+  assert.match(outcome.error.message, /repair unsubscribe timed out/);
+});
+
+test('promotion rejects an unrecognized unsubscribe response as uncertain state', async () => {
+  const outcome = await promoteColdResumeProvider({
+    async call() {
+      return { status: 'future-status' };
+    },
+  }, 'thread-current', '/workspace', () => {}, 1000);
+
+  assert.equal(outcome.kind, 'restart_https');
+  if (outcome.kind !== 'restart_https') return;
+  assert.equal(outcome.stage, 'initial_unsubscribe');
+  assert.match(outcome.error.message, /unrecognized status/);
 });
 
 test('post-turn compaction ignores stale or below-threshold usage', async () => {
@@ -466,11 +727,11 @@ test('boot and in-process resume persist policy without starting model turns', (
 
   assert.match(
     channelSource,
-    /buildThreadResumeParams\(persistedThreadId,\s*CODEX_APPSERVER_CWD,\s*bootstrapProvider\)/,
+    /resumePersistedThreadGuarded\(persistedThreadId,\s*appserverModelWebsockets\)/,
   );
   assert.match(
     channelSource,
-    /buildThreadResumeParams\(target,\s*CODEX_APPSERVER_CWD\)/,
+    /resumePersistedThreadGuarded\(target,\s*appserverModelWebsockets\)/,
   );
   assert.match(channelSource, /rpcCall\(\s*['"]initialize['"]\s*,\s*buildAppServerInitializeParams\(/);
   assert.doesNotMatch(
@@ -496,18 +757,19 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
     'utf8',
   );
   const coordinatorIndex = channelSource.indexOf('postTurnCompactor = new PostTurnCompactionCoordinator');
-  const bootstrapResumeIndex = channelSource.indexOf("buildThreadResumeParams(persistedThreadId, CODEX_APPSERVER_CWD, bootstrapProvider)");
-  const compactIndex = channelSource.indexOf('postTurnCompactor.compactColdResume');
+  const guardedResumeIndex = channelSource.indexOf('await resumePersistedThreadGuarded(persistedThreadId, appserverModelWebsockets)');
   const readyIndex = channelSource.indexOf('await announceReady()');
+  const forgetUsageIndex = channelSource.indexOf('postTurnCompactor?.forgetThreadUsage(persistedThreadId)');
+  const bootstrapResumeIndex = channelSource.indexOf("rpcCall(\n      'thread/resume',", forgetUsageIndex);
 
-  assert.ok(coordinatorIndex >= 0 && coordinatorIndex < bootstrapResumeIndex);
-  assert.ok(bootstrapResumeIndex < compactIndex && compactIndex < readyIndex);
-  assert.match(channelSource, /bootstrapProvider = CODEX_MODEL_WEBSOCKETS\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
-  assert.match(channelSource, /rpcCall\(['"]thread\/unsubscribe['"], \{ threadId: resumedThreadId \}/);
-  assert.match(
-    channelSource,
-    /buildThreadResumeParams\(resumedThreadId,\s*CODEX_APPSERVER_CWD,\s*HIVE_MODEL_PROVIDER_ID\)/,
-  );
+  assert.ok(coordinatorIndex >= 0 && coordinatorIndex < guardedResumeIndex);
+  assert.ok(guardedResumeIndex < readyIndex);
+  assert.ok(forgetUsageIndex >= 0 && forgetUsageIndex < bootstrapResumeIndex);
+  assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
+  assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
+  assert.match(channelSource, /promoteColdResumeProvider\(/);
+  assert.match(channelSource, /setupAppserver\(\{ forceHttps: true \}\)/);
+  assert.match(channelSource, /generation !== appserverGeneration/);
   assert.doesNotMatch(channelSource, /thread\/read/);
 });
 

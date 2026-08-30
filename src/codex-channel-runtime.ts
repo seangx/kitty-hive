@@ -43,6 +43,7 @@
  *     duplicated turn from a user's codex thread.
  */
 
+import { closeSync, openSync, readSync, statSync } from 'node:fs';
 import type { PushIdentity, PushDeliveryReason } from './push-delivery.js';
 
 export interface CodexTurn {
@@ -106,6 +107,10 @@ export const HIVE_HTTP_MODEL_PROVIDER_ID = 'hive-openai-http';
 export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 1;
 export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 1;
 export const DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT = 160_000;
+export const DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS = 2_000;
+export const DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS = 60_000;
+export const DEFAULT_HIVE_COLD_RESUME_TAIL_SCAN_BYTES = 8 * 1024 * 1024;
+export const DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES = 64 * 1024 * 1024;
 
 export interface CodexAppServerModelOptions {
   supportsWebsockets?: boolean;
@@ -244,6 +249,91 @@ export function buildThreadResumeParams(
   };
 }
 
+export type ColdResumePromotionOutcome =
+  | { kind: 'promoted_websocket' }
+  | { kind: 'retained_https'; promotionError: Error }
+  | {
+      kind: 'restart_https';
+      stage: 'initial_unsubscribe' | 'repair_unsubscribe' | 'restore_https';
+      error: Error;
+      promotionError?: Error;
+    };
+
+/** Switch an already-safe cold resume from the HTTPS bootstrap provider to
+ * the ordinary WS provider. A failed resume response is result-uncertain: the
+ * server may already have subscribed this connection. Always unsubscribe a
+ * second time before restoring HTTPS. If any state-repair RPC is uncertain,
+ * ask the caller to recycle the whole app-server in HTTPS mode rather than
+ * pretending the current subscription/provider is known.
+ */
+export async function promoteColdResumeProvider(
+  transport: RpcTransport,
+  threadId: string,
+  cwd: string,
+  validateResume: (response: unknown, expectedProvider: string) => void,
+  timeoutMs: number,
+): Promise<ColdResumePromotionOutcome> {
+  positiveInteger(timeoutMs, 'timeoutMs');
+  try {
+    const response = await transport.call('thread/unsubscribe', { threadId }, timeoutMs);
+    validateThreadUnsubscribeResponse(response);
+  } catch (err) {
+    return {
+      kind: 'restart_https',
+      stage: 'initial_unsubscribe',
+      error: toError(err),
+    };
+  }
+
+  let promotionError: Error;
+  try {
+    const response = await transport.call(
+      'thread/resume',
+      buildThreadResumeParams(threadId, cwd, HIVE_MODEL_PROVIDER_ID),
+      timeoutMs,
+    );
+    validateResume(response, HIVE_MODEL_PROVIDER_ID);
+    return { kind: 'promoted_websocket' };
+  } catch (err) {
+    promotionError = toError(err);
+  }
+
+  try {
+    const response = await transport.call('thread/unsubscribe', { threadId }, timeoutMs);
+    validateThreadUnsubscribeResponse(response);
+  } catch (err) {
+    return {
+      kind: 'restart_https',
+      stage: 'repair_unsubscribe',
+      error: toError(err),
+      promotionError,
+    };
+  }
+
+  try {
+    const response = await transport.call(
+      'thread/resume',
+      buildThreadResumeParams(threadId, cwd, HIVE_HTTP_MODEL_PROVIDER_ID),
+      timeoutMs,
+    );
+    validateResume(response, HIVE_HTTP_MODEL_PROVIDER_ID);
+    return { kind: 'retained_https', promotionError };
+  } catch (err) {
+    return {
+      kind: 'restart_https',
+      stage: 'restore_https',
+      error: toError(err),
+      promotionError,
+    };
+  }
+}
+
+function validateThreadUnsubscribeResponse(response: unknown): void {
+  const status = nonEmptyString(recordOf(response)?.status);
+  if (status === 'notLoaded' || status === 'notSubscribed' || status === 'unsubscribed') return;
+  throw new Error(`thread/unsubscribe returned unrecognized status: ${JSON.stringify(response)}`);
+}
+
 export type CodexModelTransport = 'websocket' | 'https' | 'https-fallback';
 
 export interface ThreadTokenUsageSnapshot {
@@ -257,14 +347,145 @@ export interface ThreadTokenUsageSnapshot {
   approximateTokenTextBytes: number;
 }
 
+export type PersistedRolloutRisk =
+  | {
+      kind: 'usage';
+      usage: ThreadTokenUsageSnapshot;
+      rolloutBytes: number;
+      scannedBytes: number;
+    }
+  | {
+      kind: 'oversized';
+      rolloutBytes: number;
+      scannedBytes: number;
+    }
+  | {
+      kind: 'unavailable';
+      rolloutBytes: number | null;
+      scannedBytes: number;
+      reason: 'missing_path' | 'not_file' | 'read_error' | 'usage_not_found';
+    };
+
+/** Recover Codex's latest persisted context usage without hydrating turns or
+ * loading a rollout into memory. Only a bounded tail is read. Legacy
+ * non-paginated `excludeTurns=true` resumes do not emit a tokenUsage replay,
+ * so this is the lightweight compatibility path. If the bounded tail lacks a
+ * usable token record but the rollout is unquestionably large, return an
+ * explicit size guard so callers compact over HTTPS conservatively.
+ */
+export function inspectPersistedRolloutRisk(
+  rolloutPath: string | null,
+  threadId: string,
+  options: {
+    maxScanBytes?: number;
+    oversizedGuardBytes?: number;
+  } = {},
+): PersistedRolloutRisk {
+  if (!rolloutPath) {
+    return { kind: 'unavailable', rolloutBytes: null, scannedBytes: 0, reason: 'missing_path' };
+  }
+  const maxScanBytes = positiveInteger(
+    options.maxScanBytes ?? DEFAULT_HIVE_COLD_RESUME_TAIL_SCAN_BYTES,
+    'maxScanBytes',
+  );
+  const oversizedGuardBytes = positiveInteger(
+    options.oversizedGuardBytes ?? DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES,
+    'oversizedGuardBytes',
+  );
+
+  let rolloutBytes: number;
+  try {
+    const stat = statSync(rolloutPath);
+    if (!stat.isFile()) {
+      return { kind: 'unavailable', rolloutBytes: null, scannedBytes: 0, reason: 'not_file' };
+    }
+    rolloutBytes = stat.size;
+  } catch {
+    return { kind: 'unavailable', rolloutBytes: null, scannedBytes: 0, reason: 'read_error' };
+  }
+
+  const scannedBytes = Math.min(rolloutBytes, maxScanBytes);
+  let fd: number | null = null;
+  try {
+    fd = openSync(rolloutPath, 'r');
+    const buffer = Buffer.allocUnsafe(scannedBytes);
+    const offset = rolloutBytes - scannedBytes;
+    const bytesRead = scannedBytes === 0
+      ? 0
+      : readSync(fd, buffer, 0, scannedBytes, offset);
+    const lines = buffer.subarray(0, bytesRead).toString('utf8').split(/\r?\n/);
+    if (offset > 0) {
+      const precedingByte = Buffer.allocUnsafe(1);
+      const precedingBytesRead = readSync(fd, precedingByte, 0, 1, offset - 1);
+      // If the bounded window begins inside a JSONL record, discard only that
+      // partial record. Do not throw away a valid first line when the byte just
+      // before the window is a newline.
+      if (precedingBytesRead !== 1 || precedingByte[0] !== 0x0a) lines.shift();
+    }
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const line = lines[index]?.trim();
+      if (!line) continue;
+      let item: Record<string, unknown> | undefined;
+      try {
+        item = recordOf(JSON.parse(line));
+      } catch {
+        continue;
+      }
+      const payload = recordOf(item?.payload);
+      const info = recordOf(payload?.info);
+      const last = recordOf(info?.last_token_usage);
+      if (item?.type !== 'event_msg' || payload?.type !== 'token_count' || !last) continue;
+      const inputTokens = finiteNonNegativeNumber(last.input_tokens);
+      const cachedInputTokens = finiteNonNegativeNumber(last.cached_input_tokens) ?? 0;
+      const totalTokens = finiteNonNegativeNumber(last.total_tokens);
+      if (inputTokens == null || totalTokens == null) continue;
+      const contextWindow = finitePositiveNumber(info?.model_context_window);
+      const stamp = nonEmptyString(item?.timestamp) ?? 'latest';
+      return {
+        kind: 'usage',
+        usage: {
+          threadId,
+          turnId: `persisted-rollout:${stamp}`,
+          inputTokens,
+          cachedInputTokens,
+          totalTokens,
+          modelContextWindow: contextWindow,
+          contextUtilization: contextWindow ? inputTokens / contextWindow : null,
+          approximateTokenTextBytes: inputTokens * 4,
+        },
+        rolloutBytes,
+        scannedBytes: bytesRead,
+      };
+    }
+  } catch {
+    return { kind: 'unavailable', rolloutBytes, scannedBytes: 0, reason: 'read_error' };
+  } finally {
+    if (fd != null) {
+      try { closeSync(fd); } catch { /* ignore close failure on read-only diagnostics */ }
+    }
+  }
+
+  if (rolloutBytes >= oversizedGuardBytes) {
+    return { kind: 'oversized', rolloutBytes, scannedBytes };
+  }
+  return { kind: 'unavailable', rolloutBytes, scannedBytes, reason: 'usage_not_found' };
+}
+
 export type PostTurnCompactionOutcome =
-  | { kind: 'compacted'; threadId: string; turnId: string; inputTokens: number }
-  | { kind: 'failed'; threadId: string; turnId: string; inputTokens: number; status: string }
+  | { kind: 'compacted'; threadId: string; turnId: string; inputTokens: number | null; rolloutBytes?: number }
+  | { kind: 'failed'; threadId: string; turnId: string; inputTokens: number | null; status: string; rolloutBytes?: number }
   | { kind: 'skipped_no_usage'; threadId: string; turnId?: string }
   | { kind: 'skipped_below_threshold'; threadId: string; turnId: string; inputTokens: number }
   | { kind: 'skipped_in_progress'; threadId: string; turnId: string }
-  | { kind: 'rpc_error'; threadId: string; turnId: string; inputTokens: number; error: Error }
-  | { kind: 'timeout'; threadId: string; turnId: string; inputTokens: number; afterMs: number };
+  | { kind: 'rpc_error'; threadId: string; turnId: string; inputTokens: number | null; error: Error; rolloutBytes?: number }
+  | { kind: 'timeout'; threadId: string; turnId: string; inputTokens: number | null; afterMs: number; rolloutBytes?: number };
+
+export interface ColdResumeCompactionOptions {
+  usageTimeoutMs?: number;
+  completionTimeoutMs?: number;
+  fallbackUsage?: ThreadTokenUsageSnapshot | null;
+  forceCompactRolloutBytes?: number | null;
+}
 
 interface CompactionWaiter {
   resolve: (result: 'completed' | { failedStatus: string }) => void;
@@ -440,7 +661,7 @@ export class PostTurnCompactionCoordinator {
     if (!usage || usage.turnId !== turnId) {
       return { kind: 'skipped_no_usage', threadId, turnId };
     }
-    return this.compactWithUsage(usage);
+    return this.compactWithUsage(usage, this.completionTimeoutMs);
   }
 
   /** Compact a restored thread before it is exposed to foreground or queued
@@ -450,22 +671,54 @@ export class PostTurnCompactionCoordinator {
    */
   async compactColdResume(
     threadId: string,
-    usageTimeoutMs = 2_000,
+    options: ColdResumeCompactionOptions = {},
   ): Promise<PostTurnCompactionOutcome> {
+    const usageTimeoutMs = options.usageTimeoutMs
+      ?? DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS;
+    const completionTimeoutMs = options.completionTimeoutMs
+      ?? DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS;
     positiveInteger(usageTimeoutMs, 'usageTimeoutMs');
-    const usage = await this.waitForLatestUsage(threadId, usageTimeoutMs);
-    if (!usage) return { kind: 'skipped_no_usage', threadId };
-    return this.compactWithUsage(usage);
+    positiveInteger(completionTimeoutMs, 'completionTimeoutMs');
+    const liveUsage = await this.waitForLatestUsage(threadId, usageTimeoutMs);
+    const usage = liveUsage ?? options.fallbackUsage;
+    if (usage) return this.compactWithUsage(usage, completionTimeoutMs);
+    if (options.forceCompactRolloutBytes != null) {
+      positiveInteger(options.forceCompactRolloutBytes, 'forceCompactRolloutBytes');
+      return this.compactThread(
+        threadId,
+        'persisted-rollout:size-guard',
+        null,
+        completionTimeoutMs,
+        options.forceCompactRolloutBytes,
+      );
+    }
+    return { kind: 'skipped_no_usage', threadId };
   }
 
   private async compactWithUsage(
     usage: ThreadTokenUsageSnapshot,
+    completionTimeoutMs: number,
   ): Promise<PostTurnCompactionOutcome> {
     const { threadId, turnId } = usage;
     // Match Codex's configured AutoCompactTokenLimitScope::Total semantics.
     if (usage.totalTokens < this.threshold) {
       return { kind: 'skipped_below_threshold', threadId, turnId, inputTokens: usage.inputTokens };
     }
+    return this.compactThread(
+      threadId,
+      turnId,
+      usage.inputTokens,
+      completionTimeoutMs,
+    );
+  }
+
+  private async compactThread(
+    threadId: string,
+    turnId: string,
+    inputTokens: number | null,
+    completionTimeoutMs: number,
+    rolloutBytes?: number,
+  ): Promise<PostTurnCompactionOutcome> {
     if (this.waitersByThread.has(threadId)) {
       return { kind: 'skipped_in_progress', threadId, turnId };
     }
@@ -480,7 +733,7 @@ export class PostTurnCompactionCoordinator {
           this.waitersByThread.delete(threadId);
           resolve('timeout');
         }
-      }, this.completionTimeoutMs);
+      }, completionTimeoutMs);
       this.waitersByThread.set(threadId, {
         resolve: resolveCompletion,
         timer,
@@ -501,8 +754,9 @@ export class PostTurnCompactionCoordinator {
         kind: 'rpc_error',
         threadId,
         turnId,
-        inputTokens: usage.inputTokens,
+        inputTokens,
         error: err instanceof Error ? err : new Error(String(err)),
+        ...(rolloutBytes == null ? {} : { rolloutBytes }),
       };
     }
 
@@ -512,8 +766,9 @@ export class PostTurnCompactionCoordinator {
         kind: 'timeout',
         threadId,
         turnId,
-        inputTokens: usage.inputTokens,
-        afterMs: this.completionTimeoutMs,
+        inputTokens,
+        afterMs: completionTimeoutMs,
+        ...(rolloutBytes == null ? {} : { rolloutBytes }),
       };
     }
     if (result !== 'completed') {
@@ -521,11 +776,18 @@ export class PostTurnCompactionCoordinator {
         kind: 'failed',
         threadId,
         turnId,
-        inputTokens: usage.inputTokens,
+        inputTokens,
         status: result.failedStatus,
+        ...(rolloutBytes == null ? {} : { rolloutBytes }),
       };
     }
-    return { kind: 'compacted', threadId, turnId, inputTokens: usage.inputTokens };
+    return {
+      kind: 'compacted',
+      threadId,
+      turnId,
+      inputTokens,
+      ...(rolloutBytes == null ? {} : { rolloutBytes }),
+    };
   }
 
   isOwnedTurn(turnId: string | undefined): boolean {
@@ -534,6 +796,16 @@ export class PostTurnCompactionCoordinator {
 
   releaseOwnedTurn(turnId: string | undefined): void {
     if (turnId) this.ownedCompactionTurns.delete(turnId);
+  }
+
+  /** Discard a snapshot observed for an earlier subscription before issuing
+   * a new thread/resume. Modern paginated Codex resumes replay usage after
+   * the resume response; keeping the old snapshot would let an in-process
+   * thread switch skip that replay and make the cold-resume decision from
+   * stale context size data.
+   */
+  forgetThreadUsage(threadId: string): void {
+    this.latestUsageByThread.delete(threadId);
   }
 
   clear(): void {
@@ -615,6 +887,22 @@ function recordOf(value: unknown): Record<string, unknown> | undefined {
 
 function nonEmptyString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+function finiteNonNegativeNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0
+    ? value
+    : null;
+}
+
+function finitePositiveNumber(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value > 0
+    ? value
+    : null;
+}
+
+function toError(value: unknown): Error {
+  return value instanceof Error ? value : new Error(String(value));
 }
 
 /** Preserve the useful details hidden inside Node/Undici WebSocket events.

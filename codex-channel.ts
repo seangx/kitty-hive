@@ -35,6 +35,9 @@
  *   HIVE_CODEX_REQUEST_MAX_RETRIES HTTP request retry budget (default 1)
  *   HIVE_CODEX_STREAM_MAX_RETRIES stream retry budget (default 1)
  *   HIVE_CODEX_AUTO_COMPACT_TOKENS auto-compact threshold (default 160000)
+ *   HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS usage replay wait (default 2000)
+ *   HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS startup compact SLA (default 60000)
+ *   HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB legacy size guard (default 64)
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
@@ -42,7 +45,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS, DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES, DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, inspectPersistedRolloutRisk, parseCodexTerminalNotice, parseThreadTokenUsage, promoteColdResumeProvider, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PersistedRolloutRisk, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -70,7 +73,6 @@ const HIVE_SUPERVISOR_PID = process.env.HIVE_SUPERVISOR_PID;
 // crash-looped the whole fleet on 2026-07-15. Resume of a large rollout jsonl
 // under boot-storm load can also legitimately exceed 30s.
 const THREAD_RPC_TIMEOUT_MS = 120_000;
-const COLD_RESUME_USAGE_TIMEOUT_MS = 2_000;
 
 function boundedIntegerEnv(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]?.trim();
@@ -102,6 +104,25 @@ const CODEX_AUTO_COMPACT_TOKEN_LIMIT = boundedIntegerEnv(
   32_000,
   1_000_000,
 );
+const COLD_RESUME_USAGE_TIMEOUT_MS = boundedIntegerEnv(
+  'HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS',
+  DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS,
+  100,
+  30_000,
+);
+const COLD_RESUME_COMPACT_TIMEOUT_MS = boundedIntegerEnv(
+  'HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS',
+  DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS,
+  5_000,
+  300_000,
+);
+const COLD_RESUME_ROLLOUT_GUARD_MIB = boundedIntegerEnv(
+  'HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB',
+  DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES / 1024 / 1024,
+  8,
+  1024,
+);
+const COLD_RESUME_ROLLOUT_GUARD_BYTES = COLD_RESUME_ROLLOUT_GUARD_MIB * 1024 * 1024;
 
 // Allow CLI flags to override env
 for (let i = 2; i < process.argv.length; i++) {
@@ -362,6 +383,26 @@ let controlUrl: string | null = null;      // http://127.0.0.1:<port> — superv
 let supervisorWatchdog: NodeJS.Timeout | null = null;
 let modelTransport: CodexModelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
 let threadRolloutPath: string | null = null;
+let appserverGeneration = 0;
+let appserverModelWebsockets = CODEX_MODEL_WEBSOCKETS;
+
+class ColdResumeAppserverRecycleError extends Error {
+  constructor(
+    readonly stage: 'initial_resume' | 'initial_unsubscribe' | 'repair_unsubscribe' | 'restore_https',
+    error: unknown,
+  ) {
+    const detail = error instanceof Error ? error.message : String(error);
+    super(`cold-resume state uncertain at ${stage}: ${detail}`);
+    this.name = 'ColdResumeAppserverRecycleError';
+  }
+}
+
+class CodexRpcResponseError extends Error {
+  constructor(readonly responseError: unknown) {
+    super(`codex rpc error: ${JSON.stringify(responseError)}`);
+    this.name = 'CodexRpcResponseError';
+  }
+}
 
 function rolloutSizeMiB(): string {
   if (!threadRolloutPath) return 'unknown';
@@ -462,9 +503,15 @@ function applyResumeResponse(
 }
 
 function logColdResumeCompaction(outcome: PostTurnCompactionOutcome): void {
+  const source = 'rolloutBytes' in outcome && outcome.rolloutBytes != null
+    ? ` rolloutBytes=${outcome.rolloutBytes}`
+    : '';
+  const inputTokens = 'inputTokens' in outcome && outcome.inputTokens != null
+    ? String(outcome.inputTokens)
+    : 'unknown';
   switch (outcome.kind) {
     case 'compacted':
-      console.error(`[codex-channel] cold-resume compact completed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${outcome.inputTokens}`);
+      console.error(`[codex-channel] cold-resume compact completed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${inputTokens}${source}`);
       break;
     case 'skipped_below_threshold':
       console.error(`[codex-channel] cold-resume compact skipped: thread=${outcome.threadId} sourceTurn=${outcome.turnId} reason=below-threshold inputTokens=${outcome.inputTokens}`);
@@ -476,15 +523,37 @@ function logColdResumeCompaction(outcome: PostTurnCompactionOutcome): void {
       console.error(`[codex-channel] cold-resume compact skipped: thread=${outcome.threadId} sourceTurn=${outcome.turnId} reason=in-progress`);
       break;
     case 'rpc_error':
-      console.error(`[codex-channel] cold-resume compact start failed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${outcome.inputTokens} error=${outcome.error.message}`);
+      console.error(`[codex-channel] cold-resume compact start failed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${inputTokens}${source} error=${outcome.error.message}`);
       break;
     case 'failed':
-      console.error(`[codex-channel] cold-resume compact failed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${outcome.inputTokens} status=${outcome.status}`);
+      console.error(`[codex-channel] cold-resume compact failed: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${inputTokens}${source} status=${outcome.status}`);
       break;
     case 'timeout':
-      console.error(`[codex-channel] cold-resume compact timed out: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${outcome.inputTokens} afterMs=${outcome.afterMs}`);
+      console.error(`[codex-channel] cold-resume compact timed out: thread=${outcome.threadId} sourceTurn=${outcome.turnId} inputTokens=${inputTokens}${source} afterMs=${outcome.afterMs}`);
       break;
   }
+}
+
+function logPersistedRolloutRisk(risk: PersistedRolloutRisk): void {
+  if (risk.kind === 'usage') {
+    console.error(
+      `[codex-channel] cold-resume rollout usage recovered: thread=${risk.usage.threadId} `
+      + `sourceTurn=${risk.usage.turnId} inputTokens=${risk.usage.inputTokens} `
+      + `rolloutBytes=${risk.rolloutBytes} scannedBytes=${risk.scannedBytes}`,
+    );
+    return;
+  }
+  if (risk.kind === 'oversized') {
+    console.error(
+      `[codex-channel] cold-resume rollout size guard: rolloutBytes=${risk.rolloutBytes} `
+      + `scannedBytes=${risk.scannedBytes} thresholdBytes=${COLD_RESUME_ROLLOUT_GUARD_BYTES}`,
+    );
+    return;
+  }
+  console.error(
+    `[codex-channel] cold-resume rollout usage unavailable: reason=${risk.reason} `
+    + `rolloutBytes=${risk.rolloutBytes ?? 'unknown'} scannedBytes=${risk.scannedBytes}`,
+  );
 }
 
 /** Reload a bootstrap-HTTPS thread under the ordinary WS provider only after
@@ -494,44 +563,108 @@ function logColdResumeCompaction(outcome: PostTurnCompactionOutcome): void {
  * the same durable rollout with a fresh connection-scoped WS baseline.
  */
 async function promoteColdResumeToWebsocket(resumedThreadId: string): Promise<boolean> {
-  try {
-    await rpcCall('thread/unsubscribe', { threadId: resumedThreadId }, THREAD_RPC_TIMEOUT_MS);
-  } catch (err) {
-    console.error(`[codex-channel] cold-resume WS promotion skipped: thread=${resumedThreadId} stage=unsubscribe error=${err}`);
-    return false;
-  }
-
-  try {
-    const response = await rpcCall(
-      'thread/resume',
-      buildThreadResumeParams(resumedThreadId, CODEX_APPSERVER_CWD, HIVE_MODEL_PROVIDER_ID),
-      THREAD_RPC_TIMEOUT_MS,
-    );
-    applyResumeResponse(response, resumedThreadId, HIVE_MODEL_PROVIDER_ID);
+  const outcome = await promoteColdResumeProvider(
+    { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+    resumedThreadId,
+    CODEX_APPSERVER_CWD,
+    (response, expectedProvider) => applyResumeResponse(
+      response,
+      resumedThreadId,
+      expectedProvider,
+    ),
+    THREAD_RPC_TIMEOUT_MS,
+  );
+  if (outcome.kind === 'promoted_websocket') {
     modelTransport = 'websocket';
     console.error(`[codex-channel] cold-resume transport promoted: thread=${resumedThreadId} transport=websocket`);
     return true;
-  } catch (promotionError) {
-    console.error(`[codex-channel] cold-resume WS promotion failed: thread=${resumedThreadId} error=${promotionError}; restoring HTTPS subscription`);
   }
-
-  const response = await rpcCall(
-    'thread/resume',
-    buildThreadResumeParams(resumedThreadId, CODEX_APPSERVER_CWD, HIVE_HTTP_MODEL_PROVIDER_ID),
-    THREAD_RPC_TIMEOUT_MS,
-  );
-  applyResumeResponse(response, resumedThreadId, HIVE_HTTP_MODEL_PROVIDER_ID);
-  modelTransport = 'https';
-  console.error(`[codex-channel] cold-resume transport retained: thread=${resumedThreadId} transport=https reason=promotion-failed`);
-  return false;
+  if (outcome.kind === 'retained_https') {
+    modelTransport = 'https';
+    console.error(
+      `[codex-channel] cold-resume transport retained: thread=${resumedThreadId} `
+      + `transport=https reason=promotion-failed error=${outcome.promotionError.message}`,
+    );
+    return false;
+  }
+  throw new ColdResumeAppserverRecycleError(outcome.stage, outcome.error);
 }
 
-async function setupAppserver(): Promise<void> {
+/** Resume an existing rollout without ever exposing an unbounded cold WS
+ * request. Modern paginated resumes replay token usage; legacy resumes do
+ * not, so inspect only a bounded rollout tail and conservatively compact an
+ * oversized unknown rollout. The thread is eligible for WS only after that
+ * guard completes or proves the context is below threshold.
+ */
+async function resumePersistedThreadGuarded(
+  persistedThreadId: string,
+  allowWebsocketPromotion: boolean,
+): Promise<void> {
+  // An in-process switch can return to a thread whose previous subscription
+  // left a token snapshot in the coordinator. Drop it before resume so the
+  // modern post-resume replay (or the bounded legacy rollout fallback) is the
+  // only evidence used for this cold-resume decision.
+  postTurnCompactor?.forgetThreadUsage(persistedThreadId);
+  const bootstrapProvider = allowWebsocketPromotion
+    ? HIVE_HTTP_MODEL_PROVIDER_ID
+    : HIVE_MODEL_PROVIDER_ID;
+  let resumeResp: any;
+  try {
+    resumeResp = await rpcCall(
+      'thread/resume',
+      buildThreadResumeParams(persistedThreadId, CODEX_APPSERVER_CWD, bootstrapProvider),
+      THREAD_RPC_TIMEOUT_MS,
+    );
+    applyResumeResponse(resumeResp, persistedThreadId, bootstrapProvider);
+  } catch (err) {
+    // A JSON-RPC error is an authoritative rejection (missing rollout/schema
+    // mismatch), so callers may create a fresh thread. A timeout/transport or
+    // malformed success response is result-uncertain: recycle the app-server.
+    if (err instanceof CodexRpcResponseError) throw err;
+    throw new ColdResumeAppserverRecycleError('initial_resume', err);
+  }
+  modelTransport = 'https';
+  console.error(
+    `[codex-channel] appserver thread resumed: ${threadId} `
+    + `(metadata-only response, bootstrapTransport=https)`,
+  );
+
+  if (!allowWebsocketPromotion) return;
+  if (!postTurnCompactor) throw new Error('cold-resume compactor not initialized');
+
+  const risk = inspectPersistedRolloutRisk(threadRolloutPath, persistedThreadId, {
+    oversizedGuardBytes: COLD_RESUME_ROLLOUT_GUARD_BYTES,
+  });
+  logPersistedRolloutRisk(risk);
+  const compact = await postTurnCompactor.compactColdResume(persistedThreadId, {
+    usageTimeoutMs: COLD_RESUME_USAGE_TIMEOUT_MS,
+    completionTimeoutMs: COLD_RESUME_COMPACT_TIMEOUT_MS,
+    fallbackUsage: risk.kind === 'usage' ? risk.usage : null,
+    forceCompactRolloutBytes: risk.kind === 'oversized' ? risk.rolloutBytes : null,
+  });
+  logColdResumeCompaction(compact);
+  if (shouldPromoteColdResumeToWebsocket(compact)) {
+    await promoteColdResumeToWebsocket(persistedThreadId);
+  } else {
+    console.error(
+      `[codex-channel] cold-resume transport retained: thread=${threadId} `
+      + `transport=https reason=${compact.kind}`,
+    );
+  }
+}
+
+async function setupAppserver(options: { forceHttps?: boolean } = {}): Promise<void> {
   if (typeof (globalThis as any).WebSocket !== 'function') {
     throw new Error('global WebSocket not available (need Node 22+); set CODEX_CHANNEL_MODE=exec');
   }
+  const generation = ++appserverGeneration;
+  appserverDeathHandled = false;
+  appserverModelWebsockets = CODEX_MODEL_WEBSOCKETS && !options.forceHttps;
   const port = await pickFreePort();
-  console.error(`[codex-channel] starting appserver: ${CODEX_CMD} app-server --listen ws://127.0.0.1:${port}`);
+  console.error(
+    `[codex-channel] starting appserver: ${CODEX_CMD} app-server --listen `
+    + `ws://127.0.0.1:${port} modelTransport=${appserverModelWebsockets ? 'websocket' : 'https'}`,
+  );
 
   // detached: true puts appserverProc in its own process group, so SIGTERM
   // to -pid kills the entire subtree (npm/npx wrapper + grandchild codex
@@ -561,16 +694,17 @@ async function setupAppserver(): Promise<void> {
     ENV_URL,
     await listHiveToolNames(),
     {
-      supportsWebsockets: CODEX_MODEL_WEBSOCKETS,
+      supportsWebsockets: appserverModelWebsockets,
       requestMaxRetries: CODEX_REQUEST_MAX_RETRIES,
       streamMaxRetries: CODEX_STREAM_MAX_RETRIES,
       autoCompactTokenLimit: CODEX_AUTO_COMPACT_TOKEN_LIMIT,
     },
   );
-  appserverProc = spawn(CODEX_CMD, appserverArgs, {
+  const proc = spawn(CODEX_CMD, appserverArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: true,
   });
+  appserverProc = proc;
 
   // Wait for listen-ready line on stderr, or fail after 10s
   await new Promise<void>((resolve, reject) => {
@@ -578,20 +712,21 @@ async function setupAppserver(): Promise<void> {
     const timer = setTimeout(() => {
       if (!ready) { ready = true; reject(new Error('codex app-server did not become ready within 10s')); }
     }, 10000);
-    appserverProc!.stderr!.on('data', (chunk) => {
+    proc.stderr!.on('data', (chunk) => {
       const s = String(chunk);
       process.stderr.write(`[codex-app] ${s}`);
       if (!ready && /Listening|listen|started|ready/i.test(s)) {
         ready = true; clearTimeout(timer); resolve();
       }
     });
-    appserverProc!.stdout!.on('data', (chunk) => process.stderr.write(`[codex-app] ${chunk}`));
-    appserverProc!.on('exit', (code, signal) => {
+    proc.stdout!.on('data', (chunk) => process.stderr.write(`[codex-app] ${chunk}`));
+    proc.on('exit', (code, signal) => {
       if (!ready) {
         ready = true; clearTimeout(timer);
         reject(new Error(`codex app-server exited (code=${code}, signal=${signal}) before becoming ready`));
         return;
       }
+      if (generation !== appserverGeneration) return;
       // post-ready exit: codex app-server crashed mid-flight. Daemon's WS will
       // also close immediately; further turn/start calls would silently fail.
       // Best recovery is for daemon to die so supervisor respawns it cleanly
@@ -601,8 +736,9 @@ async function setupAppserver(): Promise<void> {
       // when supervisor's new daemon binds.
       onAppserverFailure('process', `codex app-server exited (code=${code}, signal=${signal})`);
     });
-    appserverProc!.on('error', (err) => {
+    proc.on('error', (err) => {
       if (!ready) { ready = true; clearTimeout(timer); reject(err); return; }
+      if (generation !== appserverGeneration) return;
       onAppserverFailure('process', `codex app-server process error: ${err?.message || err}`);
     });
   });
@@ -611,20 +747,22 @@ async function setupAppserver(): Promise<void> {
   await new Promise(r => setTimeout(r, 200));
 
   // Open WS
-  appserverWs = new (globalThis as any).WebSocket(`ws://127.0.0.1:${port}`);
+  const ws = new (globalThis as any).WebSocket(`ws://127.0.0.1:${port}`);
+  appserverWs = ws;
   await new Promise<void>((resolve, reject) => {
     const onOpen = () => { cleanup(); resolve(); };
     const onErr = (e: any) => { cleanup(); reject(new Error(`WS open failed: ${describeWebSocketEvent(e)}`)); };
     const cleanup = () => {
-      appserverWs.removeEventListener('open', onOpen);
-      appserverWs.removeEventListener('error', onErr);
+      ws.removeEventListener('open', onOpen);
+      ws.removeEventListener('error', onErr);
     };
-    appserverWs.addEventListener('open', onOpen);
-    appserverWs.addEventListener('error', onErr);
-    setTimeout(() => { if (appserverWs.readyState !== 1) { cleanup(); reject(new Error('WS open timeout')); } }, 5000);
+    ws.addEventListener('open', onOpen);
+    ws.addEventListener('error', onErr);
+    setTimeout(() => { if (ws.readyState !== 1) { cleanup(); reject(new Error('WS open timeout')); } }, 5000);
   });
 
-  appserverWs.addEventListener('message', (ev: any) => {
+  ws.addEventListener('message', (ev: any) => {
+    if (generation !== appserverGeneration) return;
     let msg: any;
     try { msg = JSON.parse(String(ev.data)); } catch (err) {
       console.error('[codex-channel] WS parse error:', err);
@@ -635,7 +773,7 @@ async function setupAppserver(): Promise<void> {
       const pending = pendingResponses.get(msg.id);
       if (pending) {
         pendingResponses.delete(msg.id);
-        if (msg.error) pending.reject(new Error(`codex rpc error: ${JSON.stringify(msg.error)}`));
+        if (msg.error) pending.reject(new CodexRpcResponseError(msg.error));
         else pending.resolve(msg.result);
       }
       return;
@@ -718,10 +856,12 @@ async function setupAppserver(): Promise<void> {
     }
   });
 
-  appserverWs.addEventListener('close', (e: any) => {
+  ws.addEventListener('close', (e: any) => {
+    if (generation !== appserverGeneration) return;
     onAppserverFailure('transport', `WebSocket closed (${describeWebSocketEvent(e)})`);
   });
-  appserverWs.addEventListener('error', (e: any) => {
+  ws.addEventListener('error', (e: any) => {
+    if (generation !== appserverGeneration) return;
     onAppserverFailure('transport', `WebSocket error (${describeWebSocketEvent(e)})`);
   });
 
@@ -731,7 +871,7 @@ async function setupAppserver(): Promise<void> {
     version: '0.7.0',
   }));
   // initialized notification — fire and forget
-  appserverWs.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }));
+  ws.send(JSON.stringify({ jsonrpc: '2.0', method: 'initialized', params: {} }));
 
   // Install before thread/resume. Codex sends the durable tokenUsage replay
   // immediately after the metadata-only response, and the cold-resume guard
@@ -751,39 +891,15 @@ async function setupAppserver(): Promise<void> {
   let resumed = false;
   if (persistedThreadId) {
     try {
-      // A restored store=false Responses session has no durable WS baseline.
-      // Bootstrap it over HTTPS so a large compact request cannot first upload
-      // the same full history over WS and then repeat it through fallback.
-      const bootstrapProvider = CODEX_MODEL_WEBSOCKETS
-        ? HIVE_HTTP_MODEL_PROVIDER_ID
-        : HIVE_MODEL_PROVIDER_ID;
-      const resumeResp = await rpcCall(
-        'thread/resume',
-        buildThreadResumeParams(persistedThreadId, CODEX_APPSERVER_CWD, bootstrapProvider),
-        THREAD_RPC_TIMEOUT_MS,
-      );
-      applyResumeResponse(resumeResp, persistedThreadId, bootstrapProvider);
-      modelTransport = 'https';
+      await resumePersistedThreadGuarded(persistedThreadId, appserverModelWebsockets);
       resumed = true;
-      console.error(`[codex-channel] appserver thread resumed: ${threadId} (metadata-only response, bootstrapTransport=https)`);
     } catch (err) {
+      if (err instanceof ColdResumeAppserverRecycleError) throw err;
       // Common cause: jsonl missing (stale thread_id from a wiped ~/.codex)
       // or codex schema upgrade. Fall back to a fresh thread; the new
       // thread_id will overwrite the stale one in agents.thread_id via
       // markDaemonReady → setAgentThreadId, so this self-heals.
       console.error(`[codex-channel] thread/resume failed for ${persistedThreadId}, falling back to thread/start: ${err}`);
-    }
-  }
-  if (resumed && CODEX_MODEL_WEBSOCKETS) {
-    const compact = await postTurnCompactor.compactColdResume(
-      threadId!,
-      COLD_RESUME_USAGE_TIMEOUT_MS,
-    );
-    logColdResumeCompaction(compact);
-    if (shouldPromoteColdResumeToWebsocket(compact)) {
-      await promoteColdResumeToWebsocket(threadId!);
-    } else {
-      console.error(`[codex-channel] cold-resume transport retained: thread=${threadId} transport=https reason=${compact.kind}`);
     }
   }
   if (!resumed) {
@@ -794,7 +910,7 @@ async function setupAppserver(): Promise<void> {
     console.error(`[codex-channel] appserver thread started: ${threadId}`);
   }
   appserverWsUrl = `ws://127.0.0.1:${port}`;
-  if (!resumed) modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
+  if (!resumed) modelTransport = appserverModelWebsockets ? 'websocket' : 'https';
   console.error(
     `[codex-channel] model transport configured: ${modelTransport} (HTTPS fallback enabled, requestRetries=${CODEX_REQUEST_MAX_RETRIES}, streamRetries=${CODEX_STREAM_MAX_RETRIES}, autoCompactTokens=${CODEX_AUTO_COMPACT_TOKEN_LIMIT})`,
   );
@@ -936,26 +1052,24 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
   if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1) {
     return { ok: false, error: 'daemon not in appserver mode (or WS not open)' };
   }
+  const previousThreadId = threadId;
+  const previousRolloutPath = threadRolloutPath;
+  const previousModelTransport = modelTransport;
   try {
     if (target) {
-      const resp = await rpcCall(
-        'thread/resume',
-        buildThreadResumeParams(target, CODEX_APPSERVER_CWD),
-        THREAD_RPC_TIMEOUT_MS,
-      );
-      const resumedId = resp?.thread?.id;
-      if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
-      threadId = resumedId;
-      threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
-      modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
-      console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (metadata-only response)`);
+      if (target !== threadId) {
+        await resumePersistedThreadGuarded(target, appserverModelWebsockets);
+        console.error(`[codex-channel] in-process switch: resumed guarded thread ${threadId}`);
+      } else {
+        console.error(`[codex-channel] in-process switch: thread ${target} already active`);
+      }
     } else {
       const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
       const newId = resp?.thread?.id;
       if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = newId;
       threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
-      modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
+      modelTransport = appserverModelWebsockets ? 'websocket' : 'https';
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
     }
     turnTracker?.setThreadId(threadId!);
@@ -974,6 +1088,19 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
     });
     return { ok: true, thread_id: threadId! };
   } catch (err: any) {
+    if (err instanceof ColdResumeAppserverRecycleError) {
+      console.error(
+        `[codex-channel] in-process switch requires app-server recycle: `
+        + `target=${target} stage=${err.stage} error=${err.message}`,
+      );
+      // Let the HTTP response reach the supervisor first; then fail-close so
+      // no queued event uses a subscription/provider whose state is unknown.
+      setImmediate(() => onAppserverFailure('transport', err.message));
+      return { ok: false, error: err.message };
+    }
+    threadId = previousThreadId;
+    threadRolloutPath = previousRolloutPath;
+    modelTransport = previousModelTransport;
     return { ok: false, error: String(err?.message || err) };
   }
 }
@@ -1421,7 +1548,19 @@ async function setupPushMode() {
   }
   // 'auto' or 'appserver': try appserver
   try {
-    await setupAppserver();
+    try {
+      await setupAppserver();
+    } catch (err) {
+      if (!(err instanceof ColdResumeAppserverRecycleError) || !CODEX_MODEL_WEBSOCKETS) {
+        throw err;
+      }
+      console.error(
+        `[codex-channel] cold-resume state could not be repaired in-place: `
+        + `stage=${err.stage}; recycling app-server with HTTPS forced`,
+      );
+      cleanupAppserver();
+      await setupAppserver({ forceHttps: true });
+    }
     pushMode = 'appserver';
     console.error(`[codex-channel] mode: appserver (long-lived codex thread; context persists across events)`);
   } catch (err) {
@@ -1437,6 +1576,13 @@ async function setupPushMode() {
 }
 
 function cleanupAppserver() {
+  // Invalidate every callback registered by the outgoing process/WS before
+  // closing either object. Their asynchronous exit/close events must not be
+  // mistaken for failures of a replacement generation.
+  appserverGeneration += 1;
+  const cleanupError = new Error('codex app-server connection recycled');
+  for (const pending of pendingResponses.values()) pending.reject(cleanupError);
+  pendingResponses.clear();
   if (controlServer) {
     try { controlServer.close(); } catch { /* ignore */ }
     controlServer = null;
@@ -1464,6 +1610,7 @@ function cleanupAppserver() {
   postTurnCompactor = null;
   threadId = null;
   threadRolloutPath = null;
+  appserverWsUrl = null;
   modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
 }
 

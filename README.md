@@ -415,14 +415,20 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP request retry budget (default `1`; upstream Codex default is `4`) |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
 | `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex auto-compaction threshold (default `160000`) |
+| `HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS` | Wait for modern Codex's post-resume usage replay (default `2000`) |
+| `HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS` | Cold-start compaction SLA before the thread stays on HTTPS (default `60000`) |
+| `HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB` | Compact a legacy rollout with no recoverable usage once it reaches this size (default `64`) |
 
 When a persisted Codex thread is restored with WebSockets enabled, Hive first
-resumes it on an HTTPS-only bootstrap provider and consumes Codex's lightweight
-persisted token-usage replay. Contexts at or above the compaction threshold are
-compacted before the channel announces ready; bounded contexts are then reloaded
-on the ordinary WebSocket provider. If usage is unavailable or compaction fails,
-the thread remains on HTTPS for that daemon lifetime instead of risking a
-duplicate full-history WS upload followed by HTTPS fallback.
+resumes it on an HTTPS-only bootstrap provider. Modern paginated resumes replay
+token usage; legacy `excludeTurns` resumes are covered by a bounded tail scan of
+the rollout, plus a conservative size guard when no usage record is recoverable.
+Contexts at or above the compaction threshold are compacted before the channel
+announces ready; bounded contexts are then reloaded on the ordinary WebSocket
+provider. If usage is unavailable or compaction fails, the thread remains on
+HTTPS for that daemon lifetime. If a provider-switch response is uncertain,
+Hive destroys that app-server and rebuilds it with HTTPS forced instead of
+risking a duplicate full-history WS upload followed by HTTPS fallback.
 
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 
