@@ -101,20 +101,60 @@ export interface AppServerInitializeParams {
   };
 }
 
-export const HIVE_HTTP_MODEL_PROVIDER_ID = 'hive-openai-http';
+export const HIVE_MODEL_PROVIDER_ID = 'hive-openai';
+export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 1;
+export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 1;
+export const DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT = 160_000;
+
+export interface CodexAppServerModelOptions {
+  supportsWebsockets?: boolean;
+  requestMaxRetries?: number;
+  streamMaxRetries?: number;
+  autoCompactTokenLimit?: number;
+}
+
+function nonNegativeInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value < 0) {
+    throw new Error(`${field} must be a non-negative safe integer`);
+  }
+  return value;
+}
+
+function positiveInteger(value: number, field: string): number {
+  if (!Number.isSafeInteger(value) || value <= 0) {
+    throw new Error(`${field} must be a positive safe integer`);
+  }
+  return value;
+}
 
 /** Build arguments for the long-lived Codex app-server owned by Hive.
  *
  * Hive restores many persisted, often long-context threads at serve startup.
- * Keep its Responses transport on HTTPS so a WebSocket interruption cannot
- * take down that whole bootstrap turn. This override is process-local:
- * interactive Codex sessions retain their configured transport.
+ * Prefer Responses WebSockets so Codex can carry the stable prompt prefix by
+ * `previous_response_id` instead of uploading the whole history for every
+ * tool continuation. Codex retains its built-in HTTPS fallback. Retry budgets
+ * are deliberately small because an HTTPS retry re-uploads the entire prompt.
+ * This override is process-local: interactive Codex sessions are unchanged.
  */
 export function buildCodexAppServerArgs(
   listenUrl: string,
   hiveMcpUrl: string,
   hiveToolNames: readonly string[],
+  options: CodexAppServerModelOptions = {},
 ): string[] {
+  const supportsWebsockets = options.supportsWebsockets ?? true;
+  const requestMaxRetries = nonNegativeInteger(
+    options.requestMaxRetries ?? DEFAULT_HIVE_REQUEST_MAX_RETRIES,
+    'requestMaxRetries',
+  );
+  const streamMaxRetries = nonNegativeInteger(
+    options.streamMaxRetries ?? DEFAULT_HIVE_STREAM_MAX_RETRIES,
+    'streamMaxRetries',
+  );
+  const autoCompactTokenLimit = positiveInteger(
+    options.autoCompactTokenLimit ?? DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT,
+    'autoCompactTokenLimit',
+  );
   const args = [
     'app-server',
     '--listen', listenUrl,
@@ -122,8 +162,10 @@ export function buildCodexAppServerArgs(
     // to override `model_providers.openai.supports_websockets` makes config
     // loading fail. Define a complete process-local provider instead and
     // select it only for this Hive-owned app-server.
-    '-c', `model_providers.${HIVE_HTTP_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}`,
-    '-c', `model_provider=${JSON.stringify(HIVE_HTTP_MODEL_PROVIDER_ID)}`,
+    '-c', `model_providers.${HIVE_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=${supportsWebsockets},request_max_retries=${requestMaxRetries},stream_max_retries=${streamMaxRetries},supports_standalone_web_search=true}`,
+    '-c', `model_provider=${JSON.stringify(HIVE_MODEL_PROVIDER_ID)}`,
+    '-c', `model_auto_compact_token_limit=${autoCompactTokenLimit}`,
+    '-c', 'model_auto_compact_token_limit_scope="total"',
     // Keep the CLI override layer transport-complete and bind the app-server
     // to the supervisor that spawned it, not a possibly stale user URL.
     '-c', `mcp_servers.hive.url=${JSON.stringify(hiveMcpUrl)}`,
@@ -177,11 +219,10 @@ export function supervisorProcessIsMissing(
  * A rollout's original session_meta cwd is immutable, so resuming with only
  * threadId restores stale per-rollout settings. In addition to hiding
  * project-local skills deployed after the thread was first created, an old
- * built-in `openai` provider re-enables Responses WebSockets even though this
- * Hive-owned app-server is configured for HTTPS. Codex app-server supports
- * cwd and modelProvider as thread/resume overrides; always carry the daemon's
- * authoritative settings on both boot-time resume and in-process thread
- * switches. `excludeTurns`
+ * provider can restore the wrong Responses transport and retry policy. Codex
+ * app-server supports cwd and modelProvider as thread/resume overrides; always
+ * carry the daemon's authoritative settings on both boot-time resume and
+ * in-process thread switches. `excludeTurns`
  * omits the potentially enormous serialized history from the RPC response;
  * it does not discard the history Codex loads internally for the resumed
  * thread.
@@ -189,10 +230,75 @@ export function supervisorProcessIsMissing(
 export function buildThreadResumeParams(threadId: string, cwd: string): ThreadResumeParams {
   return {
     threadId,
-    modelProvider: HIVE_HTTP_MODEL_PROVIDER_ID,
+    modelProvider: HIVE_MODEL_PROVIDER_ID,
     cwd,
     excludeTurns: true,
   };
+}
+
+export type CodexModelTransport = 'websocket' | 'https' | 'https-fallback';
+
+export interface ThreadTokenUsageSnapshot {
+  threadId: string;
+  turnId: string;
+  inputTokens: number;
+  cachedInputTokens: number;
+  totalTokens: number;
+  modelContextWindow: number | null;
+  contextUtilization: number | null;
+  approximateTokenTextBytes: number;
+}
+
+/** Parse the app-server token notification without trusting its shape.
+ *
+ * `approximateTokenTextBytes` is intentionally only a token-text estimate.
+ * JSON framing, tool schemas and encrypted reasoning can make the real wire
+ * payload much larger, so callers must label it as an estimate rather than an
+ * observed request size.
+ */
+export function parseThreadTokenUsage(
+  method: string,
+  params: unknown,
+  expectedThreadId?: string,
+): ThreadTokenUsageSnapshot | null {
+  if (method !== 'thread/tokenUsage/updated') return null;
+  const p = recordOf(params);
+  const usage = recordOf(p?.tokenUsage);
+  const last = recordOf(usage?.last);
+  const threadId = nonEmptyString(p?.threadId);
+  const turnId = nonEmptyString(p?.turnId);
+  const inputTokens = last?.inputTokens;
+  const cachedInputTokens = last?.cachedInputTokens;
+  const totalTokens = last?.totalTokens;
+  const contextWindowValue = usage?.modelContextWindow;
+  if (
+    !threadId || !turnId ||
+    (expectedThreadId && threadId !== expectedThreadId) ||
+    typeof inputTokens !== 'number' || !Number.isFinite(inputTokens) || inputTokens < 0 ||
+    typeof cachedInputTokens !== 'number' || !Number.isFinite(cachedInputTokens) || cachedInputTokens < 0 ||
+    typeof totalTokens !== 'number' || !Number.isFinite(totalTokens) || totalTokens < 0
+  ) {
+    return null;
+  }
+  const modelContextWindow = typeof contextWindowValue === 'number' && Number.isFinite(contextWindowValue) && contextWindowValue > 0
+    ? contextWindowValue
+    : null;
+  return {
+    threadId,
+    turnId,
+    inputTokens,
+    cachedInputTokens,
+    totalTokens,
+    modelContextWindow,
+    contextUtilization: modelContextWindow ? inputTokens / modelContextWindow : null,
+    approximateTokenTextBytes: inputTokens * 4,
+  };
+}
+
+export function detectResponsesTransportFallback(method: string, params: unknown): boolean {
+  if (method !== 'warning') return false;
+  const message = nonEmptyString(recordOf(params)?.message);
+  return !!message && message.includes('Falling back from WebSockets to HTTPS transport');
 }
 
 function recordOf(value: unknown): Record<string, unknown> | undefined {

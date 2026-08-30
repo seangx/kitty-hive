@@ -410,6 +410,10 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | `HIVE_AGENT_KEY` | 按 external_key 自动注册（外部 orchestrator 给的稳定标识；幂等 — 同 key 永远返回同 agent） |
 | `HIVE_AGENT_NAME` | 按 display_name 注册（最低优先级；复用最近匹配） |
 | `HIVE_EVENT_MODE` | Codex 事件归属：`auto` 由后台启动回合；`foreground` 只持久化通知，不做后台推理 |
+| `HIVE_CODEX_FORCE_HTTPS` | 紧急回退：禁用 Hive 托管 Codex app-server 的 Responses WebSocket |
+| `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP 请求重试预算（默认 `1`；Codex 上游默认 `4`） |
+| `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex 流重试预算（默认 `1`；Codex 上游默认 `5`） |
+| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex 自动压缩阈值（默认 `160000`） |
 
 **优先级 ID → KEY → NAME**。多个同时给的话，高优先级决定 agent；低优先级值还会用来更新 display_name / 附加 external_key。
 

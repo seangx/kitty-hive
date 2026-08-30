@@ -7,7 +7,9 @@ import {
   buildAppServerInitializeParams,
   buildCodexAppServerArgs,
   buildThreadResumeParams,
+  detectResponsesTransportFallback,
   describeWebSocketEvent,
+  parseThreadTokenUsage,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
   type RpcTransport,
@@ -25,7 +27,7 @@ test('thread resume overrides stale rollout cwd and model transport without retu
     ),
     {
       threadId: '019fa11b-79eb-79e3-8628-863405bf27de',
-      modelProvider: 'hive-openai-http',
+      modelProvider: 'hive-openai',
       cwd: '/Users/example/.kitty-kitty/sessions/e2f81622',
       excludeTurns: true,
     },
@@ -48,7 +50,7 @@ test('app-server initialization enables the experimental resume field', () => {
   );
 });
 
-test('Hive app-server uses HTTPS Responses without changing interactive Codex', () => {
+test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS fallback', () => {
   assert.deepEqual(
     buildCodexAppServerArgs(
       'ws://127.0.0.1:4567',
@@ -60,9 +62,13 @@ test('Hive app-server uses HTTPS Responses without changing interactive Codex', 
       '--listen',
       'ws://127.0.0.1:4567',
       '-c',
-      'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,supports_standalone_web_search=true}',
+      'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=true,request_max_retries=1,stream_max_retries=1,supports_standalone_web_search=true}',
       '-c',
-      'model_provider="hive-openai-http"',
+      'model_provider="hive-openai"',
+      '-c',
+      'model_auto_compact_token_limit=160000',
+      '-c',
+      'model_auto_compact_token_limit_scope="total"',
       '-c',
       'mcp_servers.hive.url="http://127.0.0.1:4123/mcp"',
       '-c',
@@ -71,6 +77,87 @@ test('Hive app-server uses HTTPS Responses without changing interactive Codex', 
       'mcp_servers.hive.tools.hive_inbox.approval_mode="auto"',
     ],
   );
+});
+
+test('Hive app-server transport remains rollback-configurable without reopening retry amplification', () => {
+  const args = buildCodexAppServerArgs(
+    'ws://127.0.0.1:4567',
+    'http://127.0.0.1:4123/mcp',
+    [],
+    {
+      supportsWebsockets: false,
+      requestMaxRetries: 0,
+      streamMaxRetries: 0,
+      autoCompactTokenLimit: 120_000,
+    },
+  );
+  assert.ok(args.includes(
+    'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=0,stream_max_retries=0,supports_standalone_web_search=true}',
+  ));
+  assert.ok(args.includes('model_auto_compact_token_limit=120000'));
+  assert.ok(args.includes('model_auto_compact_token_limit_scope="total"'));
+});
+
+test('Hive app-server rejects invalid traffic guard settings', () => {
+  assert.throws(
+    () => buildCodexAppServerArgs('ws://127.0.0.1:1', 'http://127.0.0.1:4123/mcp', [], {
+      streamMaxRetries: -1,
+    }),
+    /streamMaxRetries must be a non-negative safe integer/,
+  );
+  assert.throws(
+    () => buildCodexAppServerArgs('ws://127.0.0.1:1', 'http://127.0.0.1:4123/mcp', [], {
+      autoCompactTokenLimit: 0,
+    }),
+    /autoCompactTokenLimit must be a positive safe integer/,
+  );
+});
+
+test('token usage telemetry is thread-scoped and labels estimates', () => {
+  assert.deepEqual(
+    parseThreadTokenUsage('thread/tokenUsage/updated', {
+      threadId: 'thread-current',
+      turnId: 'turn-1',
+      tokenUsage: {
+        last: {
+          inputTokens: 200_000,
+          cachedInputTokens: 190_000,
+          totalTokens: 201_000,
+        },
+        modelContextWindow: 250_000,
+      },
+    }, 'thread-current'),
+    {
+      threadId: 'thread-current',
+      turnId: 'turn-1',
+      inputTokens: 200_000,
+      cachedInputTokens: 190_000,
+      totalTokens: 201_000,
+      modelContextWindow: 250_000,
+      contextUtilization: 0.8,
+      approximateTokenTextBytes: 800_000,
+    },
+  );
+  assert.equal(
+    parseThreadTokenUsage('thread/tokenUsage/updated', {
+      threadId: 'thread-other',
+      turnId: 'turn-1',
+      tokenUsage: { last: { inputTokens: 1, cachedInputTokens: 1, totalTokens: 1 } },
+    }, 'thread-current'),
+    null,
+  );
+});
+
+test('transport fallback warning detection is exact', () => {
+  assert.equal(detectResponsesTransportFallback('warning', {
+    message: 'Falling back from WebSockets to HTTPS transport. broken pipe',
+  }), true);
+  assert.equal(detectResponsesTransportFallback('warning', {
+    message: 'another warning',
+  }), false);
+  assert.equal(detectResponsesTransportFallback('error', {
+    message: 'Falling back from WebSockets to HTTPS transport.',
+  }), false);
 });
 
 test('boot and in-process resume persist policy without starting model turns', () => {
