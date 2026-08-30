@@ -31,13 +31,18 @@
  *   CODEX_CMD         path to codex binary (default: `codex` from PATH)
  *   CODEX_PROFILE     codex profile name to pass via --profile (optional)
  *   CODEX_EXTRA_ARGS  extra space-separated args before the prompt
+ *   HIVE_CODEX_FORCE_HTTPS disable Responses WebSockets (emergency rollback)
+ *   HIVE_CODEX_REQUEST_MAX_RETRIES HTTP request retry budget (default 1)
+ *   HIVE_CODEX_STREAM_MAX_RETRIES stream retry budget (default 1)
+ *   HIVE_CODEX_AUTO_COMPACT_TOKENS auto-compact threshold (default 160000)
  */
 
 import { spawn, type ChildProcess } from 'node:child_process';
 import { execSync } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, parseCodexTerminalNotice, supervisorProcessIsMissing, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, supervisorProcessIsMissing, type CodexModelTransport, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -65,6 +70,37 @@ const HIVE_SUPERVISOR_PID = process.env.HIVE_SUPERVISOR_PID;
 // crash-looped the whole fleet on 2026-07-15. Resume of a large rollout jsonl
 // under boot-storm load can also legitimately exceed 30s.
 const THREAD_RPC_TIMEOUT_MS = 120_000;
+
+function boundedIntegerEnv(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    console.error(`[codex-channel] WARN: ${name} must be an integer in ${min}..${max}; using ${fallback}`);
+    return fallback;
+  }
+  return value;
+}
+
+const CODEX_MODEL_WEBSOCKETS = !/^(1|true|yes)$/i.test(process.env.HIVE_CODEX_FORCE_HTTPS?.trim() || '');
+const CODEX_REQUEST_MAX_RETRIES = boundedIntegerEnv(
+  'HIVE_CODEX_REQUEST_MAX_RETRIES',
+  DEFAULT_HIVE_REQUEST_MAX_RETRIES,
+  0,
+  10,
+);
+const CODEX_STREAM_MAX_RETRIES = boundedIntegerEnv(
+  'HIVE_CODEX_STREAM_MAX_RETRIES',
+  DEFAULT_HIVE_STREAM_MAX_RETRIES,
+  0,
+  10,
+);
+const CODEX_AUTO_COMPACT_TOKEN_LIMIT = boundedIntegerEnv(
+  'HIVE_CODEX_AUTO_COMPACT_TOKENS',
+  DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT,
+  32_000,
+  1_000_000,
+);
 
 // Allow CLI flags to override env
 for (let i = 2; i < process.argv.length; i++) {
@@ -322,6 +358,17 @@ let historyInjector: HistoryItemInjector | null = null;
 let controlServer: HttpServer | null = null;
 let controlUrl: string | null = null;      // http://127.0.0.1:<port> — supervisor drives in-process thread switch
 let supervisorWatchdog: NodeJS.Timeout | null = null;
+let modelTransport: CodexModelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
+let threadRolloutPath: string | null = null;
+
+function rolloutSizeMiB(): string {
+  if (!threadRolloutPath) return 'unknown';
+  try {
+    return (statSync(threadRolloutPath).size / 1024 / 1024).toFixed(1);
+  } catch {
+    return 'unknown';
+  }
+}
 
 /** Called when the codex app-server process fails post-ready OR this daemon's
  *  WebSocket transport closes / errors. A transport failure does not prove
@@ -425,6 +472,12 @@ async function setupAppserver(): Promise<void> {
     `ws://127.0.0.1:${port}`,
     ENV_URL,
     await listHiveToolNames(),
+    {
+      supportsWebsockets: CODEX_MODEL_WEBSOCKETS,
+      requestMaxRetries: CODEX_REQUEST_MAX_RETRIES,
+      streamMaxRetries: CODEX_STREAM_MAX_RETRIES,
+      autoCompactTokenLimit: CODEX_AUTO_COMPACT_TOKEN_LIMIT,
+    },
   );
   appserverProc = spawn(CODEX_CMD, appserverArgs, {
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -509,6 +562,22 @@ async function setupAppserver(): Promise<void> {
       return;
     }
     if (msg.method) {
+      if (detectResponsesTransportFallback(msg.method, msg.params)) {
+        modelTransport = 'https-fallback';
+        console.error(
+          `[codex-channel] model transport fallback: thread=${threadId ?? 'unknown'} appserverPid=${appserverProc?.pid ?? 'unknown'} transport=${modelTransport} requestRetries=${CODEX_REQUEST_MAX_RETRIES} streamRetries=${CODEX_STREAM_MAX_RETRIES}`,
+        );
+      }
+      const tokenUsage = parseThreadTokenUsage(msg.method, msg.params, threadId ?? undefined);
+      if (tokenUsage && tokenUsage.inputTokens >= 100_000) {
+        const contextPercent = tokenUsage.contextUtilization == null
+          ? 'unknown'
+          : (tokenUsage.contextUtilization * 100).toFixed(1);
+        const tokenTextMiB = (tokenUsage.approximateTokenTextBytes / 1024 / 1024).toFixed(2);
+        console.error(
+          `[codex-channel] high prompt usage: thread=${tokenUsage.threadId} turn=${tokenUsage.turnId} appserverPid=${appserverProc?.pid ?? 'unknown'} transport=${modelTransport} inputTokens=${tokenUsage.inputTokens} cachedInputTokens=${tokenUsage.cachedInputTokens} contextPercent=${contextPercent} approxTokenTextMiB=${tokenTextMiB} rolloutMiB=${rolloutSizeMiB()} rollout=${threadRolloutPath ?? 'unknown'} (wire payload may be larger)`,
+        );
+      }
       // Classify the terminal event BEFORE releasing daemon ownership. The
       // app-server broadcasts the same thread notification to this daemon and
       // an attached remote TUI; only non-daemon turns become Kitty completion
@@ -591,6 +660,7 @@ async function setupAppserver(): Promise<void> {
       const resumedId = resumeResp?.thread?.id;
       if (!resumedId) throw new Error(`thread/resume returned no thread.id: ${JSON.stringify(resumeResp)}`);
       threadId = resumedId;
+      threadRolloutPath = typeof resumeResp?.thread?.path === 'string' ? resumeResp.thread.path : null;
       resumed = true;
       console.error(`[codex-channel] appserver thread resumed: ${threadId} (metadata-only response)`);
     } catch (err) {
@@ -604,10 +674,15 @@ async function setupAppserver(): Promise<void> {
   if (!resumed) {
     const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
     threadId = threadResp?.thread?.id;
+    threadRolloutPath = typeof threadResp?.thread?.path === 'string' ? threadResp.thread.path : null;
     if (!threadId) throw new Error(`thread/start did not return thread.id: ${JSON.stringify(threadResp)}`);
     console.error(`[codex-channel] appserver thread started: ${threadId}`);
   }
   appserverWsUrl = `ws://127.0.0.1:${port}`;
+  modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
+  console.error(
+    `[codex-channel] model transport configured: ${modelTransport} (HTTPS fallback enabled, requestRetries=${CODEX_REQUEST_MAX_RETRIES}, streamRetries=${CODEX_STREAM_MAX_RETRIES}, autoCompactTokens=${CODEX_AUTO_COMPACT_TOKEN_LIMIT})`,
+  );
 
   // Bring up the TurnTracker now that we have a thread. RpcTransport is a
   // thin adapter over the local rpcCall — the tracker stays decoupled from
@@ -757,12 +832,14 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       const resumedId = resp?.thread?.id;
       if (!resumedId) return { ok: false, error: `thread/resume returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = resumedId;
+      threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
       console.error(`[codex-channel] in-process switch: resumed thread ${threadId} (metadata-only response)`);
     } else {
       const resp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
       const newId = resp?.thread?.id;
       if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = newId;
+      threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
     }
     turnTracker?.setThreadId(threadId!);
@@ -1241,6 +1318,8 @@ function cleanupAppserver() {
   terminalNotificationTracker = null;
   historyInjector = null;
   threadId = null;
+  threadRolloutPath = null;
+  modelTransport = CODEX_MODEL_WEBSOCKETS ? 'websocket' : 'https';
 }
 
 function shutdown(reason: NodeJS.Signals | 'supervisor-exit') {

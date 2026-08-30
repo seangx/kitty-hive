@@ -411,6 +411,10 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_AGENT_KEY` | Auto-register via opaque external_key (orchestrator-assigned; idempotent — same key returns same agent) |
 | `HIVE_AGENT_NAME` | Auto-register channel as this display_name (lowest priority; reuses latest match by name) |
 | `HIVE_EVENT_MODE` | Codex event ownership: `auto` starts daemon turns; `foreground` persists notifications without background inference |
+| `HIVE_CODEX_FORCE_HTTPS` | Emergency rollback: disable Responses WebSockets for Hive-owned Codex app-servers |
+| `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP request retry budget (default `1`; upstream Codex default is `4`) |
+| `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
+| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex auto-compaction threshold (default `160000`) |
 
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 
