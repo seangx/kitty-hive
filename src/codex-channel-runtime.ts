@@ -249,6 +249,23 @@ export interface ThreadTokenUsageSnapshot {
   approximateTokenTextBytes: number;
 }
 
+export type PostTurnCompactionOutcome =
+  | { kind: 'compacted'; threadId: string; turnId: string; inputTokens: number }
+  | { kind: 'failed'; threadId: string; turnId: string; inputTokens: number; status: string }
+  | { kind: 'skipped_no_usage'; threadId: string; turnId: string }
+  | { kind: 'skipped_below_threshold'; threadId: string; turnId: string; inputTokens: number }
+  | { kind: 'skipped_in_progress'; threadId: string; turnId: string }
+  | { kind: 'rpc_error'; threadId: string; turnId: string; inputTokens: number; error: Error }
+  | { kind: 'timeout'; threadId: string; turnId: string; inputTokens: number; afterMs: number };
+
+interface CompactionWaiter {
+  resolve: (result: 'completed' | { failedStatus: string }) => void;
+  timer: NodeJS.Timeout;
+  compactionTurnId?: string;
+  itemCompleted: boolean;
+  terminalCompleted: boolean;
+}
+
 /** Parse the app-server token notification without trusting its shape.
  *
  * `approximateTokenTextBytes` is intentionally only a token-text estimate.
@@ -295,9 +312,208 @@ export function parseThreadTokenUsage(
   };
 }
 
-export function detectResponsesTransportFallback(method: string, params: unknown): boolean {
+/** Serialize an explicit compaction after a large daemon-owned turn.
+ *
+ * Codex's built-in auto-compaction only runs while a turn still needs a
+ * follow-up sampling. A turn can therefore finish above the threshold and
+ * make the next Hive event upload the large history once before compaction.
+ * This coordinator closes that cross-event gap: the event queue awaits the
+ * canonical ContextCompaction item completion before consuming its next
+ * event. It never retries `thread/compact/start`, because an RPC response can
+ * be lost after Codex already accepted the operation.
+ */
+export class PostTurnCompactionCoordinator {
+  private readonly latestUsageByThread = new Map<string, ThreadTokenUsageSnapshot>();
+  private readonly waitersByThread = new Map<string, CompactionWaiter>();
+  private readonly ownedCompactionTurns = new Set<string>();
+
+  constructor(
+    private readonly transport: RpcTransport,
+    private readonly threshold: number,
+    private readonly completionTimeoutMs = 300_000,
+  ) {
+    positiveInteger(threshold, 'threshold');
+    positiveInteger(completionTimeoutMs, 'completionTimeoutMs');
+  }
+
+  observeNotification(method: string, params: unknown): boolean {
+    const usage = parseThreadTokenUsage(method, params);
+    if (usage) this.latestUsageByThread.set(usage.threadId, usage);
+
+    const p = recordOf(params);
+    const item = recordOf(p?.item);
+    const threadId = nonEmptyString(p?.threadId);
+    const notificationTurnId = nonEmptyString(p?.turnId)
+      ?? nonEmptyString(recordOf(p?.turn)?.id);
+    if (!threadId) return false;
+    const waiter = this.waitersByThread.get(threadId);
+
+    // Manual compaction is itself a Codex turn. Capture ownership at the
+    // earliest canonical lifecycle event, before pre-compact hooks run, so a
+    // hook failure cannot leak a false Kitty completion or hold the event
+    // queue until timeout.
+    if (method === 'turn/started' && waiter && notificationTurnId) {
+      if (waiter.compactionTurnId && waiter.compactionTurnId !== notificationTurnId) return false;
+      waiter.compactionTurnId = notificationTurnId;
+      this.ownedCompactionTurns.add(notificationTurnId);
+      return true;
+    }
+
+    const isCanonicalStart = method === 'item/started' && item?.type === 'contextCompaction';
+    if (isCanonicalStart && waiter && notificationTurnId) {
+      if (waiter.compactionTurnId && waiter.compactionTurnId !== notificationTurnId) return false;
+      waiter.compactionTurnId ??= notificationTurnId;
+      this.ownedCompactionTurns.add(notificationTurnId);
+      return true;
+    }
+
+    const isCanonicalCompletion = method === 'item/completed' && item?.type === 'contextCompaction';
+    const isLegacyCompletion = method === 'thread/compacted';
+    if ((isCanonicalCompletion || isLegacyCompletion) && waiter) {
+      if (notificationTurnId) {
+        if (waiter.compactionTurnId && waiter.compactionTurnId !== notificationTurnId) return false;
+        waiter.compactionTurnId ??= notificationTurnId;
+        this.ownedCompactionTurns.add(notificationTurnId);
+      }
+      waiter.itemCompleted = true;
+      this.finishSuccessfulCompactionIfReady(threadId, waiter);
+      return true;
+    }
+
+    if (method === 'turn/completed' && waiter && notificationTurnId === waiter.compactionTurnId) {
+      const status = nonEmptyString(recordOf(p?.turn)?.status) ?? 'completed';
+      if (status !== 'completed') {
+        this.finishCompaction(threadId, waiter, { failedStatus: status });
+      } else {
+        waiter.terminalCompleted = true;
+        this.finishSuccessfulCompactionIfReady(threadId, waiter);
+      }
+      return true;
+    }
+    if (
+      method === 'error' && waiter && notificationTurnId === waiter.compactionTurnId
+      && p?.willRetry !== true
+    ) {
+      this.finishCompaction(threadId, waiter, { failedStatus: 'failed' });
+      return true;
+    }
+    return false;
+  }
+
+  async compactAfterTurn(threadId: string, turnId: string): Promise<PostTurnCompactionOutcome> {
+    const usage = this.latestUsageByThread.get(threadId);
+    if (!usage || usage.turnId !== turnId) {
+      return { kind: 'skipped_no_usage', threadId, turnId };
+    }
+    // Match Codex's configured AutoCompactTokenLimitScope::Total semantics.
+    if (usage.totalTokens < this.threshold) {
+      return { kind: 'skipped_below_threshold', threadId, turnId, inputTokens: usage.inputTokens };
+    }
+    if (this.waitersByThread.has(threadId)) {
+      return { kind: 'skipped_in_progress', threadId, turnId };
+    }
+
+    let resolveCompletion!: (result: 'completed' | { failedStatus: string }) => void;
+    const completion = new Promise<'completed' | { failedStatus: string }>((resolve) => {
+      resolveCompletion = resolve;
+    });
+    const timeout = new Promise<'timeout'>((resolve) => {
+      const timer = setTimeout(() => {
+        if (this.waitersByThread.get(threadId)?.timer === timer) {
+          this.waitersByThread.delete(threadId);
+          resolve('timeout');
+        }
+      }, this.completionTimeoutMs);
+      this.waitersByThread.set(threadId, {
+        resolve: resolveCompletion,
+        timer,
+        itemCompleted: false,
+        terminalCompleted: false,
+      });
+    });
+
+    try {
+      await this.transport.call('thread/compact/start', { threadId });
+    } catch (err) {
+      const waiter = this.waitersByThread.get(threadId);
+      if (waiter) {
+        clearTimeout(waiter.timer);
+        this.waitersByThread.delete(threadId);
+      }
+      return {
+        kind: 'rpc_error',
+        threadId,
+        turnId,
+        inputTokens: usage.inputTokens,
+        error: err instanceof Error ? err : new Error(String(err)),
+      };
+    }
+
+    const result = await Promise.race([completion, timeout]);
+    if (result === 'timeout') {
+      return {
+        kind: 'timeout',
+        threadId,
+        turnId,
+        inputTokens: usage.inputTokens,
+        afterMs: this.completionTimeoutMs,
+      };
+    }
+    if (result !== 'completed') {
+      return {
+        kind: 'failed',
+        threadId,
+        turnId,
+        inputTokens: usage.inputTokens,
+        status: result.failedStatus,
+      };
+    }
+    return { kind: 'compacted', threadId, turnId, inputTokens: usage.inputTokens };
+  }
+
+  isOwnedTurn(turnId: string | undefined): boolean {
+    return !!turnId && this.ownedCompactionTurns.has(turnId);
+  }
+
+  releaseOwnedTurn(turnId: string | undefined): void {
+    if (turnId) this.ownedCompactionTurns.delete(turnId);
+  }
+
+  clear(): void {
+    this.latestUsageByThread.clear();
+    for (const waiter of this.waitersByThread.values()) clearTimeout(waiter.timer);
+    this.waitersByThread.clear();
+    this.ownedCompactionTurns.clear();
+  }
+
+  private finishSuccessfulCompactionIfReady(threadId: string, waiter: CompactionWaiter): void {
+    if (waiter.itemCompleted && waiter.terminalCompleted) {
+      this.finishCompaction(threadId, waiter, 'completed');
+    }
+  }
+
+  private finishCompaction(
+    threadId: string,
+    waiter: CompactionWaiter,
+    result: 'completed' | { failedStatus: string },
+  ): void {
+    clearTimeout(waiter.timer);
+    this.waitersByThread.delete(threadId);
+    this.latestUsageByThread.delete(threadId);
+    waiter.resolve(result);
+  }
+}
+
+export function detectResponsesTransportFallback(
+  method: string,
+  params: unknown,
+  expectedThreadId?: string,
+): boolean {
   if (method !== 'warning') return false;
-  const message = nonEmptyString(recordOf(params)?.message);
+  const p = recordOf(params);
+  const message = nonEmptyString(p?.message);
+  const warningThreadId = nonEmptyString(p?.threadId);
+  if (expectedThreadId && warningThreadId && warningThreadId !== expectedThreadId) return false;
   return !!message && message.includes('Falling back from WebSockets to HTTPS transport');
 }
 

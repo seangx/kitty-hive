@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import {
   CodexTerminalNotificationTracker,
+  PostTurnCompactionCoordinator,
   TurnTracker,
   buildAppServerInitializeParams,
   buildCodexAppServerArgs,
@@ -150,14 +151,202 @@ test('token usage telemetry is thread-scoped and labels estimates', () => {
 
 test('transport fallback warning detection is exact', () => {
   assert.equal(detectResponsesTransportFallback('warning', {
+    threadId: 'thread-current',
     message: 'Falling back from WebSockets to HTTPS transport. broken pipe',
-  }), true);
+  }, 'thread-current'), true);
+  assert.equal(detectResponsesTransportFallback('warning', {
+    threadId: 'thread-stale',
+    message: 'Falling back from WebSockets to HTTPS transport. broken pipe',
+  }, 'thread-current'), false);
   assert.equal(detectResponsesTransportFallback('warning', {
     message: 'another warning',
-  }), false);
+  }, 'thread-current'), false);
   assert.equal(detectResponsesTransportFallback('error', {
     message: 'Falling back from WebSockets to HTTPS transport.',
-  }), false);
+  }, 'thread-current'), false);
+});
+
+test('large completed turns compact before the event queue can continue', async () => {
+  const calls: Array<{ method: string; params: unknown }> = [];
+  const transport: RpcTransport = {
+    async call(method, params) {
+      calls.push({ method, params });
+      return {};
+    },
+  };
+  const compactor = new PostTurnCompactionCoordinator(transport, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+      modelContextWindow: 250_000,
+    },
+  });
+
+  let settled = false;
+  const pending = compactor.compactAfterTurn('thread-current', 'turn-large')
+    .then((outcome) => {
+      settled = true;
+      return outcome;
+    });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(calls, [{
+    method: 'thread/compact/start',
+    params: { threadId: 'thread-current' },
+  }]);
+  assert.equal(settled, false, 'queue must remain blocked until ContextCompaction completes');
+  assert.equal(compactor.observeNotification('item/started', {
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    item: { type: 'contextCompaction', id: 'compact-1' },
+  }), true);
+  assert.equal(compactor.isOwnedTurn('turn-compact'), true, 'manual compact must not notify Kitty');
+  assert.equal(compactor.observeNotification('item/completed', {
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    item: { type: 'contextCompaction', id: 'compact-1' },
+  }), true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(settled, false, 'queue must also await the compaction turn terminal');
+  const compactTerminal = {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'completed' },
+  };
+  assert.equal(compactor.observeNotification('turn/completed', compactTerminal), true);
+  const terminalTracker = new CodexTerminalNotificationTracker('thread-current');
+  assert.equal(
+    ignoredReason(terminalTracker.observe(
+      'turn/completed',
+      compactTerminal,
+      compactor.isOwnedTurn('turn-compact'),
+    )),
+    'daemon-owned',
+  );
+  assert.deepEqual(await pending, {
+    kind: 'compacted',
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    inputTokens: 175_000,
+  });
+  compactor.releaseOwnedTurn('turn-compact');
+  assert.equal(compactor.isOwnedTurn('turn-compact'), false);
+});
+
+test('post-turn compaction ignores stale or below-threshold usage', async () => {
+  let calls = 0;
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      calls += 1;
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-old',
+    tokenUsage: {
+      last: { inputTokens: 200_000, cachedInputTokens: 190_000, totalTokens: 201_000 },
+    },
+  });
+  assert.deepEqual(
+    await compactor.compactAfterTurn('thread-current', 'turn-new'),
+    { kind: 'skipped_no_usage', threadId: 'thread-current', turnId: 'turn-new' },
+  );
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-small',
+    tokenUsage: {
+      last: { inputTokens: 80_000, cachedInputTokens: 70_000, totalTokens: 81_000 },
+    },
+  });
+  assert.deepEqual(
+    await compactor.compactAfterTurn('thread-current', 'turn-small'),
+    {
+      kind: 'skipped_below_threshold',
+      threadId: 'thread-current',
+      turnId: 'turn-small',
+      inputTokens: 80_000,
+    },
+  );
+  assert.equal(calls, 0);
+});
+
+test('pre-compact hook failure terminates without an item or queue timeout', async () => {
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+    },
+  });
+
+  let settled = false;
+  const pending = compactor.compactAfterTurn('thread-current', 'turn-large')
+    .then((outcome) => {
+      settled = true;
+      return outcome;
+    });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(compactor.observeNotification('turn/started', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'inProgress' },
+  }), true);
+  assert.equal(compactor.isOwnedTurn('turn-compact'), true);
+  assert.equal(compactor.observeNotification('turn/completed', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'interrupted' },
+  }), true);
+  assert.deepEqual(await pending, {
+    kind: 'failed',
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    inputTokens: 175_000,
+    status: 'interrupted',
+  });
+  assert.equal(settled, true, 'failed pre-compact hook must not wait for ContextCompaction item');
+  assert.equal(compactor.isOwnedTurn('turn-compact'), true, 'ownership survives until terminal classification');
+  compactor.releaseOwnedTurn('turn-compact');
+});
+
+test('final compaction error terminates without waiting for an item', async () => {
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+    },
+  });
+  const pending = compactor.compactAfterTurn('thread-current', 'turn-large');
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  compactor.observeNotification('turn/started', {
+    threadId: 'thread-current',
+    turn: { id: 'turn-compact', status: 'inProgress' },
+  });
+  assert.equal(compactor.observeNotification('error', {
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    willRetry: false,
+    error: { message: 'pre-compact hook failed' },
+  }), true);
+  assert.deepEqual(await pending, {
+    kind: 'failed',
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    inputTokens: 175_000,
+    status: 'failed',
+  });
+  assert.equal(compactor.isOwnedTurn('turn-compact'), true);
+  compactor.releaseOwnedTurn('turn-compact');
 });
 
 test('boot and in-process resume persist policy without starting model turns', () => {
