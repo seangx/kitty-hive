@@ -104,8 +104,8 @@ export interface AppServerInitializeParams {
 
 export const HIVE_MODEL_PROVIDER_ID = 'hive-openai';
 export const HIVE_HTTP_MODEL_PROVIDER_ID = 'hive-openai-http';
-export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 1;
-export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 1;
+export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 3;
+export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 3;
 export const DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT = 160_000;
 export const DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS = 2_000;
 export const DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS = 60_000;
