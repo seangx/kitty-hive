@@ -686,7 +686,12 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
           };
         }
         db.setAgentThreadId(agent_id, targetThreadId);
-        const snap = await requestDaemonRespawn(agent_id, 30_000);
+        const snap = await requestDaemonRespawn(agent_id, 30_000, {
+          // A non-empty target is an explicit operator selection and must not
+          // silently degrade to thread/start after respawn. Reset deliberately
+          // clears the strict intent so creating a fresh thread remains valid.
+          strictThreadId: targetThreadId || null,
+        });
         return { snap, mode: 'respawn' as const, error: null, status: 200, ready: snap?.ready ?? false };
       });
 

@@ -857,7 +857,10 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   const uncertaintyThrowIndex = channelSource.indexOf('throw new ColdResumeAppserverRecycleError(', uncertaintyIndex);
   const recycleLogIndex = channelSource.indexOf('cold-resume state could not be repaired in-place');
   const recycleCleanupIndex = channelSource.indexOf('cleanupAppserver();', recycleLogIndex);
-  const forcedHttpsIndex = channelSource.indexOf('await setupAppserver({ forceHttps: true })', recycleCleanupIndex);
+  const forcedHttpsIndex = channelSource.indexOf(
+    'await setupAppserver({ ...startupTarget, forceHttps: true })',
+    recycleCleanupIndex,
+  );
   const switchRecycleIndex = channelSource.indexOf('in-process switch requires app-server recycle');
   const switchCleanupIndex = channelSource.indexOf('cleanupAppserver();', switchRecycleIndex);
   const switchForcedHttpsIndex = channelSource.indexOf(
@@ -912,7 +915,7 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
   assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
   assert.match(channelSource, /promoteColdResumeProvider\(/);
-  assert.match(channelSource, /setupAppserver\(\{ forceHttps: true \}\)/);
+  assert.match(channelSource, /setupAppserver\(\{ \.\.\.startupTarget, forceHttps: true \}\)/);
   assert.match(
     channelSource,
     /if \(!lifecycleGate\.tryStartSwitch\(\)\)/,
@@ -926,6 +929,33 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   assert.match(channelSource, /result\.busy \? 409 : 500/);
   assert.match(channelSource, /generation !== appserverGeneration/);
   assert.doesNotMatch(channelSource, /thread\/read/);
+});
+
+test('explicit respawn targets remain strict while inherited restart targets may self-heal', () => {
+  const channelSource = readFileSync(
+    new URL('../codex-channel.ts', import.meta.url),
+    'utf8',
+  );
+  const strictEnvIndex = channelSource.indexOf("process.env.HIVE_AGENT_STRICT_THREAD_ID || ''");
+  const startupTargetIndex = channelSource.indexOf('const startupTarget = HIVE_AGENT_STRICT_THREAD_ID');
+  const strictSetupIndex = channelSource.indexOf('await setupAppserver(startupTarget)', startupTargetIndex);
+  const strictHttpsIndex = channelSource.indexOf(
+    'await setupAppserver({ ...startupTarget, forceHttps: true })',
+    strictSetupIndex,
+  );
+  const requiredIndex = channelSource.indexOf(
+    "CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID",
+    strictHttpsIndex,
+  );
+
+  assert.ok(strictEnvIndex >= 0);
+  assert.ok(startupTargetIndex > strictEnvIndex);
+  assert.ok(strictSetupIndex > startupTargetIndex);
+  assert.ok(strictHttpsIndex > strictSetupIndex);
+  assert.ok(
+    requiredIndex > strictHttpsIndex,
+    'strict resume rejection must be fatal instead of falling back to exec/thread-start',
+  );
 });
 
 test('WebSocket diagnostics expose nested Undici errors and close details', () => {

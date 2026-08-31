@@ -91,6 +91,11 @@ interface DaemonInfo {
 }
 
 const daemons = new Map<string, DaemonInfo>();
+// Non-empty targets explicitly selected through /admin/codex-set-thread.
+// Unlike the durable agents.thread_id (which may self-heal on an ordinary
+// restart), these in-memory intents must fail closed across every respawn
+// attempt until the requested thread itself announces ready.
+const strictThreadIntents = new Map<string, string>();
 let shuttingDown = false;
 let supervisorPort = 4123;  // set by startCodexSupervisor
 
@@ -169,6 +174,7 @@ export interface CodexDaemonEnvOptions {
   projectDir: string;
   eventMode: Agent['event_mode'];
   threadId: string;
+  strictThreadId?: string;
   supervisorPort: number;
   supervisorPid: number;
 }
@@ -197,7 +203,18 @@ export function buildCodexDaemonEnv(
   cleanEnv.CODEX_APPSERVER_CWD = opts.projectDir;
   cleanEnv.HIVE_EVENT_MODE = opts.eventMode;
   if (opts.threadId) cleanEnv.HIVE_AGENT_THREAD_ID = opts.threadId;
+  if (opts.strictThreadId) cleanEnv.HIVE_AGENT_STRICT_THREAD_ID = opts.strictThreadId;
   return cleanEnv;
+}
+
+/** A daemon spawned for an explicit non-empty set-thread target may announce
+ * ready only on that exact target. This prevents an authoritative resume
+ * rejection from being hidden by a fallback thread/start. */
+export function strictThreadReadyMatches(
+  strictThreadId: string | undefined,
+  announcedThreadId: string,
+): boolean {
+  return !strictThreadId || strictThreadId === announcedThreadId;
 }
 
 /** Signal the complete npx -> tsx -> codex-channel process tree on POSIX.
@@ -328,6 +345,7 @@ function spawnDaemon(
     projectDir,
     eventMode: eligible.event_mode || 'auto',
     threadId: eligible.thread_id,
+    strictThreadId: strictThreadIntents.get(agentId),
     supervisorPort,
     supervisorPid: process.pid,
   });
@@ -615,6 +633,16 @@ export function markDaemonReady(
 ): boolean {
   const info = daemons.get(agentId);
   if (!info || info.intentionalShutdown) return false;
+  const strictThreadId = strictThreadIntents.get(agentId);
+  if (!strictThreadReadyMatches(strictThreadId, threadId)) {
+    log(
+      'warn',
+      `[codex-supervisor] rejecting ready for "${info.displayName}": `
+      + `explicit thread ${strictThreadId} != announced ${threadId}; terminating mismatched daemon`,
+    );
+    signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
+    return false;
+  }
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
@@ -630,6 +658,7 @@ export function markDaemonReady(
   try { setAgentThreadId(agentId, threadId); } catch (err) {
     log('warn', `[codex-supervisor] failed to persist thread_id for ${agentId}: ${err}`);
   }
+  if (strictThreadId) strictThreadIntents.delete(agentId);
   log('info', `[codex-supervisor] daemon "${info.displayName}" ready: ws=${wsUrl} thread=${threadId.slice(0, 8)}...`);
 
   // Crash-loop counter auto-reset: if this daemon stays alive for 30s,
@@ -695,6 +724,7 @@ export function notifyAgentCreated(agentId: string): boolean {
  *  respawn logic — no per-daemon "intentional kill" flag needed.
  *  Returns true if a daemon was killed. */
 export function notifyAgentRemoved(agentId: string): boolean {
+  strictThreadIntents.delete(agentId);
   const info = daemons.get(agentId);
   if (!info) return false;
   log('info', `[codex-supervisor] notify-agent-removed: "${info.displayName}" (${agentId.slice(-12)}) → killing daemon`);
@@ -812,7 +842,16 @@ export async function switchDaemonThread(
  *  Returns the ready snapshot, or null on timeout. The caller is expected to
  *  have validated that the agent exists and is tool=codex; this function
  *  trusts that. */
-export async function requestDaemonRespawn(agentId: string, timeoutMs = 30_000): Promise<DaemonSnapshot | null> {
+export async function requestDaemonRespawn(
+  agentId: string,
+  timeoutMs = 30_000,
+  options?: { strictThreadId?: string | null },
+): Promise<DaemonSnapshot | null> {
+  if (options && 'strictThreadId' in options) {
+    const strictThreadId = options.strictThreadId?.trim() || '';
+    if (strictThreadId) strictThreadIntents.set(agentId, strictThreadId);
+    else strictThreadIntents.delete(agentId);
+  }
   const existing = daemons.get(agentId);
   if (existing) {
     log('info', `[codex-supervisor] requestDaemonRespawn: SIGTERM existing daemon for "${existing.displayName}" (${agentId.slice(-12)}), intentional=true`);

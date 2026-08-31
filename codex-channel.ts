@@ -66,6 +66,10 @@ const CODEX_EXTRA_ARGS = (process.env.CODEX_EXTRA_ARGS || '').trim();
 const CODEX_CHANNEL_MODE = (process.env.CODEX_CHANNEL_MODE || 'auto') as 'auto' | 'appserver' | 'exec';
 const CODEX_APPSERVER_CWD = process.env.CODEX_APPSERVER_CWD || process.cwd();
 const HIVE_SUPERVISOR_PID = process.env.HIVE_SUPERVISOR_PID;
+// Present only while the supervisor is applying an explicit non-empty
+// set-thread target through respawn. Natural restarts inherit only
+// HIVE_AGENT_THREAD_ID and keep the historical stale-target self-heal.
+const HIVE_AGENT_STRICT_THREAD_ID = (process.env.HIVE_AGENT_STRICT_THREAD_ID || '').trim();
 // Timeout for thread/start + thread/resume. codex 0.144 blocks these ~30s on
 // a models-refresh child-process hang (vendor bug, openai/codex#14795-family:
 // "failed to refresh available models: timeout waiting for child process to
@@ -1622,17 +1626,20 @@ async function listenSSE() {
 
 async function setupPushMode() {
   if (CODEX_CHANNEL_MODE === 'exec') {
-    if (HIVE_EVENT_MODE === 'foreground') {
-      throw new Error('foreground event mode requires codex app-server; legacy exec mode starts background model turns');
+    if (HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID) {
+      throw new Error('foreground mode or an explicit strict thread target requires codex app-server; legacy exec mode cannot preserve that contract');
     }
     pushMode = 'exec';
     console.error(`[codex-channel] mode: exec (per-event codex spawn; forced via CODEX_CHANNEL_MODE=exec)`);
     return;
   }
   // 'auto' or 'appserver': try appserver
+  const startupTarget = HIVE_AGENT_STRICT_THREAD_ID
+    ? { persistedThreadId: HIVE_AGENT_STRICT_THREAD_ID }
+    : {};
   try {
     try {
-      await setupAppserver();
+      await setupAppserver(startupTarget);
     } catch (err) {
       if (!(err instanceof ColdResumeAppserverRecycleError) || !CODEX_MODEL_WEBSOCKETS) {
         throw err;
@@ -1642,12 +1649,12 @@ async function setupPushMode() {
         + `stage=${err.stage}; recycling app-server with HTTPS forced`,
       );
       cleanupAppserver();
-      await setupAppserver({ forceHttps: true });
+      await setupAppserver({ ...startupTarget, forceHttps: true });
     }
     pushMode = 'appserver';
     console.error(`[codex-channel] mode: appserver (long-lived codex thread; context persists across events)`);
   } catch (err) {
-    if (CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground') {
+    if (CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID) {
       console.error(`[codex-channel] appserver is required but setup failed: ${err}`);
       cleanupAppserver();
       throw err;

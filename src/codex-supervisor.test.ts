@@ -12,6 +12,7 @@ import {
   shouldDetachDaemonProcess,
   signalCodexAppserverProcessTree,
   signalDaemonProcessTree,
+  strictThreadReadyMatches,
 } from './codex-supervisor.js';
 
 test('busy in-process thread switches are authoritative and never a respawn fallback', () => {
@@ -60,12 +61,20 @@ test('admin writes a requested target only after live control is unavailable', (
   const switchIndex = source.indexOf('await switchDaemonThread(agent_id, targetThreadId)');
   const unavailableIndex = source.indexOf("if (switched.kind !== 'unavailable')", switchIndex);
   const commitIndex = source.indexOf('db.setAgentThreadId(agent_id, targetThreadId)', unavailableIndex);
-  const respawnIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000)', commitIndex);
+  const respawnIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000, {', commitIndex);
+  const strictIntentIndex = source.indexOf('strictThreadId: targetThreadId || null', respawnIndex);
 
   assert.ok(switchIndex >= 0);
   assert.ok(unavailableIndex > switchIndex);
   assert.ok(commitIndex > unavailableIndex, 'live-control requests must not pre-write the DB target');
   assert.ok(respawnIndex > commitIndex, 'unavailable fallback must commit before daemon env injection');
+  assert.ok(strictIntentIndex > respawnIndex, 'explicit targets must stay strict across the respawn fallback');
+});
+
+test('strict respawn intent accepts only the explicitly requested thread', () => {
+  assert.equal(strictThreadReadyMatches('target-thread', 'target-thread'), true);
+  assert.equal(strictThreadReadyMatches('target-thread', 'fresh-thread'), false);
+  assert.equal(strictThreadReadyMatches(undefined, 'fresh-thread'), true);
 });
 
 test('boot queue starts only the configured number until slots settle', () => {
@@ -130,6 +139,7 @@ test('daemon env restores only the authoritative agent Kitty key', () => {
       projectDir: '/Users/example/project',
       eventMode: 'auto',
       threadId: 'thread-789',
+      strictThreadId: 'thread-789',
       supervisorPort: 4123,
       supervisorPid: 99,
     },
@@ -145,6 +155,7 @@ test('daemon env restores only the authoritative agent Kitty key', () => {
     CODEX_APPSERVER_CWD: '/Users/example/project',
     HIVE_EVENT_MODE: 'auto',
     HIVE_AGENT_THREAD_ID: 'thread-789',
+    HIVE_AGENT_STRICT_THREAD_ID: 'thread-789',
   });
 });
 
@@ -165,6 +176,7 @@ test('daemon env does not invent a Kitty key for unmanaged agents', () => {
 
   assert.equal(env.HIVE_AGENT_KEY, undefined);
   assert.equal(env.HIVE_AGENT_THREAD_ID, undefined);
+  assert.equal(env.HIVE_AGENT_STRICT_THREAD_ID, undefined);
 });
 
 test('detects a project_dir added after the daemon was spawned', () => {
