@@ -128,6 +128,7 @@ test('daemon env restores only the authoritative agent Kitty key', () => {
   const env = buildCodexDaemonEnv(
     {
       PATH: '/opt/homebrew/bin',
+      CODEX_CMD: 'codex-debug',
       HIVE_AGENT_KEY: 'wrong-inherited-key',
       HIVE_AGENT_ID: 'wrong-inherited-agent',
       HIVE_EVENT_MODE: 'foreground',
@@ -147,6 +148,7 @@ test('daemon env restores only the authoritative agent Kitty key', () => {
 
   assert.deepEqual(env, {
     PATH: '/opt/homebrew/bin',
+    CODEX_CMD: 'codex-debug',
     HIVE_AGENT_ID: 'agent-123',
     HIVE_AGENT_NAME: 'reviewer',
     HIVE_AGENT_KEY: 'kitty-session-456',

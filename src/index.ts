@@ -24,6 +24,11 @@ import {
   updateWorkflowTemplate,
   workflowTemplatesDir,
 } from './graph-workflow.js';
+import {
+  getNodeConfig,
+  resolveServeCodexCommand,
+  setNodeConfig,
+} from './node-config.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -68,6 +73,8 @@ async function cmdServe() {
   const { port, dbPath } = parseFlags(1);
   if (args.includes('--verbose') || args.includes('-v')) setLogLevel('debug');
   if (args.includes('--quiet') || args.includes('-q')) setLogLevel('warn');
+  const codexCommand = resolveServeCodexCommand(process.env.CODEX_CMD, getNodeConfig());
+  if (codexCommand) process.env.CODEX_CMD = codexCommand;
   await startServer(port, dbPath);
 }
 
@@ -1568,25 +1575,6 @@ async function cmdTeamRules() {
   process.exit(1);
 }
 
-// --- Node config ---
-
-function getConfigPath(): string {
-  return join(homedir(), '.kitty-hive', 'config.json');
-}
-
-function getNodeConfig(): { name?: string } {
-  const p = getConfigPath();
-  if (!existsSync(p)) return {};
-  try { return JSON.parse(readFileSync(p, 'utf8')); } catch { return {}; }
-}
-
-function setNodeConfig(config: Record<string, any>): void {
-  const p = getConfigPath();
-  mkdirSync(join(p, '..'), { recursive: true });
-  const existing = getNodeConfig();
-  writeFileSync(p, JSON.stringify({ ...existing, ...config }, null, 2) + '\n');
-}
-
 function getNodeName(): string {
   return getNodeConfig().name || hostname().split('.')[0];
 }
@@ -2360,7 +2348,7 @@ async function cmdFilesClean() {
   console.log(`✅ Removed ${result.removed} federation file(s) older than ${maxAgeDays} day(s); kept ${result.kept}.`);
 }
 
-const CONFIG_KEYS = ['name'] as const;
+const CONFIG_KEYS = ['name', 'codexCommand'] as const;
 
 async function cmdConfigSet() {
   // kitty-hive config set name marvin
@@ -2808,7 +2796,8 @@ Subcommands:
   set [key] [value]    Set a config value (interactive when args omitted)
 
 Known keys:
-  name    Node name (the label peers see for this machine)`);
+  name          Node name (the label peers see for this machine)
+  codexCommand  Codex executable used by supervised daemons (e.g. codex-debug)`);
 }
 
 function showFilesHelp() {

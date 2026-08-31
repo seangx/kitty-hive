@@ -419,6 +419,16 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS` | Cold-start compaction SLA before the thread stays on HTTPS (default `60000`) |
 | `HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB` | Compact a legacy rollout with no recoverable usage once it reaches this size (default `64`) |
 
+To make every Codex daemon launched by `kitty-hive serve` use a different
+executable, persist it in the node config:
+
+```bash
+kitty-hive config set codexCommand codex-debug
+```
+
+An explicit `CODEX_CMD` environment variable still overrides this setting for
+that invocation. Without either setting, Hive uses `codex` from `PATH`.
+
 When a persisted Codex thread is restored with WebSockets enabled, Hive first
 resumes it on an HTTPS-only bootstrap provider. Modern paginated resumes replay
 token usage; legacy `excludeTurns` resumes are covered by a bounded tail scan of
