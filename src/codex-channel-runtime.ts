@@ -160,7 +160,6 @@ export interface CodexAppServerModelOptions {
   supportsWebsockets?: boolean;
   requestMaxRetries?: number;
   streamMaxRetries?: number;
-  autoCompactTokenLimit?: number;
 }
 
 function nonNegativeInteger(value: number, field: string): number {
@@ -201,10 +200,6 @@ export function buildCodexAppServerArgs(
     options.streamMaxRetries ?? DEFAULT_HIVE_STREAM_MAX_RETRIES,
     'streamMaxRetries',
   );
-  const autoCompactTokenLimit = positiveInteger(
-    options.autoCompactTokenLimit ?? DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT,
-    'autoCompactTokenLimit',
-  );
   const args = [
     'app-server',
     '--listen', listenUrl,
@@ -217,8 +212,6 @@ export function buildCodexAppServerArgs(
     '-c', `model_providers.${HIVE_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=${supportsWebsockets},request_max_retries=${requestMaxRetries},stream_max_retries=${streamMaxRetries},supports_standalone_web_search=true}`,
     '-c', `model_providers.${HIVE_HTTP_MODEL_PROVIDER_ID}={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=${requestMaxRetries},stream_max_retries=${streamMaxRetries},supports_standalone_web_search=true}`,
     '-c', `model_provider=${JSON.stringify(HIVE_MODEL_PROVIDER_ID)}`,
-    '-c', `model_auto_compact_token_limit=${autoCompactTokenLimit}`,
-    '-c', 'model_auto_compact_token_limit_scope="total"',
     // Keep the CLI override layer transport-complete and bind the app-server
     // to the supervisor that spawned it, not a possibly stale user URL.
     '-c', `mcp_servers.hive.url=${JSON.stringify(hiveMcpUrl)}`,

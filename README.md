@@ -414,7 +414,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_FORCE_HTTPS` | Emergency rollback: disable Responses WebSockets for Hive-owned Codex app-servers |
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP request retry budget (default `1`; upstream Codex default is `4`) |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
-| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex auto-compaction threshold (default `160000`) |
+| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive post-turn/cold-resume proactive compaction threshold (default `160000`); Codex in-turn auto-compaction uses the model default |
 | `HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS` | Wait for modern Codex's post-resume usage replay (default `2000`) |
 | `HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS` | Cold-start compaction SLA before the thread stays on HTTPS (default `60000`) |
 | `HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB` | Compact a legacy rollout with no recoverable usage once it reaches this size (default `64`) |

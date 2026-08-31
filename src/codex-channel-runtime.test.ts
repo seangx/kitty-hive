@@ -116,10 +116,6 @@ test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS f
       '-c',
       'model_provider="hive-openai"',
       '-c',
-      'model_auto_compact_token_limit=160000',
-      '-c',
-      'model_auto_compact_token_limit_scope="total"',
-      '-c',
       'mcp_servers.hive.url="http://127.0.0.1:4123/mcp"',
       '-c',
       'mcp_servers.hive.tools.hive_start.approval_mode="auto"',
@@ -138,7 +134,6 @@ test('Hive app-server transport remains rollback-configurable without reopening 
       supportsWebsockets: false,
       requestMaxRetries: 0,
       streamMaxRetries: 0,
-      autoCompactTokenLimit: 120_000,
     },
   );
   assert.ok(args.includes(
@@ -147,8 +142,22 @@ test('Hive app-server transport remains rollback-configurable without reopening 
   assert.ok(args.includes(
     'model_providers.hive-openai-http={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=false,request_max_retries=0,stream_max_retries=0,supports_standalone_web_search=true}',
   ));
-  assert.ok(args.includes('model_auto_compact_token_limit=120000'));
-  assert.ok(args.includes('model_auto_compact_token_limit_scope="total"'));
+});
+
+test('Hive app-server leaves Codex auto-compaction policy at its model defaults', () => {
+  const args = buildCodexAppServerArgs(
+    'ws://127.0.0.1:4567',
+    'http://127.0.0.1:4123/mcp',
+    [],
+  );
+  assert.equal(
+    args.some((arg) => arg.startsWith('model_auto_compact_token_limit=')),
+    false,
+  );
+  assert.equal(
+    args.some((arg) => arg.startsWith('model_auto_compact_token_limit_scope=')),
+    false,
+  );
 });
 
 test('Hive app-server rejects invalid traffic guard settings', () => {
@@ -157,12 +166,6 @@ test('Hive app-server rejects invalid traffic guard settings', () => {
       streamMaxRetries: -1,
     }),
     /streamMaxRetries must be a non-negative safe integer/,
-  );
-  assert.throws(
-    () => buildCodexAppServerArgs('ws://127.0.0.1:1', 'http://127.0.0.1:4123/mcp', [], {
-      autoCompactTokenLimit: 0,
-    }),
-    /autoCompactTokenLimit must be a positive safe integer/,
   );
 });
 

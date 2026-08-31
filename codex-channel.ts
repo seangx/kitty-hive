@@ -34,7 +34,7 @@
  *   HIVE_CODEX_FORCE_HTTPS disable Responses WebSockets (emergency rollback)
  *   HIVE_CODEX_REQUEST_MAX_RETRIES HTTP request retry budget (default 1)
  *   HIVE_CODEX_STREAM_MAX_RETRIES stream retry budget (default 1)
- *   HIVE_CODEX_AUTO_COMPACT_TOKENS auto-compact threshold (default 160000)
+ *   HIVE_CODEX_AUTO_COMPACT_TOKENS post-turn/cold-resume compaction threshold (default 160000)
  *   HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS usage replay wait (default 2000)
  *   HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS startup compact SLA (default 60000)
  *   HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB legacy size guard (default 64)
@@ -718,7 +718,6 @@ async function setupAppserver(options: {
       supportsWebsockets: appserverModelWebsockets,
       requestMaxRetries: CODEX_REQUEST_MAX_RETRIES,
       streamMaxRetries: CODEX_STREAM_MAX_RETRIES,
-      autoCompactTokenLimit: CODEX_AUTO_COMPACT_TOKEN_LIMIT,
     },
   );
   const proc = spawn(CODEX_CMD, appserverArgs, {
@@ -938,7 +937,7 @@ async function setupAppserver(options: {
   appserverWsUrl = `ws://127.0.0.1:${port}`;
   if (!resumed) modelTransport = appserverModelWebsockets ? 'websocket' : 'https';
   console.error(
-    `[codex-channel] model transport configured: ${modelTransport} (HTTPS fallback enabled, requestRetries=${CODEX_REQUEST_MAX_RETRIES}, streamRetries=${CODEX_STREAM_MAX_RETRIES}, autoCompactTokens=${CODEX_AUTO_COMPACT_TOKEN_LIMIT})`,
+    `[codex-channel] model transport configured: ${modelTransport} (HTTPS fallback enabled, requestRetries=${CODEX_REQUEST_MAX_RETRIES}, streamRetries=${CODEX_STREAM_MAX_RETRIES}, proactiveCompactTokens=${CODEX_AUTO_COMPACT_TOKEN_LIMIT})`,
   );
 
   // Bring up the TurnTracker now that we have a thread. RpcTransport is a
