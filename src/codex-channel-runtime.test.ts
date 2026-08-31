@@ -831,6 +831,12 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   const recycleLogIndex = channelSource.indexOf('cold-resume state could not be repaired in-place');
   const recycleCleanupIndex = channelSource.indexOf('cleanupAppserver();', recycleLogIndex);
   const forcedHttpsIndex = channelSource.indexOf('await setupAppserver({ forceHttps: true })', recycleCleanupIndex);
+  const switchRecycleIndex = channelSource.indexOf('in-process switch requires app-server recycle');
+  const switchCleanupIndex = channelSource.indexOf('cleanupAppserver();', switchRecycleIndex);
+  const switchForcedHttpsIndex = channelSource.indexOf(
+    'await setupAppserver({ forceHttps: true, persistedThreadId: target })',
+    switchCleanupIndex,
+  );
 
   assert.ok(coordinatorIndex >= 0 && coordinatorIndex < guardedResumeIndex);
   assert.ok(guardedResumeIndex < readyIndex);
@@ -839,10 +845,20 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   assert.ok(uncertaintyThrowIndex < readyIndex, 'uncertain compact must abort before ready');
   assert.ok(recycleLogIndex >= 0 && recycleLogIndex < recycleCleanupIndex);
   assert.ok(recycleCleanupIndex < forcedHttpsIndex, 'old generation must die before HTTPS rebuild');
+  assert.ok(switchRecycleIndex >= 0 && switchRecycleIndex < switchCleanupIndex);
+  assert.ok(
+    switchCleanupIndex < switchForcedHttpsIndex,
+    'in-process switch must destroy the uncertain generation before its HTTPS rebuild',
+  );
   assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
   assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
   assert.match(channelSource, /promoteColdResumeProvider\(/);
   assert.match(channelSource, /setupAppserver\(\{ forceHttps: true \}\)/);
+  assert.match(
+    channelSource,
+    /if \(codexBusy \|\| appserverRecycling\) return;/,
+    'queued events must not enter an app-server generation while it is being recycled',
+  );
   assert.match(channelSource, /generation !== appserverGeneration/);
   assert.doesNotMatch(channelSource, /thread\/read/);
 });

@@ -311,6 +311,7 @@ interface ParsedEvent {
 // respawn) lives at a higher layer.
 
 let codexBusy = false;
+let appserverRecycling = false;
 const eventQueue: ParsedEvent[] = [];
 
 function buildPrompt(ev: ParsedEvent): string {
@@ -667,7 +668,10 @@ async function resumePersistedThreadGuarded(
   }
 }
 
-async function setupAppserver(options: { forceHttps?: boolean } = {}): Promise<void> {
+async function setupAppserver(options: {
+  forceHttps?: boolean;
+  persistedThreadId?: string;
+} = {}): Promise<void> {
   if (typeof (globalThis as any).WebSocket !== 'function') {
     throw new Error('global WebSocket not available (need Node 22+); set CODEX_CHANNEL_MODE=exec');
   }
@@ -901,7 +905,8 @@ async function setupAppserver(options: { forceHttps?: boolean } = {}): Promise<v
   //    agents.thread_id; codex app-server loads the corresponding jsonl from
   //    ~/.codex/sessions/ so conversation history survives daemon kill /
   //    serve restart / machine reboot.
-  const persistedThreadId = (process.env.HIVE_AGENT_THREAD_ID || '').trim();
+  const persistedThreadId = options.persistedThreadId?.trim()
+    || (process.env.HIVE_AGENT_THREAD_ID || '').trim();
   let resumed = false;
   if (persistedThreadId) {
     try {
@@ -1054,7 +1059,9 @@ function buildRebindText(): string {
 // POST <controlUrl>/switch-thread { thread_id: string | "" } — the daemon
 // swaps threads on the SAME codex app-server instead of dying for a full
 // SIGTERM→respawn cycle (~9s incl. codex startup; in-process is ~1-2s).
-// ws_url stays stable across switches, so an attached pane survives.
+// ws_url stays stable across ordinary switches, so an attached pane survives.
+// A result-uncertain cold resume is the deliberate exception: the daemon
+// replaces the app-server generation and announces its new ws_url.
 //
 // Serialized with a promise chain: two concurrent switches would race
 // threadId/turnTracker updates. The supervisor also serializes per-agent
@@ -1107,10 +1114,32 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
         `[codex-channel] in-process switch requires app-server recycle: `
         + `target=${target} stage=${err.stage} error=${err.message}`,
       );
-      // Let the HTTP response reach the supervisor first; then fail-close so
-      // no queued event uses a subscription/provider whose state is unknown.
-      setImmediate(() => onAppserverFailure('transport', err.message));
-      return { ok: false, error: err.message };
+      // The target lives in the control request, not this daemon's inherited
+      // environment. Rebuild in-process with that explicit thread id and
+      // HTTPS forced: a supervisor respawn would otherwise retry the same
+      // result-uncertain compact under the ordinary WS cold-resume path.
+      // Pause event consumption until the replacement generation is ready.
+      appserverRecycling = true;
+      cleanupAppserver();
+      try {
+        await setupAppserver({ forceHttps: true, persistedThreadId: target });
+        pushMode = 'appserver';
+        appserverRecycling = false;
+        if (eventQueue.length > 0) setImmediate(processNextEvent);
+        console.error(
+          `[codex-channel] in-process switch recycled app-server: `
+          + `thread=${threadId} transport=https`,
+        );
+        return { ok: true, thread_id: threadId! };
+      } catch (rebuildErr: any) {
+        const message = `forced-HTTPS app-server rebuild failed: ${String(rebuildErr?.message || rebuildErr)}`;
+        console.error(`[codex-channel] ${message}`);
+        // Let the HTTP response reach the supervisor before terminating this
+        // unusable generation. The supervisor can then perform its ordinary
+        // clean respawn fallback.
+        setImmediate(() => onAppserverFailure('transport', message));
+        return { ok: false, error: message };
+      }
     }
     threadId = previousThreadId;
     threadRolloutPath = previousRolloutPath;
@@ -1367,7 +1396,7 @@ async function shouldInjectQueuedEvent(ev: ParsedEvent): Promise<boolean> {
 }
 
 async function processNextEvent() {
-  if (codexBusy) return;
+  if (codexBusy || appserverRecycling) return;
   const next = eventQueue.shift();
   if (!next) return;
   codexBusy = true;
