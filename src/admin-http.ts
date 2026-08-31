@@ -581,11 +581,13 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
   //                                 accidental reset from a serialization bug).
   //
   // Implementation:
-  //   1. Tentatively UPDATE agents.thread_id (or '' for reset).
-  //   2. Prefer the live daemon's serialized control endpoint. Busy/rejected
-  //      responses roll back the DB value and never kill an active turn.
-  //   3. Use SIGTERM→respawn only when no live control path exists, or after
-  //      a failed fail-closed rebuild explicitly asks for recovery.
+  //   1. Prefer the live daemon's serialized control endpoint without first
+  //      changing agents.thread_id. Its ready announcement persists the
+  //      actual thread only after the switch commits.
+  //   2. Busy/rejected/result-uncertain responses leave the DB untouched and
+  //      never kill an active turn.
+  //   3. Only when no live control path exists do we persist the requested
+  //      target and use SIGTERM→respawn to apply it during daemon startup.
   //
   // Returns: { ok, thread_id, ws_url, ready, error? }
   //   thread_id is the ACTUAL one the new daemon now holds (matches the
@@ -655,20 +657,14 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
 
       // Serialize per-agent so concurrent set_thread calls don't trample
       // each other's switch / SIGTERM / respawn flow.
-      let previousThreadId = agent.thread_id;
       const result = await lockPerAgent(agent_id, async () => {
-        // Re-read inside the lock: another queued set-thread request may have
-        // completed after the validation query above.
-        previousThreadId = db.getAgentById(agent_id)?.thread_id ?? previousThreadId;
-        db.setAgentThreadId(agent_id, targetThreadId);
         log('info', `[admin] codex-set-thread agent=${agent_id.slice(-12)} → ${targetThreadId || '(reset)'}`);
         // Fast path: in-process switch on the live daemon (~1-2s, ws_url
-        // stable). Falls back to the SIGTERM→respawn cycle only when there is
-        // no usable live control path. Once the request reaches a daemon,
-        // busy/rejected/transport-uncertain results are authoritative and do
-        // not kill a possibly active turn. The DB write above is shared: the
-        // unavailable-path respawn reads it at env injection, while the
-        // in-process path receives the same explicit target.
+        // stable). Do not pre-write the requested target: successful daemon
+        // ready/response paths persist the actual thread, while a lost HTTP
+        // response leaves DB and daemon reconcilable instead of requiring a
+        // blind rollback. Only the unavailable path commits the target before
+        // its deliberate respawn reads it at env injection.
         const switched = await switchDaemonThread(agent_id, targetThreadId);
         if (switched.kind === 'switched') {
           return {
@@ -680,24 +676,16 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
           };
         }
         if (switched.kind !== 'unavailable') {
-          // A request reached the live control server, so busy/rejected is an
-          // authoritative failure, not permission to kill an active turn.
-          // Restore the previous durable target before any requested recovery
-          // respawn so a strict resume rejection cannot silently create a new
-          // conversation under the rejected target.
-          db.setAgentThreadId(agent_id, previousThreadId);
-          const recoverySnap = switched.kind === 'failed' && switched.requiresRespawn
-            ? await requestDaemonRespawn(agent_id, 30_000)
-            : null;
           return {
-            snap: recoverySnap,
+            snap: null,
             mode: 'in-process' as const,
             error: switched.error,
-            status: switched.kind === 'busy' ? 409 : 500,
-            ready: recoverySnap?.ready
-              ?? (switched.kind === 'busy' || !switched.requiresRespawn),
+            status: switched.kind === 'busy' ? 409 : switched.kind === 'uncertain' ? 504 : 500,
+            ready: switched.kind === 'busy'
+              || (switched.kind === 'rejected' && !switched.failClosed),
           };
         }
+        db.setAgentThreadId(agent_id, targetThreadId);
         const snap = await requestDaemonRespawn(agent_id, 30_000);
         return { snap, mode: 'respawn' as const, error: null, status: 200, ready: snap?.ready ?? false };
       });
@@ -706,7 +694,7 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         res.writeHead(result.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           ok: false,
-          thread_id: previousThreadId || null,
+          thread_id: db.getAgentById(agent_id)?.thread_id || null,
           ws_url: result.snap?.ws_url ?? null,
           ready: result.ready,
           mode: result.mode,

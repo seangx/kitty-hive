@@ -506,14 +506,30 @@ interface DaemonControlSwitchBody {
   thread_id?: string;
   error?: string;
   busy?: boolean;
-  requires_respawn?: boolean;
+  fail_closed?: boolean;
 }
 
 export type DaemonThreadSwitchResult =
   | { kind: 'switched'; snapshot: DaemonSnapshot }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'busy'; error: string }
-  | { kind: 'failed'; error: string; requiresRespawn: boolean };
+  | { kind: 'rejected'; error: string; failClosed: boolean }
+  | { kind: 'uncertain'; error: string };
+
+/** A lost control response may follow a successful switch. Reconcile against
+ * the supervisor snapshot updated by codex-daemon-ready before classifying
+ * the outcome as uncertain. Reset requests have no requested id, so any new
+ * non-empty id proves the reset committed.
+ */
+export function daemonReachedRequestedThread(
+  requestedThreadId: string,
+  previousThreadId: string | null,
+  currentThreadId: string | null,
+): boolean {
+  if (!currentThreadId) return false;
+  if (requestedThreadId) return currentThreadId === requestedThreadId;
+  return currentThreadId !== previousThreadId;
+}
 
 /** Preserve the daemon's control-plane distinction between a safe fallback
  * opportunity and a live daemon that explicitly rejected the switch. In
@@ -526,7 +542,7 @@ export function classifyDaemonThreadSwitchResponse(
 ):
   | { kind: 'switched'; threadId: string }
   | { kind: 'busy'; error: string }
-  | { kind: 'failed'; error: string; requiresRespawn: boolean } {
+  | { kind: 'rejected'; error: string; failClosed: boolean } {
   if (status === 409 || body?.busy) {
     return { kind: 'busy', error: body?.error || 'daemon busy processing a Hive event' };
   }
@@ -534,9 +550,9 @@ export function classifyDaemonThreadSwitchResponse(
     return { kind: 'switched', threadId: body.thread_id };
   }
   return {
-    kind: 'failed',
+    kind: 'rejected',
     error: body?.error || `http ${status}`,
-    requiresRespawn: body?.requires_respawn === true,
+    failClosed: body?.fail_closed === true,
   };
 }
 
@@ -715,6 +731,7 @@ export async function switchDaemonThread(
     log('info', `[codex-supervisor] switchDaemonThread: no in-process path for ${agentId.slice(-12)} (daemon=${!!info} ready=${!!info?.readyAt} control=${!!info?.controlUrl})`);
     return { kind: 'unavailable', reason: 'daemon has no ready in-process control path' };
   }
+  const previousThreadId = info.threadId;
   const agent = getAgentById(agentId);
   if (agent && daemonProjectDirHasDrifted(info.projectDir, agent.project_dir)) {
     log(
@@ -737,23 +754,37 @@ export async function switchDaemonThread(
       log('info', `[codex-supervisor] switchDaemonThread busy for "${info.displayName}": ${decision.error} — leaving active turn untouched`);
       return decision;
     }
-    if (decision.kind === 'failed') {
+    if (decision.kind === 'rejected') {
       log('warn', `[codex-supervisor] switchDaemonThread rejected for "${info.displayName}": ${decision.error} — no implicit respawn`);
       return decision;
     }
     // markDaemonReady normally already ran via the daemon's re-announce, but
     // don't depend on that ordering — set the authoritative value here too.
     info.threadId = decision.threadId;
+    try { setAgentThreadId(agentId, decision.threadId); } catch (err) {
+      log('warn', `[codex-supervisor] failed to persist switched thread_id for ${agentId}: ${err}`);
+    }
     log('info', `[codex-supervisor] in-process thread switch for "${info.displayName}": → ${decision.threadId.slice(0, 8)}...`);
     const snapshot = getDaemonForAgent({ agentId });
     if (!snapshot) {
-      return { kind: 'failed', error: 'daemon disappeared after successful control response', requiresRespawn: false };
+      return { kind: 'uncertain', error: 'daemon disappeared after successful control response' };
     }
     return { kind: 'switched', snapshot };
   } catch (err: any) {
     const error = String(err?.message || err);
-    log('warn', `[codex-supervisor] switchDaemonThread transport uncertain for "${info.displayName}": ${error} — no implicit respawn`);
-    return { kind: 'failed', error, requiresRespawn: false };
+    const current = daemons.get(agentId);
+    if (
+      current
+      && daemonReachedRequestedThread(threadId, previousThreadId, current.threadId)
+    ) {
+      const snapshot = getDaemonForAgent({ agentId });
+      if (snapshot) {
+        log('info', `[codex-supervisor] switchDaemonThread response lost for "${info.displayName}", but ready snapshot confirms thread=${snapshot.thread_id}`);
+        return { kind: 'switched', snapshot };
+      }
+    }
+    log('warn', `[codex-supervisor] switchDaemonThread transport uncertain for "${info.displayName}": ${error} — DB unchanged, no implicit respawn`);
+    return { kind: 'uncertain', error };
   }
 }
 

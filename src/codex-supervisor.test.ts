@@ -6,6 +6,7 @@ import {
   StartupConcurrencyQueue,
   buildCodexDaemonEnv,
   classifyDaemonThreadSwitchResponse,
+  daemonReachedRequestedThread,
   daemonProjectDirHasDrifted,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
@@ -24,32 +25,47 @@ test('busy in-process thread switches are authoritative and never a respawn fall
   );
 });
 
-test('failed strict rebuild preserves its recovery requirement', () => {
+test('failed strict rebuild remains an explicit fail-closed rejection', () => {
   assert.deepEqual(
     classifyDaemonThreadSwitchResponse(500, {
       ok: false,
       error: 'explicit thread resume rejected',
-      requires_respawn: true,
+      fail_closed: true,
     }),
     {
-      kind: 'failed',
+      kind: 'rejected',
       error: 'explicit thread resume rejected',
-      requiresRespawn: true,
+      failClosed: true,
     },
   );
 });
 
-test('admin rolls back authoritative live-control failures before any recovery respawn', () => {
-  const source = readFileSync(new URL('../src/admin-http.ts', import.meta.url), 'utf8');
-  const liveFailureIndex = source.indexOf("if (switched.kind !== 'unavailable')");
-  const rollbackIndex = source.indexOf('db.setAgentThreadId(agent_id, previousThreadId)', liveFailureIndex);
-  const recoveryIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000)', rollbackIndex);
-  const busyStatusIndex = source.indexOf("switched.kind === 'busy' ? 409 : 500", rollbackIndex);
+test('lost control responses reconcile a switch already committed by ready announcement', () => {
+  assert.equal(
+    daemonReachedRequestedThread('target-thread', 'old-thread', 'target-thread'),
+    true,
+  );
+  assert.equal(
+    daemonReachedRequestedThread('', 'old-thread', 'new-thread'),
+    true,
+  );
+  assert.equal(
+    daemonReachedRequestedThread('target-thread', 'old-thread', 'old-thread'),
+    false,
+  );
+});
 
-  assert.ok(liveFailureIndex >= 0);
-  assert.ok(rollbackIndex > liveFailureIndex);
-  assert.ok(recoveryIndex > rollbackIndex, 'strict rebuild recovery must read the restored DB target');
-  assert.ok(busyStatusIndex > rollbackIndex, 'busy must surface as HTTP 409 without respawn');
+test('admin writes a requested target only after live control is unavailable', () => {
+  const source = readFileSync(new URL('../src/admin-http.ts', import.meta.url), 'utf8');
+  const switchIndex = source.indexOf('await switchDaemonThread(agent_id, targetThreadId)');
+  const unavailableIndex = source.indexOf("if (switched.kind !== 'unavailable')", switchIndex);
+  const commitIndex = source.indexOf('db.setAgentThreadId(agent_id, targetThreadId)', unavailableIndex);
+  const respawnIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000)', commitIndex);
+
+  assert.ok(switchIndex >= 0);
+  assert.ok(unavailableIndex > switchIndex);
+  assert.ok(commitIndex > unavailableIndex, 'live-control requests must not pre-write the DB target');
+  assert.ok(respawnIndex > commitIndex, 'unavailable fallback must commit before daemon env injection');
 });
 
 test('boot queue starts only the configured number until slots settle', () => {

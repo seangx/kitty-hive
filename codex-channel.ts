@@ -974,9 +974,11 @@ async function setupAppserver(options: {
   // Announce ready signal back to hive supervisor so kitty-kitty (or any
   // other launcher) can query the (ws_url, thread_id) pair. Also persists
   // thread_id for next spawn.
-  await announceReady().catch(err => {
-    console.error('[codex-channel] failed to announce ready to supervisor:', err);
-  });
+  // Readiness is the durable commit acknowledgement for thread selection:
+  // markDaemonReady persists the actual thread before replying. Do not
+  // continue with an uncommitted daemon/DB pair if this acknowledgement
+  // cannot be obtained.
+  await announceReady();
 
 }
 
@@ -1077,7 +1079,7 @@ type ThreadSwitchResult = {
   thread_id?: string;
   error?: string;
   busy?: boolean;
-  requires_respawn?: boolean;
+  fail_closed?: boolean;
 };
 
 async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> {
@@ -1092,6 +1094,7 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
     };
   }
   let releaseSwitchGate = true;
+  let threadStateChanged = false;
   const previousThreadId = threadId;
   const previousRolloutPath = threadRolloutPath;
   const previousModelTransport = modelTransport;
@@ -1099,6 +1102,7 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
     if (target) {
       if (target !== threadId) {
         await resumePersistedThreadGuarded(target, appserverModelWebsockets);
+        threadStateChanged = true;
         console.error(`[codex-channel] in-process switch: resumed guarded thread ${threadId}`);
       } else {
         console.error(`[codex-channel] in-process switch: thread ${target} already active`);
@@ -1108,6 +1112,7 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
       const newId = resp?.thread?.id;
       if (!newId) return { ok: false, error: `thread/start returned no thread.id: ${JSON.stringify(resp)}` };
       threadId = newId;
+      threadStateChanged = true;
       threadRolloutPath = typeof resp?.thread?.path === 'string' ? resp.thread.path : null;
       modelTransport = appserverModelWebsockets ? 'websocket' : 'https';
       console.error(`[codex-channel] in-process switch: started fresh thread ${threadId}`);
@@ -1119,13 +1124,11 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
     const briefKind = target ? 'switch-rebind' : 'switch-intro';
     const outcome = await injectHistory(briefText, { eventId: `${briefKind}:${threadId}:${Date.now()}` });
     if (outcome.kind === 'rpc_send_error') {
-      return { ok: false, error: `session policy injection failed: ${outcome.error.message}` };
+      throw new Error(`session policy injection failed: ${outcome.error.message}`);
     }
     // Re-announce only after the session policy is persisted, so the
     // supervisor snapshot cannot expose a thread that lacks the safety rule.
-    await announceReady().catch(err => {
-      console.error('[codex-channel] switch: failed to re-announce ready:', err);
-    });
+    await announceReady();
     return { ok: true, thread_id: threadId! };
   } catch (err: any) {
     if (err instanceof ColdResumeAppserverRecycleError) {
@@ -1152,16 +1155,29 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
         const message = `forced-HTTPS app-server rebuild failed: ${String(rebuildErr?.message || rebuildErr)}`;
         console.error(`[codex-channel] ${message}`);
         // Keep the gate closed: the old generation is already gone and the
-        // replacement did not become usable. The supervisor first restores
-        // the previous DB thread id, then intentionally respawns this daemon.
+        // replacement did not become usable. Exit independently of whether
+        // this HTTP error response reaches the supervisor; because live
+        // switches no longer pre-write the requested target, the clean
+        // respawn restores the last committed DB thread.
         releaseSwitchGate = false;
-        return { ok: false, error: message, requires_respawn: true };
+        setImmediate(() => onAppserverFailure('transport', message));
+        return { ok: false, error: message, fail_closed: true };
       }
+    }
+    const message = String(err?.message || err);
+    if (threadStateChanged) {
+      // thread/resume and thread/start have no rollback RPC. Once either
+      // succeeds, an injection/ready failure cannot safely pretend the old
+      // thread is still active. Fail closed independently of the control
+      // response; the last acknowledged DB thread determines the respawn.
+      releaseSwitchGate = false;
+      setImmediate(() => onAppserverFailure('transport', `thread switch commit failed: ${message}`));
+      return { ok: false, error: message, fail_closed: true };
     }
     threadId = previousThreadId;
     threadRolloutPath = previousRolloutPath;
     modelTransport = previousModelTransport;
-    return { ok: false, error: String(err?.message || err) };
+    return { ok: false, error: message };
   } finally {
     if (releaseSwitchGate) {
       lifecycleGate.finishSwitch();

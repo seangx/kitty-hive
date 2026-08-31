@@ -870,6 +870,17 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   const eventGateIndex = channelSource.indexOf('lifecycleGate.tryStartEvent()', eventProcessorIndex);
   const sendTurnIndex = channelSource.indexOf('await sendTurn(text, { eventId })', eventGateIndex);
   const eventReleaseIndex = channelSource.indexOf('lifecycleGate.finishEvent()', sendTurnIndex);
+  const rebuildFailureIndex = channelSource.indexOf('forced-HTTPS app-server rebuild failed');
+  const keepGateClosedIndex = channelSource.indexOf('releaseSwitchGate = false', rebuildFailureIndex);
+  const independentExitIndex = channelSource.indexOf(
+    "setImmediate(() => onAppserverFailure('transport', message))",
+    keepGateClosedIndex,
+  );
+  const changedStateIndex = channelSource.indexOf('if (threadStateChanged)', independentExitIndex);
+  const commitExitIndex = channelSource.indexOf(
+    "setImmediate(() => onAppserverFailure('transport', `thread switch commit failed: ${message}`))",
+    changedStateIndex,
+  );
 
   assert.ok(coordinatorIndex >= 0 && coordinatorIndex < guardedResumeIndex);
   assert.ok(guardedResumeIndex < readyIndex);
@@ -888,6 +899,16 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
     'an explicit forced-HTTPS target must reject before thread/start fallback',
   );
   assert.ok(eventGateIndex < sendTurnIndex && sendTurnIndex < eventReleaseIndex);
+  assert.ok(
+    rebuildFailureIndex >= 0
+      && rebuildFailureIndex < keepGateClosedIndex
+      && keepGateClosedIndex < independentExitIndex,
+    'failed rebuild must schedule fail-closed exit independently of the HTTP response',
+  );
+  assert.ok(
+    changedStateIndex > independentExitIndex && commitExitIndex > changedStateIndex,
+    'a changed thread whose durable ready commit fails must exit independently of the control response',
+  );
   assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
   assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
   assert.match(channelSource, /promoteColdResumeProvider\(/);
