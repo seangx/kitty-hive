@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
+  CodexChannelLifecycleGate,
   CodexTerminalNotificationTracker,
   HIVE_HTTP_MODEL_PROVIDER_ID,
   PostTurnCompactionCoordinator,
@@ -17,11 +18,37 @@ import {
   inspectPersistedRolloutRisk,
   parseThreadTokenUsage,
   promoteColdResumeProvider,
+  resolvePersistedThreadTarget,
   shouldPromoteColdResumeToWebsocket,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
   type RpcTransport,
 } from './codex-channel-runtime.js';
+
+test('event turns and thread switches share one lifecycle gate', () => {
+  const gate = new CodexChannelLifecycleGate();
+
+  assert.equal(gate.tryStartEvent(), true, 'in-flight sendTurn owns the gate');
+  assert.equal(gate.tryStartSwitch(), false, 'switch is rejected while the event continuation is active');
+  gate.finishEvent();
+
+  assert.equal(gate.tryStartSwitch(), true, 'switch starts after the event finishes');
+  assert.equal(gate.tryStartEvent(), false, 'new events wait for the switch lifecycle');
+  gate.finishSwitch();
+  assert.equal(gate.tryStartEvent(), true);
+  gate.finishEvent();
+});
+
+test('explicit persisted thread targets are strict while inherited boot targets may self-heal', () => {
+  assert.deepEqual(
+    resolvePersistedThreadTarget(' target-thread ', 'inherited-thread'),
+    { threadId: 'target-thread', strict: true },
+  );
+  assert.deepEqual(
+    resolvePersistedThreadTarget(undefined, ' inherited-thread '),
+    { threadId: 'inherited-thread', strict: false },
+  );
+});
 
 function ignoredReason(decision: CodexTerminalDecision): string | undefined {
   return decision.kind === 'ignored' ? decision.reason : undefined;
@@ -837,6 +864,12 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
     'await setupAppserver({ forceHttps: true, persistedThreadId: target })',
     switchCleanupIndex,
   );
+  const strictResumeIndex = channelSource.indexOf('if (persistedTarget.strict) throw err;');
+  const freshThreadFallbackIndex = channelSource.indexOf("rpcCall('thread/start'", strictResumeIndex);
+  const eventProcessorIndex = channelSource.indexOf('async function processNextEvent()');
+  const eventGateIndex = channelSource.indexOf('lifecycleGate.tryStartEvent()', eventProcessorIndex);
+  const sendTurnIndex = channelSource.indexOf('await sendTurn(text, { eventId })', eventGateIndex);
+  const eventReleaseIndex = channelSource.indexOf('lifecycleGate.finishEvent()', sendTurnIndex);
 
   assert.ok(coordinatorIndex >= 0 && coordinatorIndex < guardedResumeIndex);
   assert.ok(guardedResumeIndex < readyIndex);
@@ -850,15 +883,26 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
     switchCleanupIndex < switchForcedHttpsIndex,
     'in-process switch must destroy the uncertain generation before its HTTPS rebuild',
   );
+  assert.ok(
+    strictResumeIndex >= 0 && strictResumeIndex < freshThreadFallbackIndex,
+    'an explicit forced-HTTPS target must reject before thread/start fallback',
+  );
+  assert.ok(eventGateIndex < sendTurnIndex && sendTurnIndex < eventReleaseIndex);
   assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
   assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
   assert.match(channelSource, /promoteColdResumeProvider\(/);
   assert.match(channelSource, /setupAppserver\(\{ forceHttps: true \}\)/);
   assert.match(
     channelSource,
-    /if \(codexBusy \|\| appserverRecycling\) return;/,
-    'queued events must not enter an app-server generation while it is being recycled',
+    /if \(!lifecycleGate\.tryStartSwitch\(\)\)/,
+    'thread switches must acquire the shared lifecycle gate',
   );
+  assert.match(
+    channelSource,
+    /if \(!lifecycleGate\.tryStartEvent\(\)\) return;/,
+    'event continuations must acquire the same lifecycle gate',
+  );
+  assert.match(channelSource, /result\.busy \? 409 : 500/);
   assert.match(channelSource, /generation !== appserverGeneration/);
   assert.doesNotMatch(channelSource, /thread\/read/);
 });

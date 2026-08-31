@@ -5,12 +5,52 @@ import {
   CODEX_DAEMON_START_CONCURRENCY,
   StartupConcurrencyQueue,
   buildCodexDaemonEnv,
+  classifyDaemonThreadSwitchResponse,
   daemonProjectDirHasDrifted,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
   signalCodexAppserverProcessTree,
   signalDaemonProcessTree,
 } from './codex-supervisor.js';
+
+test('busy in-process thread switches are authoritative and never a respawn fallback', () => {
+  assert.deepEqual(
+    classifyDaemonThreadSwitchResponse(409, {
+      ok: false,
+      busy: true,
+      error: 'event turn in flight',
+    }),
+    { kind: 'busy', error: 'event turn in flight' },
+  );
+});
+
+test('failed strict rebuild preserves its recovery requirement', () => {
+  assert.deepEqual(
+    classifyDaemonThreadSwitchResponse(500, {
+      ok: false,
+      error: 'explicit thread resume rejected',
+      requires_respawn: true,
+    }),
+    {
+      kind: 'failed',
+      error: 'explicit thread resume rejected',
+      requiresRespawn: true,
+    },
+  );
+});
+
+test('admin rolls back authoritative live-control failures before any recovery respawn', () => {
+  const source = readFileSync(new URL('../src/admin-http.ts', import.meta.url), 'utf8');
+  const liveFailureIndex = source.indexOf("if (switched.kind !== 'unavailable')");
+  const rollbackIndex = source.indexOf('db.setAgentThreadId(agent_id, previousThreadId)', liveFailureIndex);
+  const recoveryIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000)', rollbackIndex);
+  const busyStatusIndex = source.indexOf("switched.kind === 'busy' ? 409 : 500", rollbackIndex);
+
+  assert.ok(liveFailureIndex >= 0);
+  assert.ok(rollbackIndex > liveFailureIndex);
+  assert.ok(recoveryIndex > rollbackIndex, 'strict rebuild recovery must read the restored DB target');
+  assert.ok(busyStatusIndex > rollbackIndex, 'busy must surface as HTTP 409 without respawn');
+});
 
 test('boot queue starts only the configured number until slots settle', () => {
   const started: number[] = [];

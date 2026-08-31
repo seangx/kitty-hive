@@ -501,6 +501,45 @@ export interface DaemonSnapshot {
   control_url: string | null;
 }
 
+interface DaemonControlSwitchBody {
+  ok?: boolean;
+  thread_id?: string;
+  error?: string;
+  busy?: boolean;
+  requires_respawn?: boolean;
+}
+
+export type DaemonThreadSwitchResult =
+  | { kind: 'switched'; snapshot: DaemonSnapshot }
+  | { kind: 'unavailable'; reason: string }
+  | { kind: 'busy'; error: string }
+  | { kind: 'failed'; error: string; requiresRespawn: boolean };
+
+/** Preserve the daemon's control-plane distinction between a safe fallback
+ * opportunity and a live daemon that explicitly rejected the switch. In
+ * particular, HTTP 409 means an event turn owns the lifecycle gate and must
+ * never be killed by the admin endpoint's respawn fallback.
+ */
+export function classifyDaemonThreadSwitchResponse(
+  status: number,
+  body: DaemonControlSwitchBody | null,
+):
+  | { kind: 'switched'; threadId: string }
+  | { kind: 'busy'; error: string }
+  | { kind: 'failed'; error: string; requiresRespawn: boolean } {
+  if (status === 409 || body?.busy) {
+    return { kind: 'busy', error: body?.error || 'daemon busy processing a Hive event' };
+  }
+  if (status >= 200 && status < 300 && body?.ok && body.thread_id) {
+    return { kind: 'switched', threadId: body.thread_id };
+  }
+  return {
+    kind: 'failed',
+    error: body?.error || `http ${status}`,
+    requiresRespawn: body?.requires_respawn === true,
+  };
+}
+
 export function getDaemonSnapshots(): DaemonSnapshot[] {
   const now = Date.now();
   return [...daemons.values()].map(info => ({
@@ -652,10 +691,10 @@ export function notifyAgentRemoved(agentId: string): boolean {
  *  without dying. ~1-2s vs ~9s for the SIGTERM→respawn cycle, and ws_url
  *  stays stable so an attached pane survives.
  *
- *  Returns the updated snapshot on success, or null when the in-process path
- *  is unavailable/failed — caller falls back to requestDaemonRespawn. Reasons
- *  for null: no live daemon, daemon not ready yet, daemon predates the
- *  control server (no controlUrl), control request errored or timed out.
+ *  Returns a discriminated result. Only `unavailable` permits the caller to
+ *  fall back to requestDaemonRespawn. Once a live control request was sent,
+ *  busy/rejected/transport-uncertain results leave the requested switch
+ *  failed rather than killing a possibly active turn.
  *
  *  `threadId` semantics mirror /admin/codex-set-thread: non-empty → resume
  *  that thread; empty string → reset to a fresh thread. The daemon re-POSTs
@@ -664,14 +703,17 @@ export function notifyAgentRemoved(agentId: string): boolean {
  *  so the snapshot we build afterwards is already fresh. */
 // Default generously sized: codex 0.144's thread/start//resume can block
 // ~30s+ on its models-refresh hang (see THREAD_RPC_TIMEOUT_MS in
-// codex-channel.ts). A timeout here falls back to the SIGTERM respawn path,
-// which pays the SAME slow thread call again plus a full codex boot — so
-// waiting longer is strictly cheaper than timing out early.
-export async function switchDaemonThread(agentId: string, threadId: string, timeoutMs = 150_000): Promise<DaemonSnapshot | null> {
+// codex-channel.ts). Once a live control request is sent, a timeout is
+// result-uncertain and deliberately does NOT kill/respawn the daemon.
+export async function switchDaemonThread(
+  agentId: string,
+  threadId: string,
+  timeoutMs = 150_000,
+): Promise<DaemonThreadSwitchResult> {
   const info = daemons.get(agentId);
   if (!info || !info.readyAt || !info.controlUrl) {
     log('info', `[codex-supervisor] switchDaemonThread: no in-process path for ${agentId.slice(-12)} (daemon=${!!info} ready=${!!info?.readyAt} control=${!!info?.controlUrl})`);
-    return null;
+    return { kind: 'unavailable', reason: 'daemon has no ready in-process control path' };
   }
   const agent = getAgentById(agentId);
   if (agent && daemonProjectDirHasDrifted(info.projectDir, agent.project_dir)) {
@@ -680,7 +722,7 @@ export async function switchDaemonThread(agentId: string, threadId: string, time
       `[codex-supervisor] refusing in-process thread switch for "${info.displayName}": `
       + `daemon cwd ${info.projectDir} != configured cwd ${resolveDaemonProjectDir(agent.project_dir)}; falling back to respawn`,
     );
-    return null;
+    return { kind: 'unavailable', reason: 'daemon project directory changed' };
   }
   try {
     const res = await fetch(`${info.controlUrl}/switch-thread`, {
@@ -689,19 +731,29 @@ export async function switchDaemonThread(agentId: string, threadId: string, time
       body: JSON.stringify({ thread_id: threadId }),
       signal: AbortSignal.timeout(timeoutMs),
     });
-    const body = await res.json().catch(() => null) as { ok?: boolean; thread_id?: string; error?: string } | null;
-    if (!res.ok || !body?.ok || !body.thread_id) {
-      log('warn', `[codex-supervisor] switchDaemonThread failed for "${info.displayName}": ${body?.error || `http ${res.status}`} — falling back to respawn`);
-      return null;
+    const body = await res.json().catch(() => null) as DaemonControlSwitchBody | null;
+    const decision = classifyDaemonThreadSwitchResponse(res.status, body);
+    if (decision.kind === 'busy') {
+      log('info', `[codex-supervisor] switchDaemonThread busy for "${info.displayName}": ${decision.error} — leaving active turn untouched`);
+      return decision;
+    }
+    if (decision.kind === 'failed') {
+      log('warn', `[codex-supervisor] switchDaemonThread rejected for "${info.displayName}": ${decision.error} — no implicit respawn`);
+      return decision;
     }
     // markDaemonReady normally already ran via the daemon's re-announce, but
     // don't depend on that ordering — set the authoritative value here too.
-    info.threadId = body.thread_id;
-    log('info', `[codex-supervisor] in-process thread switch for "${info.displayName}": → ${body.thread_id.slice(0, 8)}... (ws unchanged)`);
-    return getDaemonForAgent({ agentId });
+    info.threadId = decision.threadId;
+    log('info', `[codex-supervisor] in-process thread switch for "${info.displayName}": → ${decision.threadId.slice(0, 8)}...`);
+    const snapshot = getDaemonForAgent({ agentId });
+    if (!snapshot) {
+      return { kind: 'failed', error: 'daemon disappeared after successful control response', requiresRespawn: false };
+    }
+    return { kind: 'switched', snapshot };
   } catch (err: any) {
-    log('warn', `[codex-supervisor] switchDaemonThread error for "${info.displayName}": ${err?.message || err} — falling back to respawn`);
-    return null;
+    const error = String(err?.message || err);
+    log('warn', `[codex-supervisor] switchDaemonThread transport uncertain for "${info.displayName}": ${error} — no implicit respawn`);
+    return { kind: 'failed', error, requiresRespawn: false };
   }
 }
 

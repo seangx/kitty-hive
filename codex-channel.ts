@@ -45,7 +45,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS, DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES, DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, coldResumeCompactionUncertainty, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, inspectPersistedRolloutRisk, parseCodexTerminalNotice, parseThreadTokenUsage, promoteColdResumeProvider, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PersistedRolloutRisk, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexChannelLifecycleGate, CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS, DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES, DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, coldResumeCompactionUncertainty, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, inspectPersistedRolloutRisk, parseCodexTerminalNotice, parseThreadTokenUsage, promoteColdResumeProvider, resolvePersistedThreadTarget, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PersistedRolloutRisk, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -310,8 +310,7 @@ interface ParsedEvent {
 // event_id; loss recovery (hive SSE replay, pending_pushes drain on daemon
 // respawn) lives at a higher layer.
 
-let codexBusy = false;
-let appserverRecycling = false;
+const lifecycleGate = new CodexChannelLifecycleGate();
 const eventQueue: ParsedEvent[] = [];
 
 function buildPrompt(ev: ParsedEvent): string {
@@ -905,8 +904,11 @@ async function setupAppserver(options: {
   //    agents.thread_id; codex app-server loads the corresponding jsonl from
   //    ~/.codex/sessions/ so conversation history survives daemon kill /
   //    serve restart / machine reboot.
-  const persistedThreadId = options.persistedThreadId?.trim()
-    || (process.env.HIVE_AGENT_THREAD_ID || '').trim();
+  const persistedTarget = resolvePersistedThreadTarget(
+    options.persistedThreadId,
+    process.env.HIVE_AGENT_THREAD_ID,
+  );
+  const persistedThreadId = persistedTarget.threadId;
   let resumed = false;
   if (persistedThreadId) {
     try {
@@ -914,6 +916,7 @@ async function setupAppserver(options: {
       resumed = true;
     } catch (err) {
       if (err instanceof ColdResumeAppserverRecycleError) throw err;
+      if (persistedTarget.strict) throw err;
       // Common cause: jsonl missing (stale thread_id from a wiped ~/.codex)
       // or codex schema upgrade. Fall back to a fresh thread; the new
       // thread_id will overwrite the stale one in agents.thread_id via
@@ -1069,10 +1072,26 @@ function buildRebindText(): string {
 
 let switchChain: Promise<unknown> = Promise.resolve();
 
-async function performThreadSwitch(target: string): Promise<{ ok: boolean; thread_id?: string; error?: string }> {
+type ThreadSwitchResult = {
+  ok: boolean;
+  thread_id?: string;
+  error?: string;
+  busy?: boolean;
+  requires_respawn?: boolean;
+};
+
+async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> {
   if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1) {
     return { ok: false, error: 'daemon not in appserver mode (or WS not open)' };
   }
+  if (!lifecycleGate.tryStartSwitch()) {
+    return {
+      ok: false,
+      busy: true,
+      error: 'daemon busy processing a Hive event or another thread switch',
+    };
+  }
+  let releaseSwitchGate = true;
   const previousThreadId = threadId;
   const previousRolloutPath = threadRolloutPath;
   const previousModelTransport = modelTransport;
@@ -1118,14 +1137,12 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       // environment. Rebuild in-process with that explicit thread id and
       // HTTPS forced: a supervisor respawn would otherwise retry the same
       // result-uncertain compact under the ordinary WS cold-resume path.
-      // Pause event consumption until the replacement generation is ready.
-      appserverRecycling = true;
+      // The lifecycle gate acquired above pauses event consumption until the
+      // replacement generation is ready.
       cleanupAppserver();
       try {
         await setupAppserver({ forceHttps: true, persistedThreadId: target });
         pushMode = 'appserver';
-        appserverRecycling = false;
-        if (eventQueue.length > 0) setImmediate(processNextEvent);
         console.error(
           `[codex-channel] in-process switch recycled app-server: `
           + `thread=${threadId} transport=https`,
@@ -1134,17 +1151,22 @@ async function performThreadSwitch(target: string): Promise<{ ok: boolean; threa
       } catch (rebuildErr: any) {
         const message = `forced-HTTPS app-server rebuild failed: ${String(rebuildErr?.message || rebuildErr)}`;
         console.error(`[codex-channel] ${message}`);
-        // Let the HTTP response reach the supervisor before terminating this
-        // unusable generation. The supervisor can then perform its ordinary
-        // clean respawn fallback.
-        setImmediate(() => onAppserverFailure('transport', message));
-        return { ok: false, error: message };
+        // Keep the gate closed: the old generation is already gone and the
+        // replacement did not become usable. The supervisor first restores
+        // the previous DB thread id, then intentionally respawns this daemon.
+        releaseSwitchGate = false;
+        return { ok: false, error: message, requires_respawn: true };
       }
     }
     threadId = previousThreadId;
     threadRolloutPath = previousRolloutPath;
     modelTransport = previousModelTransport;
     return { ok: false, error: String(err?.message || err) };
+  } finally {
+    if (releaseSwitchGate) {
+      lifecycleGate.finishSwitch();
+      if (eventQueue.length > 0) setImmediate(processNextEvent);
+    }
   }
 }
 
@@ -1171,7 +1193,7 @@ async function startControlServer(): Promise<void> {
         const run = switchChain.catch(() => undefined).then(() => performThreadSwitch(target));
         switchChain = run;
         run.then((result) => {
-          res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+          res.writeHead(result.ok ? 200 : result.busy ? 409 : 500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         }).catch((err) => {
           res.writeHead(500, { 'Content-Type': 'application/json' });
@@ -1396,10 +1418,12 @@ async function shouldInjectQueuedEvent(ev: ParsedEvent): Promise<boolean> {
 }
 
 async function processNextEvent() {
-  if (codexBusy || appserverRecycling) return;
+  if (!lifecycleGate.tryStartEvent()) return;
   const next = eventQueue.shift();
-  if (!next) return;
-  codexBusy = true;
+  if (!next) {
+    lifecycleGate.finishEvent();
+    return;
+  }
   try {
     const shouldInject = await shouldInjectQueuedEvent(next);
     const deliveryPath = decideEventDelivery(HIVE_EVENT_MODE, pushMode);
@@ -1499,7 +1523,7 @@ async function processNextEvent() {
       message_id: next.message_id, from: next.from || next.from_agent_id,
     })}`);
   } finally {
-    codexBusy = false;
+    lifecycleGate.finishEvent();
   }
   // Drain any events that piled up while codex was busy
   if (eventQueue.length > 0) setImmediate(processNextEvent);

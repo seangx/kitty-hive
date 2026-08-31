@@ -112,6 +112,50 @@ export const DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS = 60_000;
 export const DEFAULT_HIVE_COLD_RESUME_TAIL_SCAN_BYTES = 8 * 1024 * 1024;
 export const DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES = 64 * 1024 * 1024;
 
+/** Resolve the persisted thread requested for an app-server generation.
+ * An explicit control-plane target is strict: failure to resume it must be
+ * reported to the caller. Only the inherited boot-time value may self-heal
+ * to a fresh thread when an old rollout has disappeared or become invalid.
+ */
+export function resolvePersistedThreadTarget(
+  explicitThreadId: string | undefined,
+  inheritedThreadId: string | undefined,
+): { threadId: string; strict: boolean } {
+  if (explicitThreadId !== undefined) {
+    return { threadId: explicitThreadId.trim(), strict: true };
+  }
+  return { threadId: (inheritedThreadId || '').trim(), strict: false };
+}
+
+/** Single-process mutual exclusion between Hive event continuations and
+ * app-server thread lifecycle changes. Both acquisitions are synchronous,
+ * so JavaScript's run-to-completion semantics close the check/start race.
+ */
+export class CodexChannelLifecycleGate {
+  private eventActive = false;
+  private switchActive = false;
+
+  tryStartEvent(): boolean {
+    if (this.eventActive || this.switchActive) return false;
+    this.eventActive = true;
+    return true;
+  }
+
+  finishEvent(): void {
+    this.eventActive = false;
+  }
+
+  tryStartSwitch(): boolean {
+    if (this.eventActive || this.switchActive) return false;
+    this.switchActive = true;
+    return true;
+  }
+
+  finishSwitch(): void {
+    this.switchActive = false;
+  }
+}
+
 export interface CodexAppServerModelOptions {
   supportsWebsockets?: boolean;
   requestMaxRetries?: number;
