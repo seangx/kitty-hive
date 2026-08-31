@@ -700,7 +700,7 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         res.end(JSON.stringify({
           ok: false,
           thread_id: db.getAgentById(agent_id)?.thread_id || null,
-          ws_url: result.snap?.ws_url ?? null,
+          ws_url: null,
           ready: result.ready,
           mode: result.mode,
           error: result.error,
