@@ -45,7 +45,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS, DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES, DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, inspectPersistedRolloutRisk, parseCodexTerminalNotice, parseThreadTokenUsage, promoteColdResumeProvider, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PersistedRolloutRisk, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexTerminalNotificationTracker, DEFAULT_HIVE_AUTO_COMPACT_TOKEN_LIMIT, DEFAULT_HIVE_COLD_RESUME_COMPACT_TIMEOUT_MS, DEFAULT_HIVE_COLD_RESUME_ROLLOUT_GUARD_BYTES, DEFAULT_HIVE_COLD_RESUME_USAGE_TIMEOUT_MS, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_HTTP_MODEL_PROVIDER_ID, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, PostTurnCompactionCoordinator, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, coldResumeCompactionUncertainty, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, inspectPersistedRolloutRisk, parseCodexTerminalNotice, parseThreadTokenUsage, promoteColdResumeProvider, shouldPromoteColdResumeToWebsocket, supervisorProcessIsMissing, type CodexModelTransport, type PersistedRolloutRisk, type PostTurnCompactionOutcome, type RpcTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -388,7 +388,14 @@ let appserverModelWebsockets = CODEX_MODEL_WEBSOCKETS;
 
 class ColdResumeAppserverRecycleError extends Error {
   constructor(
-    readonly stage: 'initial_resume' | 'initial_unsubscribe' | 'repair_unsubscribe' | 'restore_https',
+    readonly stage:
+      | 'initial_resume'
+      | 'initial_unsubscribe'
+      | 'repair_unsubscribe'
+      | 'restore_https'
+      | 'compact_start'
+      | 'compact_timeout'
+      | 'compact_in_progress',
     error: unknown,
   ) {
     const detail = error instanceof Error ? error.message : String(error);
@@ -643,6 +650,13 @@ async function resumePersistedThreadGuarded(
     forceCompactRolloutBytes: risk.kind === 'oversized' ? risk.rolloutBytes : null,
   });
   logColdResumeCompaction(compact);
+  const compactionUncertainty = coldResumeCompactionUncertainty(compact);
+  if (compactionUncertainty) {
+    throw new ColdResumeAppserverRecycleError(
+      compactionUncertainty.stage,
+      compactionUncertainty.error,
+    );
+  }
   if (shouldPromoteColdResumeToWebsocket(compact)) {
     await promoteColdResumeToWebsocket(persistedThreadId);
   } else {

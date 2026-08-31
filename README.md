@@ -425,10 +425,12 @@ token usage; legacy `excludeTurns` resumes are covered by a bounded tail scan of
 the rollout, plus a conservative size guard when no usage record is recoverable.
 Contexts at or above the compaction threshold are compacted before the channel
 announces ready; bounded contexts are then reloaded on the ordinary WebSocket
-provider. If usage is unavailable or compaction fails, the thread remains on
-HTTPS for that daemon lifetime. If a provider-switch response is uncertain,
-Hive destroys that app-server and rebuilds it with HTTPS forced instead of
-risking a duplicate full-history WS upload followed by HTTPS fallback.
+provider. If usage is unavailable or compaction terminates with a confirmed
+failure, the thread remains on HTTPS for that daemon lifetime. If the compact
+request/terminal result or a provider-switch response is uncertain, Hive
+destroys that app-server and rebuilds it with HTTPS forced instead of risking
+a concurrent mutation or duplicate full-history WS upload followed by HTTPS
+fallback.
 
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 

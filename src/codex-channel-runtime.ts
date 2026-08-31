@@ -487,6 +487,39 @@ export interface ColdResumeCompactionOptions {
   forceCompactRolloutBytes?: number | null;
 }
 
+export type ColdResumeCompactionUncertainty = {
+  stage: 'compact_start' | 'compact_timeout' | 'compact_in_progress';
+  error: Error;
+} | null;
+
+/** A cold-resume compaction RPC is result-uncertain when its response is
+ * lost, its terminal lifecycle misses the startup SLA, or another compaction
+ * is already active. The caller must recycle the app-server instead of
+ * announcing ready on a thread that may still be mutating. A canonical
+ * terminal `failed` outcome is intentionally not uncertain: Codex proved the
+ * compaction turn ended, so retaining the HTTPS subscription is safe.
+ */
+export function coldResumeCompactionUncertainty(
+  outcome: PostTurnCompactionOutcome,
+): ColdResumeCompactionUncertainty {
+  if (outcome.kind === 'rpc_error') {
+    return { stage: 'compact_start', error: outcome.error };
+  }
+  if (outcome.kind === 'timeout') {
+    return {
+      stage: 'compact_timeout',
+      error: new Error(`cold-resume compaction did not reach a terminal state within ${outcome.afterMs}ms`),
+    };
+  }
+  if (outcome.kind === 'skipped_in_progress') {
+    return {
+      stage: 'compact_in_progress',
+      error: new Error('cold-resume compaction is already in progress'),
+    };
+  }
+  return null;
+}
+
 interface CompactionWaiter {
   resolve: (result: 'completed' | { failedStatus: string }) => void;
   timer: NodeJS.Timeout;
@@ -501,9 +534,10 @@ interface UsageWaiter {
 }
 
 /** Only promote a cold-resumed thread to the WebSocket provider after its
- * initial full-history risk is known to be bounded. Missing usage and failed
- * compaction stay on the bootstrap HTTPS provider so availability is fail-open
- * without paying a duplicate WS-then-HTTPS upload.
+ * initial full-history risk is known to be bounded. Missing usage and a
+ * canonically terminated failed compaction stay on the bootstrap HTTPS
+ * provider; result-uncertain outcomes are intercepted by
+ * coldResumeCompactionUncertainty before this policy is applied.
  */
 export function shouldPromoteColdResumeToWebsocket(
   outcome: PostTurnCompactionOutcome,

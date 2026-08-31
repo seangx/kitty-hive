@@ -11,6 +11,7 @@ import {
   buildAppServerInitializeParams,
   buildCodexAppServerArgs,
   buildThreadResumeParams,
+  coldResumeCompactionUncertainty,
   detectResponsesTransportFallback,
   describeWebSocketEvent,
   inspectPersistedRolloutRisk,
@@ -526,6 +527,70 @@ test('oversized unknown rollout compacts on HTTPS within the cold-start SLA', as
   });
 });
 
+test('cold compact response lost after accept requires app-server recycle', async () => {
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      throw new Error('response lost after compact was accepted');
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+    },
+  });
+
+  const outcome = await compactor.compactColdResume('thread-current', {
+    usageTimeoutMs: 5,
+    completionTimeoutMs: 1000,
+  });
+  assert.equal(outcome.kind, 'rpc_error');
+  const uncertainty = coldResumeCompactionUncertainty(outcome);
+  assert.equal(uncertainty?.stage, 'compact_start');
+  assert.match(uncertainty?.error.message ?? '', /response lost after compact was accepted/);
+});
+
+test('cold compact terminal beyond the startup SLA requires app-server recycle', async () => {
+  const compactor = new PostTurnCompactionCoordinator({
+    async call() {
+      return {};
+    },
+  }, 160_000, 1000);
+  compactor.observeNotification('thread/tokenUsage/updated', {
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    tokenUsage: {
+      last: { inputTokens: 175_000, cachedInputTokens: 160_000, totalTokens: 176_000 },
+    },
+  });
+
+  const outcome = await compactor.compactColdResume('thread-current', {
+    usageTimeoutMs: 5,
+    completionTimeoutMs: 5,
+  });
+  assert.deepEqual(outcome, {
+    kind: 'timeout',
+    threadId: 'thread-current',
+    turnId: 'turn-large',
+    inputTokens: 175_000,
+    afterMs: 5,
+  });
+  const uncertainty = coldResumeCompactionUncertainty(outcome);
+  assert.equal(uncertainty?.stage, 'compact_timeout');
+  assert.match(uncertainty?.error.message ?? '', /within 5ms/);
+});
+
+test('canonical cold compact failure is settled and may retain HTTPS', () => {
+  assert.equal(coldResumeCompactionUncertainty({
+    kind: 'failed',
+    threadId: 'thread-current',
+    turnId: 'turn-compact',
+    inputTokens: 175_000,
+    status: 'failed',
+  }), null);
+});
+
 test('cold-resume provider promotion is successful only after a confirmed resume', async () => {
   const calls: Array<{ method: string; params: any }> = [];
   const outcome = await promoteColdResumeProvider({
@@ -761,10 +826,19 @@ test('cold resume compacts on HTTPS before ready and only then promotes to WebSo
   const readyIndex = channelSource.indexOf('await announceReady()');
   const forgetUsageIndex = channelSource.indexOf('postTurnCompactor?.forgetThreadUsage(persistedThreadId)');
   const bootstrapResumeIndex = channelSource.indexOf("rpcCall(\n      'thread/resume',", forgetUsageIndex);
+  const uncertaintyIndex = channelSource.indexOf('const compactionUncertainty = coldResumeCompactionUncertainty(compact)');
+  const uncertaintyThrowIndex = channelSource.indexOf('throw new ColdResumeAppserverRecycleError(', uncertaintyIndex);
+  const recycleLogIndex = channelSource.indexOf('cold-resume state could not be repaired in-place');
+  const recycleCleanupIndex = channelSource.indexOf('cleanupAppserver();', recycleLogIndex);
+  const forcedHttpsIndex = channelSource.indexOf('await setupAppserver({ forceHttps: true })', recycleCleanupIndex);
 
   assert.ok(coordinatorIndex >= 0 && coordinatorIndex < guardedResumeIndex);
   assert.ok(guardedResumeIndex < readyIndex);
   assert.ok(forgetUsageIndex >= 0 && forgetUsageIndex < bootstrapResumeIndex);
+  assert.ok(uncertaintyIndex >= 0 && uncertaintyIndex < uncertaintyThrowIndex);
+  assert.ok(uncertaintyThrowIndex < readyIndex, 'uncertain compact must abort before ready');
+  assert.ok(recycleLogIndex >= 0 && recycleLogIndex < recycleCleanupIndex);
+  assert.ok(recycleCleanupIndex < forcedHttpsIndex, 'old generation must die before HTTPS rebuild');
   assert.match(channelSource, /bootstrapProvider = allowWebsocketPromotion\s*\? HIVE_HTTP_MODEL_PROVIDER_ID/);
   assert.match(channelSource, /inspectPersistedRolloutRisk\(threadRolloutPath, persistedThreadId/);
   assert.match(channelSource, /promoteColdResumeProvider\(/);

@@ -422,9 +422,10 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 线程。新版分页恢复会回放 token usage；旧版 `excludeTurns` 恢复则只扫描 rollout
 末尾的有界窗口，找不到 usage 且文件过大时按尺寸保护线保守压缩。达到压缩阈值
 的上下文会在 channel 宣告 ready 前完成压缩；已确认体量安全的线程再重新加载到
-常规 WebSocket provider。若 usage 不可用或压缩失败，本次 daemon 生命周期继续
-使用 HTTPS；若 provider 切换响应不确定，Hive 会销毁该 app-server 并强制 HTTPS
-重建，避免先上传一次完整 WS 历史、失败后又通过 HTTPS 重复上传。
+常规 WebSocket provider。若 usage 不可用，或压缩已明确以失败终态结束，本次
+daemon 生命周期继续使用 HTTPS；若压缩请求/终态或 provider 切换响应不确定，
+Hive 会销毁该 app-server 并强制 HTTPS 重建，避免并发修改线程，或先上传一次
+完整 WS 历史、失败后又通过 HTTPS 重复上传。
 
 **优先级 ID → KEY → NAME**。多个同时给的话，高优先级决定 agent；低优先级值还会用来更新 display_name / 附加 external_key。
 
