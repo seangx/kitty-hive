@@ -413,19 +413,10 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | `HIVE_CODEX_FORCE_HTTPS` | 紧急回退：禁用 Hive 托管 Codex app-server 的 Responses WebSocket |
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP 请求重试预算（默认 `1`；Codex 上游默认 `4`） |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex 流重试预算（默认 `1`；Codex 上游默认 `5`） |
-| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive Codex 自动压缩阈值（默认 `160000`） |
-| `HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS` | 等待新版 Codex 在恢复后回放 usage 的时限（默认 `2000`） |
-| `HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS` | 冷启动压缩的 SLA；超时后线程继续留在 HTTPS（默认 `60000`） |
-| `HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB` | 旧 rollout 无法恢复 usage 时触发保守压缩的文件大小（默认 `64`） |
 
-开启 WebSocket 时，Hive 会先用仅 HTTPS 的引导 provider 恢复持久化 Codex
-线程。新版分页恢复会回放 token usage；旧版 `excludeTurns` 恢复则只扫描 rollout
-末尾的有界窗口，找不到 usage 且文件过大时按尺寸保护线保守压缩。达到压缩阈值
-的上下文会在 channel 宣告 ready 前完成压缩；已确认体量安全的线程再重新加载到
-常规 WebSocket provider。若 usage 不可用，或压缩已明确以失败终态结束，本次
-daemon 生命周期继续使用 HTTPS；若压缩请求/终态或 provider 切换响应不确定，
-Hive 会销毁该 app-server 并强制 HTTPS 重建，避免并发修改线程，或先上传一次
-完整 WS 历史、失败后又通过 HTTPS 重复上传。
+Hive 不再主动发起压缩 turn。持久化线程通过 `excludeTurns: true` 恢复，Codex
+会在模型采样前按模型自身策略执行 turn 前和 turn 内自动压缩。这样重启就绪不再
+依赖远端压缩耗时，Hive 也不需要另外维护一套 token 阈值。
 
 **优先级 ID → KEY → NAME**。多个同时给的话，高优先级决定 agent；低优先级值还会用来更新 display_name / 附加 external_key。
 

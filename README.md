@@ -414,10 +414,6 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_FORCE_HTTPS` | Emergency rollback: disable Responses WebSockets for Hive-owned Codex app-servers |
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP request retry budget (default `1`; upstream Codex default is `4`) |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
-| `HIVE_CODEX_AUTO_COMPACT_TOKENS` | Hive post-turn/cold-resume proactive compaction threshold (default `160000`); Codex in-turn auto-compaction uses the model default |
-| `HIVE_CODEX_COLD_RESUME_USAGE_TIMEOUT_MS` | Wait for modern Codex's post-resume usage replay (default `2000`) |
-| `HIVE_CODEX_COLD_RESUME_COMPACT_TIMEOUT_MS` | Cold-start compaction SLA before the thread stays on HTTPS (default `60000`) |
-| `HIVE_CODEX_COLD_RESUME_ROLLOUT_GUARD_MIB` | Compact a legacy rollout with no recoverable usage once it reaches this size (default `64`) |
 
 To make every Codex daemon launched by `kitty-hive serve` use a different
 executable, persist it in the node config:
@@ -429,18 +425,11 @@ kitty-hive config set codexCommand codex-debug
 An explicit `CODEX_CMD` environment variable still overrides this setting for
 that invocation. Without either setting, Hive uses `codex` from `PATH`.
 
-When a persisted Codex thread is restored with WebSockets enabled, Hive first
-resumes it on an HTTPS-only bootstrap provider. Modern paginated resumes replay
-token usage; legacy `excludeTurns` resumes are covered by a bounded tail scan of
-the rollout, plus a conservative size guard when no usage record is recoverable.
-Contexts at or above the compaction threshold are compacted before the channel
-announces ready; bounded contexts are then reloaded on the ordinary WebSocket
-provider. If usage is unavailable or compaction terminates with a confirmed
-failure, the thread remains on HTTPS for that daemon lifetime. If the compact
-request/terminal result or a provider-switch response is uncertain, Hive
-destroys that app-server and rebuilds it with HTTPS forced instead of risking
-a concurrent mutation or duplicate full-history WS upload followed by HTTPS
-fallback.
+Hive does not issue manual compaction turns. Persisted threads resume with
+`excludeTurns: true`, and Codex applies its model-specific pre-turn and mid-turn
+auto-compaction policy before sampling. This keeps restart readiness independent
+from remote compaction latency and avoids maintaining a second token threshold
+inside Hive.
 
 **Lookup priority is ID → KEY → NAME**. When more than one is set, the higher-priority match decides the agent; lower-priority values still update display_name / attach external_key when given.
 
