@@ -107,6 +107,7 @@ let supervisorPort = 4123;  // set by startCodexSupervisor
 
 export const CODEX_DAEMON_START_CONCURRENCY = 3;
 const CODEX_DAEMON_READY_TIMEOUT_MS = 60 * 1000;
+const CODEX_GOAL_PAUSE_TIMEOUT_MS = 2_000;
 
 /** Small synchronous concurrency gate used only for the boot-time daemon
  * restore burst. Every item receives an idempotent release callback; the
@@ -370,6 +371,80 @@ function reapAllTrackedCodexTuis(signal: NodeJS.Signals): number[] {
   return sweepAttachedCodexTuis(trackedCodexWsUrls(), undefined, process.kill, signal);
 }
 
+export type CodexGoalPauseResult = {
+  ok: boolean;
+  paused?: boolean;
+  thread_id?: string;
+  previous_status?: string | null;
+  error?: string;
+};
+
+/** Ask one live codex-channel daemon to persist an active goal as paused.
+ *
+ * This must happen before its TUI/app-server is signalled. Killing an attached
+ * TUI directly bypasses the TUI's Esc/Ctrl+C handler, which otherwise persists
+ * the pause. Leaving the goal active makes Codex start a fresh continuation as
+ * soon as the thread is resumed after the next Hive launch.
+ */
+export async function requestDaemonGoalPause(
+  controlUrl: string,
+  fetchImpl: typeof fetch = fetch,
+  timeoutMs = CODEX_GOAL_PAUSE_TIMEOUT_MS,
+): Promise<CodexGoalPauseResult> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+  try {
+    const response = await fetchImpl(`${controlUrl.replace(/\/+$/, '')}/pause-goal`, {
+      method: 'POST',
+      signal: controller.signal,
+    });
+    const body = await response.json().catch(() => ({})) as CodexGoalPauseResult;
+    if (!response.ok || !body.ok) {
+      return {
+        ok: false,
+        error: body.error || `pause-goal returned HTTP ${response.status}`,
+      };
+    }
+    return body;
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function pauseAllTrackedCodexGoals(): Promise<void> {
+  const targets = Array.from(daemons.values()).filter(
+    (info): info is DaemonInfo & { controlUrl: string } => Boolean(info.readyAt && info.controlUrl),
+  );
+  if (targets.length === 0) return;
+
+  const results = await Promise.all(targets.map(async (info) => ({
+    info,
+    result: await requestDaemonGoalPause(info.controlUrl),
+  })));
+  const paused = results.filter(({ result }) => result.ok && result.paused);
+  const failed = results.filter(({ result }) => !result.ok);
+  if (paused.length > 0) {
+    log(
+      'info',
+      `[codex-supervisor] paused ${paused.length} active Codex goal(s) before shutdown: `
+      + paused.map(({ info }) => info.displayName).join(', '),
+    );
+  }
+  if (failed.length > 0) {
+    log(
+      'warn',
+      `[codex-supervisor] unable to pause goals for ${failed.length} daemon(s) before shutdown; continuing cleanup: `
+      + failed.map(({ info }) => info.displayName).join(', '),
+    );
+  }
+}
+
 function reapTrackedAppserver(info: DaemonInfo, signal: NodeJS.Signals): void {
   const pid = info.appserverPid;
   info.appserverPid = null;
@@ -605,10 +680,11 @@ function releaseDaemonStartupSlot(info: DaemonInfo): void {
   release?.();
 }
 
-export function stopCodexSupervisor(): Promise<void> {
+export async function stopCodexSupervisor(): Promise<void> {
   shuttingDown = true;
-  if (daemons.size === 0) return Promise.resolve();
+  if (daemons.size === 0) return;
   log('info', `[codex-supervisor] stopping ${daemons.size} daemon(s)...`);
+  await pauseAllTrackedCodexGoals();
   const stoppedTuis = reapAllTrackedCodexTuis('SIGTERM');
   if (stoppedTuis.length > 0) {
     log(

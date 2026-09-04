@@ -11,6 +11,7 @@ import {
   isAttachedCodexTuiProcess,
   isOrphanedHiveAppserverProcess,
   parseProcessSnapshots,
+  requestDaemonGoalPause,
   sweepAttachedCodexTuis,
   sweepOrphanedHiveAppservers,
   resolveDaemonProjectDir,
@@ -19,6 +20,61 @@ import {
   signalDaemonProcessTree,
   strictThreadReadyMatches,
 } from './codex-supervisor.js';
+
+test('shutdown pause request targets the daemon control endpoint', async () => {
+  const calls: Array<{ url: string; method: string | undefined }> = [];
+  const fakeFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+    calls.push({ url: String(input), method: init?.method });
+    return new Response(JSON.stringify({
+      ok: true,
+      paused: true,
+      thread_id: 'thread-1',
+      previous_status: 'active',
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  }) as typeof fetch;
+
+  assert.deepEqual(
+    await requestDaemonGoalPause('http://127.0.0.1:4567/', fakeFetch, 100),
+    {
+      ok: true,
+      paused: true,
+      thread_id: 'thread-1',
+      previous_status: 'active',
+    },
+  );
+  assert.deepEqual(calls, [
+    { url: 'http://127.0.0.1:4567/pause-goal', method: 'POST' },
+  ]);
+});
+
+test('shutdown ordering persists active goals before attached TUIs are signalled', () => {
+  const source = readFileSync(new URL('../src/codex-supervisor.ts', import.meta.url), 'utf8');
+  const stop = source.slice(source.indexOf('export async function stopCodexSupervisor'));
+  const pauseIndex = stop.indexOf('await pauseAllTrackedCodexGoals()');
+  const tuiSignalIndex = stop.indexOf("reapAllTrackedCodexTuis('SIGTERM')");
+  const daemonSignalIndex = stop.indexOf("signalDaemonProcessTree(info.pid, 'SIGTERM'");
+
+  assert.ok(pauseIndex >= 0);
+  assert.ok(tuiSignalIndex > pauseIndex);
+  assert.ok(daemonSignalIndex > tuiSignalIndex);
+});
+
+test('codex-channel pause endpoint only changes active goals to paused', () => {
+  const source = readFileSync(new URL('../codex-channel.ts', import.meta.url), 'utf8');
+  const pause = source.slice(
+    source.indexOf('async function performThreadGoalPause'),
+    source.indexOf('async function performThreadSwitch'),
+  );
+
+  assert.match(source, /req\.url === '\/pause-goal'/);
+  assert.match(pause, /rpcCall\('thread\/goal\/get'/);
+  assert.match(pause, /status !== 'active'/);
+  assert.match(pause, /rpcCall\('thread\/goal\/set'/);
+  assert.match(pause, /status: 'paused'/);
+});
 
 test('busy in-process thread switches are authoritative and never a respawn fallback', () => {
   assert.deepEqual(
