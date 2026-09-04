@@ -70,10 +70,7 @@ test('codex-channel pause endpoint only changes active goals to paused', () => {
   );
 
   assert.match(source, /req\.url === '\/pause-goal'/);
-  assert.match(pause, /rpcCall\('thread\/goal\/get'/);
-  assert.match(pause, /status !== 'active'/);
-  assert.match(pause, /rpcCall\('thread\/goal\/set'/);
-  assert.match(pause, /status: 'paused'/);
+  assert.match(pause, /pauseActiveThreadGoal/);
 });
 
 test('busy in-process thread switches are authoritative and never a respawn fallback', () => {

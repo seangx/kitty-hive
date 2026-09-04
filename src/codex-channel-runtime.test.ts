@@ -8,14 +8,106 @@ import {
   buildAppServerInitializeParams,
   buildCodexAppServerArgs,
   buildThreadResumeParams,
+  codexAppserverIsRequired,
   detectResponsesTransportFallback,
   describeWebSocketEvent,
   parseThreadTokenUsage,
+  pauseActiveThreadGoal,
   resolvePersistedThreadTarget,
   supervisorProcessIsMissing,
   type CodexTerminalDecision,
   type RpcTransport,
 } from './codex-channel-runtime.js';
+
+test('persisted threads never fall back to legacy exec mode', () => {
+  assert.equal(codexAppserverIsRequired({
+    channelMode: 'auto',
+    eventMode: 'auto',
+    persistedThreadId: 'thread-1',
+  }), true);
+  assert.equal(codexAppserverIsRequired({
+    channelMode: 'auto',
+    eventMode: 'auto',
+  }), false);
+  assert.equal(codexAppserverIsRequired({
+    channelMode: 'auto',
+    eventMode: 'foreground',
+  }), true);
+  assert.equal(codexAppserverIsRequired({
+    channelMode: 'exec',
+    eventMode: 'auto',
+    persistedThreadId: 'thread-1',
+  }), true);
+});
+
+test('startup pauses an active goal before resuming its thread', async () => {
+  const calls: Array<{ method: string; params: unknown; timeoutMs?: number }> = [];
+  const transport: RpcTransport = {
+    async call(method, params, timeoutMs) {
+      calls.push({ method, params, timeoutMs });
+      if (method === 'thread/goal/get') return { goal: { status: 'active' } };
+      if (method === 'thread/goal/set') return { goal: { status: 'paused' } };
+      throw new Error(`unexpected method ${method}`);
+    },
+  };
+
+  assert.deepEqual(
+    await pauseActiveThreadGoal(transport, 'thread-1'),
+    { paused: true, previousStatus: 'active' },
+  );
+  assert.deepEqual(calls, [
+    { method: 'thread/goal/get', params: { threadId: 'thread-1' }, timeoutMs: 10_000 },
+    {
+      method: 'thread/goal/set',
+      params: { threadId: 'thread-1', status: 'paused' },
+      timeoutMs: 10_000,
+    },
+  ]);
+});
+
+test('startup leaves a non-active goal unchanged', async () => {
+  const calls: string[] = [];
+  const transport: RpcTransport = {
+    async call(method) {
+      calls.push(method);
+      return { goal: { status: 'paused' } };
+    },
+  };
+
+  assert.deepEqual(
+    await pauseActiveThreadGoal(transport, 'thread-1'),
+    { paused: false, previousStatus: 'paused' },
+  );
+  assert.deepEqual(calls, ['thread/goal/get']);
+});
+
+test('startup accepts a persisted thread with no goal', async () => {
+  const transport: RpcTransport = {
+    async call() {
+      return { goal: null };
+    },
+  };
+
+  assert.deepEqual(
+    await pauseActiveThreadGoal(transport, 'thread-1'),
+    { paused: false, previousStatus: null },
+  );
+});
+
+test('startup fails closed when an active goal was not durably paused', async () => {
+  const transport: RpcTransport = {
+    async call(method) {
+      return method === 'thread/goal/get'
+        ? { goal: { status: 'active' } }
+        : { goal: { status: 'active' } };
+    },
+  };
+
+  await assert.rejects(
+    pauseActiveThreadGoal(transport, 'thread-1'),
+    /unexpected status/,
+  );
+});
 
 test('event turns and thread switches share one lifecycle gate', () => {
   const gate = new CodexChannelLifecycleGate();
@@ -31,7 +123,7 @@ test('event turns and thread switches share one lifecycle gate', () => {
   gate.finishEvent();
 });
 
-test('explicit persisted thread targets are strict while inherited boot targets may self-heal', () => {
+test('explicit persisted thread targets take precedence over inherited targets', () => {
   assert.deepEqual(
     resolvePersistedThreadTarget(' target-thread ', 'inherited-thread'),
     { threadId: 'target-thread', strict: true },
@@ -241,9 +333,12 @@ test('Hive delegates compaction to Codex and resumes before announcing ready', (
     new URL('../codex-channel.ts', import.meta.url),
     'utf8',
   );
+  const guardIndex = channelSource.indexOf('const guard = await pauseActiveThreadGoal(');
+  const resumeRpcIndex = channelSource.indexOf("'thread/resume'", guardIndex);
   const resumeIndex = channelSource.indexOf('await resumePersistedThread(persistedThreadId)');
   const readyIndex = channelSource.indexOf('await announceReady()');
 
+  assert.ok(guardIndex >= 0 && resumeRpcIndex > guardIndex, 'goal must be paused before thread/resume');
   assert.ok(resumeIndex >= 0 && resumeIndex < readyIndex);
   assert.doesNotMatch(channelSource, /rpcCall\(\s*['"]thread\/compact\/start['"]/);
   assert.doesNotMatch(channelSource, /PostTurnCompactionCoordinator/);
@@ -253,7 +348,18 @@ test('Hive delegates compaction to Codex and resumes before announcing ready', (
   assert.match(channelSource, /compaction=codex-managed/);
 });
 
-test('explicit respawn targets remain strict while inherited restart targets may self-heal', () => {
+test('persisted resume failures cannot fall through to thread/start', () => {
+  const channelSource = readFileSync(
+    new URL('../codex-channel.ts', import.meta.url),
+    'utf8',
+  );
+  assert.match(
+    channelSource,
+    /if \(persistedThreadId\) \{\s*await resumePersistedThread\(persistedThreadId\);\s*resumed = true;\s*\} else \{\s*const threadResp = await rpcCall\('thread\/start'/,
+  );
+});
+
+test('explicit and inherited persisted targets require app-server recovery', () => {
   const channelSource = readFileSync(
     new URL('../codex-channel.ts', import.meta.url),
     'utf8',
@@ -266,7 +372,7 @@ test('explicit respawn targets remain strict while inherited restart targets may
     strictSetupIndex,
   );
   const requiredIndex = channelSource.indexOf(
-    "CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID",
+    'codexAppserverIsRequired({',
     strictHttpsIndex,
   );
 
@@ -276,7 +382,7 @@ test('explicit respawn targets remain strict while inherited restart targets may
   assert.ok(strictHttpsIndex > strictSetupIndex);
   assert.ok(
     requiredIndex > strictHttpsIndex,
-    'strict resume rejection must be fatal instead of falling back to exec/thread-start',
+    'persisted resume failures must be fatal instead of falling back to exec',
   );
 });
 
