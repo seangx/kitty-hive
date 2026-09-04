@@ -8,6 +8,9 @@ import {
   classifyDaemonThreadSwitchResponse,
   daemonReachedRequestedThread,
   daemonProjectDirHasDrifted,
+  isOrphanedHiveAppserverProcess,
+  parseProcessSnapshots,
+  sweepOrphanedHiveAppservers,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
   signalCodexAppserverProcessTree,
@@ -270,4 +273,45 @@ test('ignores missing or invalid reported app-server pids', () => {
   signalCodexAppserverProcessTree(-1, 'SIGTERM', kill, 'darwin');
 
   assert.deepEqual(calls, []);
+});
+
+test('recognizes only detached app-servers owned by this Hive endpoint', () => {
+  const owned = {
+    pid: 456,
+    ppid: 1,
+    command: 'codex-debug app-server --listen ws://127.0.0.1:51270 '
+      + '-c model_providers.hive-openai={name="OpenAI"} '
+      + '-c mcp_servers.hive.url="http://127.0.0.1:4123/mcp"',
+  };
+
+  assert.equal(isOrphanedHiveAppserverProcess(owned, 4123), true);
+  assert.equal(isOrphanedHiveAppserverProcess({ ...owned, ppid: 99 }, 4123), false);
+  assert.equal(isOrphanedHiveAppserverProcess(owned, 4999), false);
+  assert.equal(
+    isOrphanedHiveAppserverProcess({ ...owned, command: 'codex-debug app-server --listen ws://127.0.0.1:51270' }, 4123),
+    false,
+  );
+});
+
+test('startup sweep kills only matching orphaned Hive app-server process groups', () => {
+  const snapshots = parseProcessSnapshots(`
+    456 1 codex-debug app-server --listen ws://127.0.0.1:51270 -c model_providers.hive-openai={} -c mcp_servers.hive.url="http://127.0.0.1:4123/mcp"
+    457 99 codex-debug app-server --listen ws://127.0.0.1:51271 -c model_providers.hive-openai={} -c mcp_servers.hive.url="http://127.0.0.1:4123/mcp"
+    458 1 codex-debug app-server --listen ws://127.0.0.1:51272
+  `);
+  const calls: Array<[number, NodeJS.Signals]> = [];
+
+  assert.deepEqual(
+    sweepOrphanedHiveAppservers(
+      4123,
+      snapshots,
+      (pid, signal) => calls.push([pid, signal]),
+      'darwin',
+    ),
+    [456],
+  );
+  assert.deepEqual(calls, [
+    [-456, 'SIGKILL'],
+    [456, 'SIGKILL'],
+  ]);
 });

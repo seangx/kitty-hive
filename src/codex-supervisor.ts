@@ -90,6 +90,12 @@ interface DaemonInfo {
   startupSlotTimer?: NodeJS.Timeout;
 }
 
+export interface ProcessSnapshot {
+  pid: number;
+  ppid: number;
+  command: string;
+}
+
 const daemons = new Map<string, DaemonInfo>();
 // Non-empty targets explicitly selected through /admin/codex-set-thread.
 // Unlike the durable agents.thread_id (which may self-heal on an ordinary
@@ -255,10 +261,67 @@ export function signalCodexAppserverProcessTree(
   try { kill(safePid, signal); } catch { /* process may already be gone */ }
 }
 
+/** Parse the portable columns requested from `ps` without interpreting the command text. */
+export function parseProcessSnapshots(output: string): ProcessSnapshot[] {
+  const snapshots: ProcessSnapshot[] = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.match(/^\s*(\d+)\s+(\d+)\s+(.+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    if (!Number.isSafeInteger(pid) || !Number.isSafeInteger(ppid)) continue;
+    snapshots.push({ pid, ppid, command: match[3] });
+  }
+  return snapshots;
+}
+
+/** Match only detached app-servers that still carry this Hive instance's wiring. */
+export function isOrphanedHiveAppserverProcess(
+  snapshot: ProcessSnapshot,
+  port: number,
+): boolean {
+  return snapshot.ppid === 1
+    && snapshot.command.includes(' app-server --listen ws://127.0.0.1:')
+    && snapshot.command.includes('model_providers.hive-openai=')
+    && snapshot.command.includes('mcp_servers.hive.url=')
+    && snapshot.command.includes(`127.0.0.1:${port}/mcp`);
+}
+
+function readProcessSnapshots(): ProcessSnapshot[] {
+  try {
+    return parseProcessSnapshots(execSync('ps -axo pid=,ppid=,command=', { encoding: 'utf8' }));
+  } catch (err) {
+    log('warn', `[codex-supervisor] unable to inspect stale app-servers: ${err}`);
+    return [];
+  }
+}
+
+/** Reap only PPID-1 app-servers that can be attributed to this Hive endpoint. */
+export function sweepOrphanedHiveAppservers(
+  port: number,
+  snapshots?: ProcessSnapshot[],
+  kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+  platform = process.platform,
+): number[] {
+  if (platform === 'win32') return [];
+  const reaped: number[] = [];
+  for (const snapshot of snapshots ?? readProcessSnapshots()) {
+    if (!isOrphanedHiveAppserverProcess(snapshot, port)) continue;
+    signalCodexAppserverProcessTree(snapshot.pid, 'SIGKILL', kill, platform);
+    reaped.push(snapshot.pid);
+  }
+  return reaped;
+}
+
 function reapTrackedAppserver(info: DaemonInfo, signal: NodeJS.Signals): void {
   const pid = info.appserverPid;
   info.appserverPid = null;
   signalCodexAppserverProcessTree(pid, signal);
+}
+
+/** Synchronous last-resort cleanup for process exit paths that cannot await child events. */
+export function reapAllTrackedCodexAppservers(signal: NodeJS.Signals): void {
+  for (const info of daemons.values()) reapTrackedAppserver(info, signal);
 }
 
 /** Retire a daemon without leaving its soon-to-close websocket discoverable. */
@@ -431,6 +494,13 @@ function spawnDaemon(
 
 export function startCodexSupervisor(port: number = 4123): void {
   supervisorPort = port;
+  const orphanedAppservers = sweepOrphanedHiveAppservers(port);
+  if (orphanedAppservers.length > 0) {
+    log(
+      'warn',
+      `[codex-supervisor] reaped ${orphanedAppservers.length} orphaned Hive app-server(s) before restore: ${orphanedAppservers.join(', ')}`,
+    );
+  }
   const agents = listLocalCodexAgents();
   if (agents.length === 0) {
     log('info', '[codex-supervisor] no local tool=codex agents — nothing to spawn at boot');

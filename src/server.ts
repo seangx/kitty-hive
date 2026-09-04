@@ -9,7 +9,11 @@ import { createMcpServer } from './mcp/server.js';
 import { handleFederation, cleanupOldFiles, getNodeName } from './federation-http.js';
 import { handleAdmin } from './admin-http.js';
 import { startHeartbeat } from './federation-heartbeat.js';
-import { startCodexSupervisor, stopCodexSupervisor } from './codex-supervisor.js';
+import {
+  reapAllTrackedCodexAppservers,
+  startCodexSupervisor,
+  stopCodexSupervisor,
+} from './codex-supervisor.js';
 import { startOpenCodeSupervisor, stopOpenCodeSupervisor } from './opencode-supervisor.js';
 import { DisconnectedSessionReaper } from './session-lifecycle.js';
 
@@ -212,13 +216,21 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
 
   // Stop persistent daemons on serve shutdown. Without this, child processes
   // become orphans and their backend subprocesses leak.
+  let shutdownStarted = false;
   const shutdown = async (signal: NodeJS.Signals) => {
+    if (shutdownStarted) return;
+    shutdownStarted = true;
     log('info', `[server] received ${signal}, stopping persistent agent daemons before exit`);
     await Promise.all([stopCodexSupervisor(), stopOpenCodeSupervisor()]);
     process.exit(0);
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
+  if (process.platform !== 'win32') {
+    process.on('SIGHUP', shutdown);
+    process.on('SIGQUIT', shutdown);
+  }
+  process.once('exit', () => reapAllTrackedCodexAppservers('SIGTERM'));
 
   setInterval(() => {
     const count = cleanupStaleTasks(7);
