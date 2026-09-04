@@ -1089,7 +1089,9 @@ function handleServerRequest(msg: { id: number; method: string; params?: any }):
     return;
   }
   if (answer.kind === 'result') {
-    const verb = JSON.stringify(answer.payload).includes('"accept"') ? 'auto-accepting' : 'declining';
+    const verb = msg.method === 'item/tool/requestUserInput'
+      ? 'auto-answering'
+      : JSON.stringify(answer.payload).includes('"accept"') ? 'auto-accepting' : 'declining';
     console.error(`[codex-channel] ${verb} server request ${msg.method}${p.serverName ? ` (server=${p.serverName})` : ''}: ${detail}`);
   } else {
     console.error(`[codex-channel] unknown server request "${msg.method}" on OUR turn — answering method-not-found to avoid hanging it`);
