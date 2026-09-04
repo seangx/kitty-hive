@@ -906,6 +906,10 @@ export type ServerRequestAnswer =
   // the monkeys-cli pane, making the session unusable.
   | { kind: 'ignore'; reason: string };
 
+const WEBSOCKET_FALLBACK_ITEM_ID = 'websocket_fallback_choice';
+const WEBSOCKET_FALLBACK_QUESTION_ID = 'transport';
+const KEEP_RECONNECTING_LABEL = 'Keep reconnecting (Recommended)';
+
 /** Best-effort form fill for approval elicitations we ACCEPT: prefer the
  *  affirmative enum option per field; persist choices prefer 'session' (never
  *  'always' — a headless daemon must not permanently rewrite user config). */
@@ -941,11 +945,13 @@ export function synthesizeElicitationContent(schema: unknown): Record<string, un
  *  Requests for other turns are the attached human's to answer.
  *
  *  Policy for OWN turns (headless, nobody to ask):
+ *   - WebSocket fallback choice → keep reconnecting (never replay a long turn over HTTPS silently)
  *   - hive MCP elicitations → accept (spawn-time approval_mode=auto
  *     overrides should prevent these entirely; net under the net)
  *   - everything else → decline/refuse. Failing one tool call lets the turn
  *     FINISH; a headless daemon must never self-grant shell or fs access.
  *
+ *  Requests for pane-owned user-input prompts are left for the attached TUI.
  *  Exception: hive elicitations are accepted regardless of ownership — hive
  *  is OUR server, the spawn overrides already made its tools auto on this
  *  app-server, and accepting is what the pane user wants ~always (identity
@@ -954,6 +960,25 @@ export function synthesizeElicitationContent(schema: unknown): Record<string, un
 export function answerServerRequest(method: string, params: any, isOwnTurn: (turnId: string | undefined) => boolean): ServerRequestAnswer {
   const p = params ?? {};
   const turnId: string | undefined = p.turnId ?? p.turn_id ?? undefined;
+  if (method === 'item/tool/requestUserInput') {
+    if (!isOwnTurn(turnId)) return { kind: 'ignore', reason: `turn ${turnId ?? '(none)'} not started by daemon — leaving for attached client` };
+    const transportQuestion = Array.isArray(p.questions)
+      ? p.questions.find((question: any) => question?.id === WEBSOCKET_FALLBACK_QUESTION_ID)
+      : undefined;
+    const canKeepReconnecting = Array.isArray(transportQuestion?.options)
+      && transportQuestion.options.some((option: any) => option?.label === KEEP_RECONNECTING_LABEL);
+    if (p.itemId === WEBSOCKET_FALLBACK_ITEM_ID && canKeepReconnecting) {
+      return {
+        kind: 'result',
+        payload: {
+          answers: {
+            [WEBSOCKET_FALLBACK_QUESTION_ID]: { answers: [KEEP_RECONNECTING_LABEL] },
+          },
+        },
+      };
+    }
+    return { kind: 'error', payload: { code: -32601, message: 'codex-channel daemon cannot answer arbitrary user input (headless)' } };
+  }
   if (method === 'mcpServer/elicitation/request') {
     if (p.serverName === 'hive') {
       return { kind: 'result', payload: { action: 'accept', content: synthesizeElicitationContent(p.requestedSchema) } };

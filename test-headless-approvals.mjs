@@ -67,6 +67,36 @@ console.log('=== 5. unknown request → JSON-RPC error, never silence ===');
   ok(a.kind === 'error' && a.payload.code === -32601, `error -32601 (got ${JSON.stringify(a.payload)})`);
 }
 
+console.log('=== 5a. WebSocket fallback choice → keep reconnecting ===');
+{
+  const params = {
+    itemId: 'websocket_fallback_choice',
+    turnId: 't1',
+    questions: [{
+      id: 'transport',
+      options: [
+        { label: 'Keep reconnecting (Recommended)' },
+        { label: 'Use HTTPS fallback' },
+      ],
+    }],
+  };
+  const own = answerServerRequest('item/tool/requestUserInput', params, OWN);
+  ok(
+    own.kind === 'result'
+      && own.payload.answers.transport.answers[0] === 'Keep reconnecting (Recommended)',
+    `daemon turn keeps WebSocket transport (got ${JSON.stringify(own)})`,
+  );
+  const pane = answerServerRequest('item/tool/requestUserInput', { ...params, turnId: 'pane-turn' }, NOT_OWN);
+  ok(pane.kind === 'ignore', `pane turn is left for the attached client (got ${pane.kind})`);
+  const arbitrary = answerServerRequest('item/tool/requestUserInput', {
+    itemId: 'some_other_prompt',
+    turnId: 't1',
+    questions: [],
+  }, OWN);
+  ok(arbitrary.kind === 'error' && arbitrary.payload.code === -32601,
+    `arbitrary headless prompt fails closed (got ${JSON.stringify(arbitrary)})`);
+}
+
 
 console.log('=== 5b. OWNERSHIP GATE: pane turns are never answered ===');
 // 2026-07-16 monkeys-cli incident: a human pane attached to the daemon's
