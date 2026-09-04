@@ -84,6 +84,59 @@ export interface RpcTransport {
   call(method: string, params: unknown, timeoutMs?: number): Promise<unknown>;
 }
 
+export function codexAppserverIsRequired(options: {
+  channelMode: 'auto' | 'appserver' | 'exec';
+  eventMode: 'auto' | 'foreground';
+  strictThreadId?: string;
+  persistedThreadId?: string;
+}): boolean {
+  return options.channelMode === 'appserver'
+    || options.eventMode === 'foreground'
+    || Boolean(options.strictThreadId?.trim())
+    || Boolean(options.persistedThreadId?.trim());
+}
+
+export type ThreadGoalPauseResult = {
+  paused: boolean;
+  previousStatus: string | null;
+};
+
+/** Persist an active goal as paused without starting a model turn.
+ *
+ * Calling this while a thread is still unloaded closes the resume race:
+ * Codex's state DB is updated before `thread/resume` can restore the active
+ * goal and immediately start a continuation turn.
+ */
+export async function pauseActiveThreadGoal(
+  transport: RpcTransport,
+  threadId: string,
+  timeoutMs = 10_000,
+): Promise<ThreadGoalPauseResult> {
+  const response = await transport.call('thread/goal/get', { threadId }, timeoutMs) as {
+    goal?: { status?: unknown } | null;
+  };
+  if (response?.goal == null) {
+    return { paused: false, previousStatus: null };
+  }
+
+  const status = response.goal.status;
+  if (typeof status !== 'string') {
+    throw new Error(`thread/goal/get returned a goal without a status: ${JSON.stringify(response)}`);
+  }
+  if (status !== 'active') {
+    return { paused: false, previousStatus: status };
+  }
+
+  const updated = await transport.call('thread/goal/set', {
+    threadId,
+    status: 'paused',
+  }, timeoutMs) as { goal?: { status?: unknown } | null };
+  if (updated?.goal?.status !== 'paused') {
+    throw new Error(`thread/goal/set returned unexpected status: ${JSON.stringify(updated)}`);
+  }
+  return { paused: true, previousStatus: status };
+}
+
 export interface ThreadResumeParams {
   threadId: string;
   modelProvider: string;
@@ -106,9 +159,8 @@ export const DEFAULT_HIVE_REQUEST_MAX_RETRIES = 3;
 export const DEFAULT_HIVE_STREAM_MAX_RETRIES = 3;
 
 /** Resolve the persisted thread requested for an app-server generation.
- * An explicit control-plane target is strict: failure to resume it must be
- * reported to the caller. Only the inherited boot-time value may self-heal
- * to a fresh thread when an old rollout has disappeared or become invalid.
+ * An explicit control-plane target wins over the inherited boot-time value.
+ * Both are fail-closed: neither may silently become a fresh thread.
  */
 export function resolvePersistedThreadTarget(
   explicitThreadId: string | undefined,

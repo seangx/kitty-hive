@@ -41,7 +41,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexChannelLifecycleGate, CodexTerminalNotificationTracker, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, resolvePersistedThreadTarget, supervisorProcessIsMissing, type CodexModelTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { CodexChannelLifecycleGate, CodexTerminalNotificationTracker, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, codexAppserverIsRequired, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, pauseActiveThreadGoal, resolvePersistedThreadTarget, supervisorProcessIsMissing, type CodexModelTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -64,7 +64,7 @@ const CODEX_APPSERVER_CWD = process.env.CODEX_APPSERVER_CWD || process.cwd();
 const HIVE_SUPERVISOR_PID = process.env.HIVE_SUPERVISOR_PID;
 // Present only while the supervisor is applying an explicit non-empty
 // set-thread target through respawn. Natural restarts inherit only
-// HIVE_AGENT_THREAD_ID and keep the historical stale-target self-heal.
+// HIVE_AGENT_THREAD_ID; both paths now fail closed on restore errors.
 const HIVE_AGENT_STRICT_THREAD_ID = (process.env.HIVE_AGENT_STRICT_THREAD_ID || '').trim();
 // Timeout for thread/start + thread/resume. codex 0.144 blocks these ~30s on
 // a models-refresh child-process hang (vendor bug, openai/codex#14795-family:
@@ -367,6 +367,14 @@ class ThreadResumeAppserverRecycleError extends Error {
   }
 }
 
+class ThreadGoalResumeGuardError extends Error {
+  constructor(error: unknown) {
+    const detail = error instanceof Error ? error.message : String(error);
+    super(`pre-resume goal guard failed: ${detail}`);
+    this.name = 'ThreadGoalResumeGuardError';
+  }
+}
+
 class CodexRpcResponseError extends Error {
   constructor(readonly responseError: unknown) {
     super(`codex rpc error: ${JSON.stringify(responseError)}`);
@@ -477,6 +485,28 @@ function applyResumeResponse(
  * during startup or block readiness on a second maintenance turn.
  */
 async function resumePersistedThread(persistedThreadId: string): Promise<void> {
+  try {
+    const guard = await pauseActiveThreadGoal(
+      { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+      persistedThreadId,
+    );
+    if (guard.paused) {
+      console.error(`[codex-channel] paused active goal before thread/resume: thread=${persistedThreadId}`);
+    }
+  } catch (err) {
+    const rpcDetail = err instanceof CodexRpcResponseError
+      ? JSON.stringify(err.responseError)
+      : '';
+    if (/goals feature is disabled/i.test(rpcDetail)) {
+      // A disabled extension cannot auto-continue, so resuming is safe.
+      console.error('[codex-channel] pre-resume goal guard skipped: goals feature is disabled');
+    } else {
+      throw new ThreadGoalResumeGuardError(
+        `could not safely pause ${persistedThreadId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
   let resumeResp: any;
   try {
     resumeResp = await rpcCall(
@@ -486,9 +516,9 @@ async function resumePersistedThread(persistedThreadId: string): Promise<void> {
     );
     applyResumeResponse(resumeResp, persistedThreadId, HIVE_MODEL_PROVIDER_ID);
   } catch (err) {
-    // A JSON-RPC error is an authoritative rejection (missing rollout/schema
-    // mismatch), so callers may create a fresh thread. A timeout/transport or
-    // malformed success response is result-uncertain: recycle the app-server.
+    // Preserve JSON-RPC detail so the caller reports the exact rejection.
+    // Timeout/transport or a malformed success response is result-uncertain:
+    // recycle the app-server.
     if (err instanceof CodexRpcResponseError) throw err;
     throw new ThreadResumeAppserverRecycleError(err);
   }
@@ -731,20 +761,9 @@ async function setupAppserver(options: {
   const persistedThreadId = persistedTarget.threadId;
   let resumed = false;
   if (persistedThreadId) {
-    try {
-      await resumePersistedThread(persistedThreadId);
-      resumed = true;
-    } catch (err) {
-      if (err instanceof ThreadResumeAppserverRecycleError) throw err;
-      if (persistedTarget.strict) throw err;
-      // Common cause: jsonl missing (stale thread_id from a wiped ~/.codex)
-      // or codex schema upgrade. Fall back to a fresh thread; the new
-      // thread_id will overwrite the stale one in agents.thread_id via
-      // markDaemonReady → setAgentThreadId, so this self-heals.
-      console.error(`[codex-channel] thread/resume failed for ${persistedThreadId}, falling back to thread/start: ${err}`);
-    }
-  }
-  if (!resumed) {
+    await resumePersistedThread(persistedThreadId);
+    resumed = true;
+  } else {
     const threadResp = await rpcCall('thread/start', { cwd: CODEX_APPSERVER_CWD }, THREAD_RPC_TIMEOUT_MS);
     threadId = threadResp?.thread?.id;
     threadRolloutPath = typeof threadResp?.thread?.path === 'string' ? threadResp.thread.path : null;
@@ -916,32 +935,18 @@ async function performThreadGoalPause(): Promise<ThreadGoalPauseResult> {
   }
   try {
     const currentThreadId = threadId;
-    const response = await rpcCall('thread/goal/get', { threadId: currentThreadId });
-    const status = typeof response?.goal?.status === 'string' ? response.goal.status : null;
-    if (status !== 'active') {
-      return {
-        ok: true,
-        paused: false,
-        thread_id: currentThreadId,
-        previous_status: status,
-      };
+    const result = await pauseActiveThreadGoal(
+      { call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) },
+      currentThreadId,
+    );
+    if (result.paused) {
+      console.error(`[codex-channel] paused active goal before shutdown: thread=${currentThreadId}`);
     }
-    const updated = await rpcCall('thread/goal/set', {
-      threadId: currentThreadId,
-      status: 'paused',
-    });
-    if (updated?.goal?.status !== 'paused') {
-      return {
-        ok: false,
-        error: `thread/goal/set returned unexpected status ${JSON.stringify(updated?.goal?.status)}`,
-      };
-    }
-    console.error(`[codex-channel] paused active goal before shutdown: thread=${currentThreadId}`);
     return {
       ok: true,
-      paused: true,
+      paused: result.paused,
       thread_id: currentThreadId,
-      previous_status: status,
+      previous_status: result.previousStatus,
     };
   } catch (err) {
     return {
@@ -1477,8 +1482,13 @@ async function listenSSE() {
 
 async function setupPushMode() {
   if (CODEX_CHANNEL_MODE === 'exec') {
-    if (HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID) {
-      throw new Error('foreground mode or an explicit strict thread target requires codex app-server; legacy exec mode cannot preserve that contract');
+    if (codexAppserverIsRequired({
+      channelMode: CODEX_CHANNEL_MODE,
+      eventMode: HIVE_EVENT_MODE,
+      strictThreadId: HIVE_AGENT_STRICT_THREAD_ID,
+      persistedThreadId: process.env.HIVE_AGENT_THREAD_ID,
+    })) {
+      throw new Error('foreground mode or a persisted thread target requires codex app-server; legacy exec mode cannot preserve that contract');
     }
     pushMode = 'exec';
     console.error(`[codex-channel] mode: exec (per-event codex spawn; forced via CODEX_CHANNEL_MODE=exec)`);
@@ -1505,7 +1515,12 @@ async function setupPushMode() {
     pushMode = 'appserver';
     console.error(`[codex-channel] mode: appserver (long-lived codex thread; context persists across events)`);
   } catch (err) {
-    if (CODEX_CHANNEL_MODE === 'appserver' || HIVE_EVENT_MODE === 'foreground' || HIVE_AGENT_STRICT_THREAD_ID) {
+    if (err instanceof ThreadGoalResumeGuardError || codexAppserverIsRequired({
+      channelMode: CODEX_CHANNEL_MODE,
+      eventMode: HIVE_EVENT_MODE,
+      strictThreadId: HIVE_AGENT_STRICT_THREAD_ID,
+      persistedThreadId: process.env.HIVE_AGENT_THREAD_ID,
+    })) {
       console.error(`[codex-channel] appserver is required but setup failed: ${err}`);
       cleanupAppserver();
       throw err;
