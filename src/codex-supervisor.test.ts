@@ -8,8 +8,10 @@ import {
   classifyDaemonThreadSwitchResponse,
   daemonReachedRequestedThread,
   daemonProjectDirHasDrifted,
+  isAttachedCodexTuiProcess,
   isOrphanedHiveAppserverProcess,
   parseProcessSnapshots,
+  sweepAttachedCodexTuis,
   sweepOrphanedHiveAppservers,
   resolveDaemonProjectDir,
   shouldDetachDaemonProcess,
@@ -313,5 +315,62 @@ test('startup sweep kills only matching orphaned Hive app-server process groups'
   assert.deepEqual(calls, [
     [-456, 'SIGKILL'],
     [456, 'SIGKILL'],
+  ]);
+});
+
+test('recognizes only Codex resume clients attached to a tracked Hive websocket', () => {
+  const tracked = ['ws://127.0.0.1:53149'];
+  const attached = {
+    pid: 700,
+    ppid: 600,
+    command: 'codex-debug resume thread-1 --remote ws://127.0.0.1:53149/',
+  };
+
+  assert.equal(isAttachedCodexTuiProcess(attached, tracked), true);
+  assert.equal(
+    isAttachedCodexTuiProcess(
+      { ...attached, command: 'codex-debug --yolo --remote=ws://127.0.0.1:53149 resume thread-1' },
+      tracked,
+    ),
+    true,
+  );
+  assert.equal(
+    isAttachedCodexTuiProcess(
+      { ...attached, command: 'codex-debug resume thread-1 --remote ws://127.0.0.1:59999' },
+      tracked,
+    ),
+    false,
+  );
+  assert.equal(
+    isAttachedCodexTuiProcess(
+      { ...attached, command: '/bin/zsh -lc codex-debug resume thread-1 --remote ws://127.0.0.1:53149' },
+      tracked,
+    ),
+    false,
+  );
+});
+
+test('shutdown sweep signals only TUI clients attached to tracked Hive websockets', () => {
+  const snapshots = parseProcessSnapshots(`
+    700 600 codex-debug resume thread-1 --remote ws://127.0.0.1:53149
+    701 601 /Users/example/.local/bin/codex-debug --remote ws://localhost:53191/ resume thread-2
+    702 602 codex-debug resume thread-3 --remote ws://127.0.0.1:59999
+    703 603 codex-debug app-server --listen ws://127.0.0.1:53149
+  `);
+  const calls: Array<[number, NodeJS.Signals]> = [];
+
+  assert.deepEqual(
+    sweepAttachedCodexTuis(
+      ['ws://127.0.0.1:53149/', 'ws://localhost:53191'],
+      snapshots,
+      (pid, signal) => calls.push([pid, signal]),
+      'SIGTERM',
+      'darwin',
+    ),
+    [700, 701],
+  );
+  assert.deepEqual(calls, [
+    [700, 'SIGTERM'],
+    [701, 'SIGTERM'],
   ]);
 });

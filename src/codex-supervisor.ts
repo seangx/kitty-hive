@@ -313,6 +313,63 @@ export function sweepOrphanedHiveAppservers(
   return reaped;
 }
 
+function normalizeTrackedWsUrl(value: string): string {
+  return value.replace(/\/+$/, '');
+}
+
+/** Match an external Codex TUI attached to one of this supervisor's live app-server URLs. */
+export function isAttachedCodexTuiProcess(
+  snapshot: ProcessSnapshot,
+  wsUrls: Iterable<string>,
+): boolean {
+  const command = snapshot.command.trim();
+  const executable = command.split(/\s+/, 1)[0]?.split('/').pop();
+  if (executable !== 'codex' && executable !== 'codex-debug') return false;
+  if (!/(?:^|\s)resume(?:\s|$)/.test(command)) return false;
+
+  const remote = command.match(
+    /(?:^|\s)--remote(?:=|\s+)["']?(ws:\/\/(?:127\.0\.0\.1|localhost):\d+\/?)["']?(?=\s|$)/,
+  )?.[1];
+  if (!remote) return false;
+  const normalizedRemote = normalizeTrackedWsUrl(remote);
+  return Array.from(wsUrls, normalizeTrackedWsUrl).includes(normalizedRemote);
+}
+
+/** Stop only external Codex TUI clients attached to tracked Hive app-server URLs. */
+export function sweepAttachedCodexTuis(
+  wsUrls: Iterable<string>,
+  snapshots?: ProcessSnapshot[],
+  kill: (pid: number, signal: NodeJS.Signals) => unknown = process.kill,
+  signal: NodeJS.Signals = 'SIGTERM',
+  platform = process.platform,
+): number[] {
+  if (platform === 'win32') return [];
+  const trackedUrls = Array.from(wsUrls, normalizeTrackedWsUrl);
+  if (trackedUrls.length === 0) return [];
+
+  const reaped: number[] = [];
+  for (const snapshot of snapshots ?? readProcessSnapshots()) {
+    if (!isAttachedCodexTuiProcess(snapshot, trackedUrls)) continue;
+    try {
+      kill(snapshot.pid, signal);
+      reaped.push(snapshot.pid);
+    } catch {
+      // The TUI may have exited between the process snapshot and the signal.
+    }
+  }
+  return reaped;
+}
+
+function trackedCodexWsUrls(): string[] {
+  return Array.from(daemons.values())
+    .map((info) => info.wsUrl)
+    .filter((wsUrl): wsUrl is string => Boolean(wsUrl));
+}
+
+function reapAllTrackedCodexTuis(signal: NodeJS.Signals): number[] {
+  return sweepAttachedCodexTuis(trackedCodexWsUrls(), undefined, process.kill, signal);
+}
+
 function reapTrackedAppserver(info: DaemonInfo, signal: NodeJS.Signals): void {
   const pid = info.appserverPid;
   info.appserverPid = null;
@@ -322,6 +379,12 @@ function reapTrackedAppserver(info: DaemonInfo, signal: NodeJS.Signals): void {
 /** Synchronous last-resort cleanup for process exit paths that cannot await child events. */
 export function reapAllTrackedCodexAppservers(signal: NodeJS.Signals): void {
   for (const info of daemons.values()) reapTrackedAppserver(info, signal);
+}
+
+/** Synchronous last-resort cleanup for both app-servers and their external TUI clients. */
+export function reapAllTrackedCodexProcesses(signal: NodeJS.Signals): void {
+  reapAllTrackedCodexTuis(signal);
+  reapAllTrackedCodexAppservers(signal);
 }
 
 /** Retire a daemon without leaving its soon-to-close websocket discoverable. */
@@ -546,6 +609,13 @@ export function stopCodexSupervisor(): Promise<void> {
   shuttingDown = true;
   if (daemons.size === 0) return Promise.resolve();
   log('info', `[codex-supervisor] stopping ${daemons.size} daemon(s)...`);
+  const stoppedTuis = reapAllTrackedCodexTuis('SIGTERM');
+  if (stoppedTuis.length > 0) {
+    log(
+      'info',
+      `[codex-supervisor] stopped ${stoppedTuis.length} attached Codex TUI client(s): ${stoppedTuis.join(', ')}`,
+    );
+  }
   return new Promise((resolve) => {
     const pending = new Set<string>();
     for (const info of daemons.values()) {
@@ -560,6 +630,7 @@ export function stopCodexSupervisor(): Promise<void> {
     setTimeout(() => {
       if (pending.size === 0) return;
       log('warn', `[codex-supervisor] ${pending.size} daemon(s) didn't exit cleanly; SIGKILL`);
+      reapAllTrackedCodexTuis('SIGKILL');
       for (const info of daemons.values()) {
         if (pending.has(info.agentId)) {
           reapTrackedAppserver(info, 'SIGKILL');
