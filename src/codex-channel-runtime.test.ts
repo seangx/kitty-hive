@@ -88,8 +88,6 @@ test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS f
       'app-server',
       '--listen',
       'ws://127.0.0.1:4567',
-      '--session-source',
-      'mcp',
       '-c',
       'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=true,request_max_retries=3,stream_max_retries=3,supports_standalone_web_search=true}',
       '-c',
@@ -102,6 +100,15 @@ test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS f
       'mcp_servers.hive.tools.hive_inbox.approval_mode="auto"',
     ],
   );
+});
+
+test('Hive does not pass standalone app-server options to the Codex CLI subcommand', () => {
+  const args = buildCodexAppServerArgs(
+    'ws://127.0.0.1:4567',
+    'http://127.0.0.1:4123/mcp',
+    [],
+  );
+  assert.equal(args.includes('--session-source'), false);
 });
 
 test('Hive app-server transport remains rollback-configurable without reopening retry amplification', () => {
