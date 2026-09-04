@@ -902,6 +902,55 @@ type ThreadSwitchResult = {
   fail_closed?: boolean;
 };
 
+type ThreadGoalPauseResult = {
+  ok: boolean;
+  paused?: boolean;
+  thread_id?: string;
+  previous_status?: string | null;
+  error?: string;
+};
+
+async function performThreadGoalPause(): Promise<ThreadGoalPauseResult> {
+  if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1 || !threadId) {
+    return { ok: false, error: 'daemon not in appserver mode (or thread unavailable)' };
+  }
+  try {
+    const currentThreadId = threadId;
+    const response = await rpcCall('thread/goal/get', { threadId: currentThreadId });
+    const status = typeof response?.goal?.status === 'string' ? response.goal.status : null;
+    if (status !== 'active') {
+      return {
+        ok: true,
+        paused: false,
+        thread_id: currentThreadId,
+        previous_status: status,
+      };
+    }
+    const updated = await rpcCall('thread/goal/set', {
+      threadId: currentThreadId,
+      status: 'paused',
+    });
+    if (updated?.goal?.status !== 'paused') {
+      return {
+        ok: false,
+        error: `thread/goal/set returned unexpected status ${JSON.stringify(updated?.goal?.status)}`,
+      };
+    }
+    console.error(`[codex-channel] paused active goal before shutdown: thread=${currentThreadId}`);
+    return {
+      ok: true,
+      paused: true,
+      thread_id: currentThreadId,
+      previous_status: status,
+    };
+  } catch (err) {
+    return {
+      ok: false,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+}
+
 async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> {
   if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1) {
     return { ok: false, error: 'daemon not in appserver mode (or WS not open)' };
@@ -1035,6 +1084,18 @@ async function startControlServer(): Promise<void> {
           res.writeHead(500, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
         });
+      });
+      return;
+    }
+    if (req.method === 'POST' && req.url === '/pause-goal') {
+      const run = switchChain.catch(() => undefined).then(() => performThreadGoalPause());
+      switchChain = run;
+      run.then((result) => {
+        res.writeHead(result.ok ? 200 : 500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      }).catch((err) => {
+        res.writeHead(500, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
       });
       return;
     }
