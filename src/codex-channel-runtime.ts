@@ -189,6 +189,11 @@ export function buildCodexAppServerArgs(
   const args = [
     'app-server',
     '--listen', listenUrl,
+    // The app-server binary defaults to `vscode`, but Hive is an MCP-owned
+    // client. Declare the source explicitly so Codex applies the recovery
+    // policy intended for unattended Hive turns instead of silently taking
+    // the VS Code fallback path.
+    '--session-source', 'mcp',
     // Codex 0.145+ reserves the built-in `openai` provider id, so attempting
     // to override `model_providers.openai.supports_websockets` makes config
     // loading fail. Define a complete process-local provider instead and

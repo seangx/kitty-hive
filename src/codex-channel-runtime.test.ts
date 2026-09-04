@@ -88,6 +88,8 @@ test('Hive app-server uses incremental Responses WebSockets with bounded HTTPS f
       'app-server',
       '--listen',
       'ws://127.0.0.1:4567',
+      '--session-source',
+      'mcp',
       '-c',
       'model_providers.hive-openai={name="OpenAI",wire_api="responses",requires_openai_auth=true,supports_websockets=true,request_max_retries=3,stream_max_retries=3,supports_standalone_web_search=true}',
       '-c',
