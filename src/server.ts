@@ -10,7 +10,7 @@ import { handleFederation, cleanupOldFiles, getNodeName } from './federation-htt
 import { handleAdmin } from './admin-http.js';
 import { startHeartbeat } from './federation-heartbeat.js';
 import {
-  reapAllTrackedCodexAppservers,
+  reapAllTrackedCodexProcesses,
   startCodexSupervisor,
   stopCodexSupervisor,
 } from './codex-supervisor.js';
@@ -230,7 +230,7 @@ export async function startServer(port: number, dbPath?: string): Promise<void> 
     process.on('SIGHUP', shutdown);
     process.on('SIGQUIT', shutdown);
   }
-  process.once('exit', () => reapAllTrackedCodexAppservers('SIGTERM'));
+  process.once('exit', () => reapAllTrackedCodexProcesses('SIGTERM'));
 
   setInterval(() => {
     const count = cleanupStaleTasks(7);
