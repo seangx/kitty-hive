@@ -413,6 +413,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 | `HIVE_CODEX_FORCE_HTTPS` | 紧急回退：禁用 Hive 托管 Codex app-server 的 Responses WebSocket |
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP 请求重试预算（默认 `1`；Codex 上游默认 `4`） |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex 流重试预算（默认 `1`；Codex 上游默认 `5`） |
+| `HIVE_CODEX_APPSERVER_LOGS` | app-server 诊断日志：默认 `compact`，合并精确识别的启动噪音；排障时设为 `raw` 恢复全部原始行 |
 
 Hive 不再主动发起压缩 turn。持久化线程通过 `excludeTurns: true` 恢复，Codex
 会在模型采样前按模型自身策略执行 turn 前和 turn 内自动压缩。这样重启就绪不再

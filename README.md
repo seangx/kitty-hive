@@ -414,6 +414,7 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 | `HIVE_CODEX_FORCE_HTTPS` | Emergency rollback: disable Responses WebSockets for Hive-owned Codex app-servers |
 | `HIVE_CODEX_REQUEST_MAX_RETRIES` | Hive Codex HTTP request retry budget (default `1`; upstream Codex default is `4`) |
 | `HIVE_CODEX_STREAM_MAX_RETRIES` | Hive Codex stream retry budget (default `1`; upstream Codex default is `5`) |
+| `HIVE_CODEX_APPSERVER_LOGS` | App-server diagnostic logging: `compact` (default) coalesces exact known startup noise; `raw` restores every original line for debugging |
 
 To make every Codex daemon launched by `kitty-hive serve` use a different
 executable, persist it in the node config:

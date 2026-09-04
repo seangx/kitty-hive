@@ -33,6 +33,10 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execSync } from 'node:child_process';
 import { log } from './log.js';
+import {
+  CodexAppserverDiagnosticCoalescer,
+  CodexDaemonLogForwarder,
+} from './codex-appserver-diagnostics.js';
 import { listLocalCodexAgents, getAgentById, onAgentCreated, onAgentRuntimeChanged, setAgentThreadId } from './db.js';
 import type { Agent } from './models.js';
 
@@ -108,6 +112,10 @@ let supervisorPort = 4123;  // set by startCodexSupervisor
 export const CODEX_DAEMON_START_CONCURRENCY = 3;
 const CODEX_DAEMON_READY_TIMEOUT_MS = 60 * 1000;
 const CODEX_GOAL_PAUSE_TIMEOUT_MS = 2_000;
+const COMPACT_CODEX_APPSERVER_LOGS = process.env.HIVE_CODEX_APPSERVER_LOGS !== 'raw';
+const codexAppserverDiagnostics = new CodexAppserverDiagnosticCoalescer(
+  message => log('warn', message),
+);
 
 /** Small synchronous concurrency gate used only for the boot-time daemon
  * restore burst. Every item receives an idempotent release callback; the
@@ -585,9 +593,16 @@ function spawnDaemon(
   // and stderr to stderr (stdout would interleave with the http log lines).
   const prefix = `[codex:${displayName}]`;
   child.stdout?.on('data', (chunk) => process.stderr.write(`${prefix} ${chunk}`));
-  child.stderr?.on('data', (chunk) => process.stderr.write(`${prefix} ${chunk}`));
+  const stderrForwarder = new CodexDaemonLogForwarder(
+    prefix,
+    displayName,
+    codexAppserverDiagnostics,
+    COMPACT_CODEX_APPSERVER_LOGS,
+  );
+  child.stderr?.on('data', chunk => stderrForwarder.push(chunk));
 
   child.on('exit', (code, signal) => {
+    stderrForwarder.end();
     const wasIntentional = info.intentionalShutdown === true;
     // Cancel any pending health-timer — the DaemonInfo is about to be
     // deleted and we don't want the timer firing against a stale ref.
@@ -682,6 +697,7 @@ function releaseDaemonStartupSlot(info: DaemonInfo): void {
 
 export async function stopCodexSupervisor(): Promise<void> {
   shuttingDown = true;
+  codexAppserverDiagnostics.flush();
   if (daemons.size === 0) return;
   log('info', `[codex-supervisor] stopping ${daemons.size} daemon(s)...`);
   await pauseAllTrackedCodexGoals();
