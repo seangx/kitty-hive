@@ -380,6 +380,8 @@ npx kitty-hive status  [--port 4123]                                     Server,
 npx kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
                        remove --key <K> [--yes]                          Idempotent remove by external_key
                        register --key <K> --display-name <N>             Idempotent upsert (stdout = agent_id)
+                       enable | disable <id-or-name>                     Toggle role:* Pool routing only
+                       start | stop <id-or-name> [--port 4123] [--db path]  Control a resident Codex runtime
 npx kitty-hive peer    invite [--expose <agent>]
                        accept [<token>] [--expose <agent>]
                        add    [<name>] [<url>] [--expose a,b] [--secret s]
@@ -401,6 +403,37 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      Show DM
 **Push notifications are id-only (v0.6.0+).** Channel pushes no longer contain a body preview — just the event type, sender, and identifiers. Receivers must call `hive-dm-read` / `hive-check` / `hive-team-events` to fetch full content. This eliminates the "receiver acts on truncated preview" bug class and also makes dedup rock-solid (channel dedups by `event_id`, not content).
 
 `peer expose` / `peer add --expose` only accept agents that actually exist on this hive — typos and remote placeholder IDs are rejected up front.
+
+Codex runtimes start on demand, not for every registry entry at serve startup.
+Automatic-mode agents restore only when durable messages or unfinished tasks
+exist. Foreground agents start on pane attachment; offline messages stay queued.
+Registration alone is not runtime demand.
+
+After approximately 15 idle minutes, unattached runtimes without unfinished
+tasks may be reclaimed, only after confirming no active turn or goal. Unknown
+state or inspection failure keeps the process alive. Thread IDs and conversation
+history are preserved for the next demand. An idle but connected TUI is retained.
+
+`agent stop` safely disables and stops a local resident Codex runtime through
+the running `serve`. A busy runtime or one with active connections is refused;
+there is no force-kill fallback. `agent start` re-enables its runtime and requests
+startup; success acknowledges the request, not app-server readiness. Both preserve
+the registered agent, persisted thread, and Pool setting. `agent enable` /
+`agent disable` only change Pool routing and do not start or stop the runtime.
+
+Runtime commands resolve an exact agent ID first, otherwise an exact, unique
+display name in `--db` (default `~/.kitty-hive/hive.db`). Use the same database and
+`--port` as the target `serve`; the CLI only reads that DB and sends the change to
+`http://127.0.0.1:<port>/admin/agents/<id>/runtime`. An offline serve, invalid target,
+or refused operation exits nonzero instead of editing runtime state locally.
+The loopback-only endpoint accepts `POST` JSON `{ "action": "stop" }` (or `"start"`);
+invalid actions return 400, ineligible/missing agents 404, and refused operations 409.
+`codex-pane ws --id <id>` (or `--key <key> --db <path>`) explicitly requests an
+enabled cold runtime before polling attach readiness. A manually stopped runtime
+returns `status: "stopped"`; it must be re-enabled with `agent start` first.
+`agent register --tool codex` only reconciles registration metadata and existing
+runtimes (`ensure_runtime: false`); it does not cold-start Codex. The pane attach
+request uses `ensure_runtime: true` without overriding a manually stopped runtime.
 
 ## Environment
 

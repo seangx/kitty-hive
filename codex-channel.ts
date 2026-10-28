@@ -41,7 +41,7 @@ import { execSync } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { createServer } from 'node:net';
 import { createServer as createHttpServer, type Server as HttpServer } from 'node:http';
-import { CodexChannelLifecycleGate, CodexTerminalNotificationTracker, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, codexAppserverIsRequired, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, pauseActiveThreadGoal, resolvePersistedThreadTarget, supervisorProcessIsMissing, type CodexModelTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
+import { confirmThreadIdle, CodexChannelLifecycleGate, CodexTerminalNotificationTracker, DEFAULT_HIVE_REQUEST_MAX_RETRIES, DEFAULT_HIVE_STREAM_MAX_RETRIES, HIVE_MODEL_PROVIDER_ID, HistoryItemInjector, TurnTracker, answerServerRequest, buildAppServerInitializeParams, buildCodexAppServerArgs, buildEventTimingLines, buildThreadResumeParams, checkEventDeliveryBeforeInject, codexAppserverIsRequired, decideEventDelivery, describeWebSocketEvent, detectResponsesTransportFallback, parseCodexTerminalNotice, parseThreadTokenUsage, pauseActiveThreadGoal, resolvePersistedThreadTarget, supervisorProcessIsMissing, type CodexModelTransport, type TurnOutcome } from './src/codex-channel-runtime.js';
 import { notifyKittyCodexTurnCompleted } from './src/kitty-wakeup.js';
 
 // --- Config (env) ---
@@ -1063,6 +1063,39 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
 async function startControlServer(): Promise<void> {
   const port = await pickFreePort();
   controlServer = createHttpServer((req, res) => {
+    if ((req.method === 'POST' && req.url === '/prepare-idle-stop')
+      || (req.method === 'GET' && req.url === '/idle-status')) {
+      void (async () => {
+        if (!threadId || eventQueue.length || !lifecycleGate.tryStartSwitch()) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'Daemon has queued work or a lifecycle operation' }));
+          return;
+        }
+        let prepared = false;
+        try {
+          await confirmThreadIdle({ call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) }, threadId);
+          if (eventQueue.length) throw new Error('Daemon has queued work');
+          prepared = req.method === 'POST';
+          // Hold daemon event execution while the supervisor rechecks clients
+          // and terminates us. If it aborts, release without losing queued work.
+          if (prepared) setTimeout(() => {
+            lifecycleGate.finishSwitch();
+            if (eventQueue.length) setImmediate(processNextEvent);
+          }, 10_000).unref();
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        } catch (err) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: String(err) }));
+        } finally {
+          if (!prepared) {
+            lifecycleGate.finishSwitch();
+            if (eventQueue.length) setImmediate(processNextEvent);
+          }
+        }
+      })();
+      return;
+    }
     // Loopback-only by bind address (127.0.0.1); no auth needed beyond that —
     // same trust model as the hive admin endpoints.
     if (req.method === 'POST' && req.url === '/switch-thread') {

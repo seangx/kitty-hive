@@ -14,8 +14,9 @@ import { join, dirname, basename, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execSync } from 'node:child_process';
+import Database from 'better-sqlite3';
 import { buildPushMessage } from './preview.js';
-import { AGENT_EVENT_MODES, type AgentEventMode } from './models.js';
+import { AGENT_EVENT_MODES, type Agent, type AgentEventMode } from './models.js';
 import {
   createWorkflowTemplate,
   deleteWorkflowTemplate,
@@ -143,46 +144,88 @@ async function cmdCodexPane() {
     console.error('Usage: kitty-hive codex-pane ws --key <K> | --id <I> [--port 4123] [--timeout-ms 5000]');
     process.exit(2);
   }
-  const { port, dbPath } = parseFlags(1);
+  let port = 4123;
+  let dbPath: string | undefined;
   let agentKey = '';
   let agentId = '';
   let timeoutMs = 5000;
   for (let i = 2; i < args.length; i++) {
-    if (args[i] === '--key' && args[i + 1]) { agentKey = args[i + 1]; i++; }
-    else if (args[i] === '--id' && args[i + 1]) { agentId = args[i + 1]; i++; }
-    else if (args[i] === '--timeout-ms' && args[i + 1]) { timeoutMs = parseInt(args[i + 1], 10) || 5000; i++; }
-    else if (args[i] === '--port' || args[i] === '-p') { i++; }
-    else if (args[i] === '--db') { i++; }
+    const flag = args[i];
+    if (!['--key', '--id', '--timeout-ms', '--port', '-p', '--db'].includes(flag)) {
+      throw new Error(`Unexpected codex-pane argument: ${JSON.stringify(flag)}`);
+    }
+    const value = args[++i];
+    if (!value || value.startsWith('-')) throw new Error(`${flag} requires a value`);
+    if (flag === '--key') agentKey = value;
+    else if (flag === '--id') agentId = value;
+    else if (flag === '--db') dbPath = value;
+    else {
+      const number = Number(value);
+      const max = flag === '--timeout-ms' ? 2_147_483_647 : 65535;
+      if (!/^\d+$/.test(value) || !Number.isSafeInteger(number) || number < 1 || number > max) {
+        throw new Error(`Invalid ${flag}: ${JSON.stringify(value)}`);
+      }
+      if (flag === '--timeout-ms') timeoutMs = number;
+      else port = number;
+    }
   }
   if (!agentKey && !agentId) {
     console.error('Usage: kitty-hive codex-pane ws --key <K> | --id <I>');
     process.exit(2);
   }
 
-  // Backoff: 200ms / 400 / 800 / 1600 / 3200 / cap at remaining time
+  if (!agentId) {
+    // A launcher key is a stable identity, not a display-name fallback.
+    // Resolve once, read-only, before asking the running supervisor to wake.
+    const database = new Database(dbPath || join(homedir(), '.kitty-hive', 'hive.db'), { readonly: true, fileMustExist: true });
+    try {
+      const row = database.prepare('SELECT id FROM agents WHERE external_key = ?').get(agentKey) as { id: string } | undefined;
+      agentId = row?.id || '';
+    } finally {
+      database.close();
+    }
+    if (!agentId) {
+      console.log(JSON.stringify({ status: 'not_supervised', error: 'no agent registered with that key' }));
+      process.exit(1);
+    }
+  }
+
+  // Reading /admin/codex-daemons is intentionally passive. This explicit
+  // demand signal wakes an enabled cold runtime without undoing an
+  // operator's `agent stop` (unlike the runtime start endpoint).
   const start = Date.now();
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-created`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agent_id: agentId, ensure_runtime: true }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const result = await response.json() as { runtime_enabled?: number; tool?: string; error?: string };
+    if (result.runtime_enabled === 0) {
+      console.log(JSON.stringify({ status: 'stopped', agent_id: agentId, error: 'Codex runtime is manually stopped; run kitty-hive agent start to enable it' }));
+      process.exit(1);
+    }
+    if (!response.ok || (result.tool && result.tool !== 'codex')) {
+      console.log(JSON.stringify({ status: 'error', agent_id: agentId, error: result.error || 'target is not a supervised Codex agent' }));
+      process.exit(1);
+    }
+  } catch (err: any) {
+    console.log(JSON.stringify({ status: 'error', agent_id: agentId, error: `Cannot request Codex runtime from serve on port ${port}: ${err?.message || err}` }));
+    process.exit(1);
+  }
+
+  // Backoff: 200ms / 400 / 800 / 1600 / 3200 / cap at remaining time
   const delays = [200, 400, 800, 1600, 3200];
   let attempt = 0;
   let lastBody: any = null;
   while (true) {
     try {
       const url = new URL(`http://127.0.0.1:${port}/admin/codex-daemons`);
-      const res = await fetch(url);
+      const res = await fetch(url, { signal: AbortSignal.timeout(Math.max(1, timeoutMs - (Date.now() - start))) });
       if (res.ok) {
         const { daemons } = await res.json() as { daemons: Array<any> };
-        const match = daemons.find(d =>
-          (agentId && d.agent_id === agentId) ||
-          // No external_key in admin snapshot, so we have to look up by id.
-          // For agent_key path, resolve via DB locally.
-          false,
-        );
-        let chosen = match;
-        if (!chosen && agentKey) {
-          // Resolve key → id via DB (use the same dbPath as serve uses)
-          const db = initDB(dbPath);
-          const row = db.prepare('SELECT id FROM agents WHERE external_key = ?').get(agentKey) as { id: string } | undefined;
-          if (row) chosen = daemons.find(d => d.agent_id === row.id);
-        }
+        const chosen = daemons.find(d => d.agent_id === agentId);
         if (chosen) {
           if (chosen.ready && chosen.ws_url && chosen.thread_id) {
             console.log(JSON.stringify({
@@ -994,16 +1037,17 @@ async function cmdAgentRegister() {
     // not the raw --tool flag: handleStart may have refused the change).
     // Both notifies are best-effort: failures silently ignored — the agent
     // row is already written, and the supervisor reconciles at next serve boot.
-    // Codex and OpenCode both have persistent supervised backends. The admin
-    // endpoint reconciles the two supervisors, so tool morphs kill the old
-    // daemon and spawn the new one atomically from the final DB value.
+    // Codex registration is metadata, not runtime demand. Reconcile an
+    // existing ready daemon/cwd and remove an old tool, but leave a cold
+    // Codex runtime asleep until attach or event demand. OpenCode keeps its
+    // existing eager registration lifecycle.
     const supervisedTools = new Set(['codex', 'opencode']);
     if (supervisedTools.has(result.tool)) {
       try {
         const notifyRes = await fetch(`http://127.0.0.1:${port}/admin/notify-agent-created`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ agent_id: result.agent_id }),
+          body: JSON.stringify({ agent_id: result.agent_id, ...(result.tool === 'codex' ? { ensure_runtime: false } : {}) }),
           // Short timeout: register shouldn't block waiting for a dead serve
           signal: AbortSignal.timeout(2000),
         });
@@ -1090,6 +1134,67 @@ async function cmdAgentPoolEnabled(enabled: boolean) {
   const agent = matches[0];
   setAgentPoolEnabled(agent.id, enabled);
   console.log(`${agent.display_name} (${agent.id}) pool=${enabled ? 'enabled' : 'disabled'}`);
+}
+
+async function cmdAgentRuntime(action: 'start' | 'stop') {
+  const usage = `Usage: kitty-hive agent ${action} <id-or-name> [--port 4123] [--db path]`;
+  let target = '';
+  let port = 4123;
+  let dbPath = join(homedir(), '.kitty-hive', 'hive.db');
+  for (let i = 2; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === '--port' || arg === '-p' || arg === '--db') {
+      const value = args[++i];
+      if (!value || value.startsWith('-')) throw new Error(`${arg} requires a value.\n${usage}`);
+      if (arg === '--db') dbPath = value;
+      else {
+        if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+          throw new Error(`Invalid port: ${JSON.stringify(value)}. Expected 1–65535.`);
+        }
+        port = Number(value);
+      }
+    } else if (arg.startsWith('-') || target) {
+      throw new Error(`Unexpected argument: ${JSON.stringify(arg)}.\n${usage}`);
+    } else target = arg;
+  }
+  if (!target) throw new Error(usage);
+
+  // Resolution is read-only: an offline serve must not look like a
+  // successful lifecycle change just because a CLI changed the DB flag.
+  // Match IDs before names, and reject ambiguous names before eligibility
+  // filtering so an operator never silently controls a different agent.
+  const database = new Database(dbPath, { readonly: true, fileMustExist: true });
+  let agent: Agent;
+  try {
+    const byId = database.prepare('SELECT * FROM agents WHERE id = ?').get(target) as Agent | undefined;
+    const matches = byId ? [byId] : database.prepare('SELECT * FROM agents WHERE display_name = ?').all(target) as Agent[];
+    if (matches.length === 0) throw new Error(`Local resident Codex agent ${JSON.stringify(target)} not found.`);
+    if (matches.length > 1) throw new Error(`${JSON.stringify(target)} matches ${matches.length} agents. Use agent id to disambiguate.`);
+    agent = matches[0];
+    if (agent.origin_peer || agent.parent_agent_id || agent.runtime_scope !== 'resident' || agent.tool !== 'codex') {
+      throw new Error(`Agent ${JSON.stringify(target)} is not a local resident Codex agent.`);
+    }
+  } finally {
+    database.close();
+  }
+
+  let response: Response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}/admin/agents/${encodeURIComponent(agent.id)}/runtime`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action }),
+      signal: AbortSignal.timeout(30_000),
+    });
+  } catch (err: any) {
+    throw new Error(`Runtime ${action} request failed: kitty-hive serve on port ${port} is offline or unreachable (${err?.message || err}). No lifecycle change was confirmed.`);
+  }
+  const result = await response.json().catch(() => null) as { ok?: boolean; agent_id?: string; action?: string; error?: string } | null;
+  if (!response.ok) throw new Error(result?.error || `Runtime ${action} failed (HTTP ${response.status}).`);
+  if (!result?.ok || result.agent_id !== agent.id || result.action !== action) {
+    throw new Error(`Runtime ${action} was not confirmed by kitty-hive serve on port ${port}.`);
+  }
+  console.log(`${agent.display_name} (${agent.id}) runtime=${action === 'start' ? 'starting' : 'stopped'}`);
 }
 
 async function cmdAgentRename() {
@@ -2663,7 +2768,7 @@ Top-level commands:
   version | --version | -V                   Print version (bare semver on stdout)
 
 Command groups:
-  agent      Manage local agents       (list, rename, remove, register, enable, disable, event-mode)
+  agent      Manage local agents       (list, rename, remove, register, enable, disable, start, stop, event-mode)
   team       Inspect/maintain teams    (list, transfer)
   workflow   Manage workflow JSON      (list, get, create, update, delete)
   peer       Manage federation peers   (invite, accept, add, list, expose, set-url, remove)
@@ -2695,6 +2800,8 @@ Subcommands:
                                                       (claude/codex/opencode morph); daemon is spawned/killed to match.
   enable <agent>                                      Include a resident agent in role:* Pool routing.
   disable <agent>                                     Exclude from Pool routing; explicit assignment and its session still work.
+  start <id-or-name> [--port 4123] [--db path]          Enable and start a resident Codex runtime through live serve.
+  stop <id-or-name> [--port 4123] [--db path]           Safely stop an idle, unattached Codex runtime; refuses busy/attached agents.
   event-mode <agent> <auto|foreground>                Choose background handling or foreground-only unread delivery.
                                                       Restart serve after changing an existing daemon.`);
 }
@@ -2853,6 +2960,8 @@ switch (command) {
       case 'register': run(cmdAgentRegister); break;
       case 'enable':   run(() => cmdAgentPoolEnabled(true)); break;
       case 'disable':  run(() => cmdAgentPoolEnabled(false)); break;
+      case 'start':    run(() => cmdAgentRuntime('start')); break;
+      case 'stop':     run(() => cmdAgentRuntime('stop')); break;
       case 'event-mode': run(cmdAgentEventMode); break;
       case 'remove':   run(cmdAgentRemove);   break;
       case 'rename':   run(cmdAgentRename);   break;

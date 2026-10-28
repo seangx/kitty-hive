@@ -101,6 +101,24 @@ export type ThreadGoalPauseResult = {
   previousStatus: string | null;
 };
 
+/** Read-only safety check. Never unload an active/unknown thread or goal. */
+export async function confirmThreadIdle(transport: RpcTransport, threadId: string): Promise<void> {
+  const result = await transport.call('thread/read', { threadId, includeTurns: false }, 3000) as { thread?: { status?: { type?: string } } };
+  if (result?.thread?.status?.type !== 'idle') throw new Error('Thread is not confirmed idle');
+  let resultGoal: { goal?: { status?: string } | null } | undefined;
+  try {
+    resultGoal = await transport.call('thread/goal/get', { threadId }, 3000) as typeof resultGoal;
+  } catch (err) {
+    if (!/goals feature is disabled/i.test(String(err))) throw err;
+    return;
+  }
+  if (!resultGoal || !Object.hasOwn(resultGoal, 'goal') || resultGoal.goal === undefined) throw new Error('Unknown goal response');
+  if (resultGoal.goal !== null && (typeof resultGoal.goal !== 'object' || Array.isArray(resultGoal.goal))) throw new Error('Unknown goal response');
+  if (resultGoal?.goal && !['complete', 'paused', 'blocked', 'budget_limited', 'usage_limited'].includes(resultGoal.goal.status ?? '')) {
+    throw new Error('Thread has active or unknown goal state');
+  }
+}
+
 /** Persist an active goal as paused without starting a model turn.
  *
  * Calling this while a thread is still unloaded closes the resume race:

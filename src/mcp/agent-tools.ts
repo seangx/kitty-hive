@@ -2,7 +2,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { handleStart } from '../tools/start.js';
 import { renameAgent, listAllAgents, getAgentsByName, updateAgentRoles, getAgentById, getAgentByExternalKey } from '../db.js';
-import { getDaemonForAgent } from '../codex-supervisor.js';
+import { getDaemonForAgent, notifyAgentCreated } from '../codex-supervisor.js';
 import { getOpenCodeDaemonForAgent } from '../opencode-supervisor.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
 import { bindSession } from '../sessions.js';
@@ -132,6 +132,10 @@ export function registerAgentTools(mcp: McpServer) {
           error: `agent.tool="${agent.tool}", not "codex" — only codex agents are supervised`,
         }) }] };
       }
+      if (agent.runtime_enabled !== 1) {
+        return { content: [{ type: 'text', text: JSON.stringify({ status: 'stopped', agent_id: agent.id, error: 'Runtime stopped; use kitty-hive agent start to resume.' }) }] };
+      }
+      notifyAgentCreated(agent.id);
       const snap = getDaemonForAgent({ agentId: agent.id });
       if (!snap) {
         return { content: [{ type: 'text', text: JSON.stringify({

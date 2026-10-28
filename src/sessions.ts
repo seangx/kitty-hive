@@ -4,6 +4,8 @@ import { log } from './log.js';
 import * as db from './db.js';
 import { getPushDeliveryDecision, markPushReplayed, parsePushPayload } from './push-delivery.js';
 import { notifyKittyWakeup } from './kitty-wakeup.js';
+import { notifyAgentCreated, noteCodexRuntimeDemand, isCodexRuntimeRetiring } from './codex-supervisor.js';
+import { shouldWakeCodexForEvent } from './codex-runtime-policy.js';
 
 export interface Session {
   transport: StreamableHTTPServerTransport;
@@ -43,6 +45,9 @@ export function declaresEventConsumer(
 }
 
 export function livePushSessionsForAgent(agentId: string): string[] {
+  // The retiring SSE may still accept bytes while its process is exiting.
+  // Treat it as offline until the replacement daemon has announced ready.
+  if (isCodexRuntimeRetiring(agentId)) return [];
   const sids = agentSessions.get(agentId);
   const live = sids ? [...sids].filter(s => activeSSE.has(s)) : [];
   const consumers = live.filter(s => eventConsumers.has(s));
@@ -96,6 +101,8 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
   for (const agentId of agentIds) {
     if (agentId === excludeAgentId) continue;
     const target = db.getAgentById(agentId);
+    // Invalidate any in-flight idle-stop before either live delivery or enqueue.
+    if (target?.tool === 'codex') noteCodexRuntimeDemand(agentId);
     if (
       target?.event_mode === 'foreground'
       && target.tool === 'codex'
@@ -116,6 +123,7 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
     if (live.length === 0) {
       // No live SSE — persist so a future reconnect / restart can pick it up.
       db.enqueuePendingPush(agentId, payload);
+      if (shouldWakeCodexForEvent(target)) notifyAgentCreated(agentId);
       log('info', `[notify] agent=${agentId} → no live event consumer, enqueued`);
       continue;
     }
@@ -138,6 +146,7 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
     // any duplicate that manages to slip through later.)
     if (!anyDelivered) {
       db.enqueuePendingPush(agentId, payload);
+      if (shouldWakeCodexForEvent(target)) notifyAgentCreated(agentId);
       log('warn', `[notify] agent=${agentId} all sends failed → enqueued`);
     }
   }

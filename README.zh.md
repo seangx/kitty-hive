@@ -379,6 +379,8 @@ npx kitty-hive status  [--port 4123]                                     服务/
 npx kitty-hive agent   list | rename [old] [new] | remove [name-or-id]
                        remove --key <K> [--yes]                          按 external_key 幂等删除
                        register --key <K> --display-name <N>             幂等 upsert（stdout = agent_id）
+                       enable | disable <id-or-name>                     仅切换 role:* Pool 自动路由
+                       start | stop <id-or-name> [--port 4123] [--db path]  控制常驻 Codex runtime
 npx kitty-hive peer    invite [--expose <agent>]
                        accept [<token>] [--expose <agent>]
                        add    [<name>] [<url>] [--expose a,b] [--secret s]
@@ -400,6 +402,35 @@ npx kitty-hive log     dm    [<agent>] [--limit 50]                      查看�
 **Channel 推送从 v0.6.0 起只带 id、不再带摘要**。推送里只有事件类型、发送者、和拉取详情需要的 id——收到就必须调 `hive-dm-read` / `hive-check` / `hive-team-events` 取正文。这样既根除了"对着截断摘要直接办事"的老 bug，也让去重变得简单：channel 按 `event_id` 去重，跟内容无关。
 
 `peer expose` / `peer add --expose` 现在只接受真实存在的本地 agent ID —— 拼错或填了远端 placeholder 都会被直接拒掉。
+
+Codex runtime 按需启动，不再在 `serve` 启动时为全部登记 agent 分配进程。
+自动模式只恢复有持久化待处理消息或未完成任务的 agent；前台模式在打开 pane
+时启动，离线消息仍排队。注册本身不代表启动需求。
+
+无外部客户端连接、无未完成任务，并确认回合及 goal 均不活跃的 runtime，
+空闲约 15 分钟后回收。检查失败或状态未知时保留运行；会话记录和 thread ID
+不会删除，下次需求使用原 thread 恢复。关闭模型回合不等于关闭客户端：只要
+TUI 仍连接，就不会回收。此改动不会自动停止当前已运行的旧版本服务。
+
+`agent stop` 通过正在运行的 `serve` 安全停用并停止本地常驻 Codex runtime；
+忙碌或仍有活动连接时会拒绝，不会回退到强杀。`agent start` 重新启用 runtime
+并请求启动；成功只表示请求已接受，不代表 app-server 已就绪。两者都会保留
+agent 注册信息、持久化线程和 Pool 设置。`agent enable` / `agent disable`
+只改变 Pool 自动路由，不会启动或停止 runtime。
+
+runtime 命令先按精确 agent ID、再按精确且唯一的 display_name 从 `--db`
+解析目标（默认 `~/.kitty-hive/hive.db`）。请使用与目标 `serve` 相同的数据库和
+`--port`；CLI 只读该数据库，操作通过
+`http://127.0.0.1:<port>/admin/agents/<id>/runtime` 提交。服务离线、目标无效或
+操作被拒绝都会非零退出，不会直接修改本地 runtime 状态。
+此接口仅允许 loopback 请求，接受 `POST` JSON `{ "action": "stop" }`（也可用 `"start"`）；
+非法 action 返回 400，目标不存在或不符合条件返回 404，操作被拒绝返回 409。
+`codex-pane ws --id <id>`（或 `--key <key> --db <path>`）会先明确请求唤醒已启用的
+冷 runtime，再轮询 attach 就绪状态。手动停止的 runtime 会返回
+`status: "stopped"`，必须先用 `agent start` 重新启用。
+`agent register --tool codex` 仅同步注册元数据和已有 runtime
+（`ensure_runtime: false`），不会冷启动 Codex；pane attach 请求使用
+`ensure_runtime: true`，但仍不会覆盖手动停止状态。
 
 ## 环境变量
 

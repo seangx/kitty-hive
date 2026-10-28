@@ -12,7 +12,8 @@ import { existsSync, readdirSync, statSync } from 'node:fs';
 import * as db from './db.js';
 import { log } from './log.js';
 import { getPushDeliveryDecision } from './push-delivery.js';
-import { getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, switchDaemonThread } from './codex-supervisor.js';
+import { getDaemonForAgent, getDaemonSnapshots, markDaemonReady, notifyAgentCreated, notifyAgentRemoved, requestDaemonRespawn, startCodexRuntime, stopCodexRuntime, switchDaemonThread } from './codex-supervisor.js';
+import type { Agent } from './models.js';
 import {
   getOpenCodeDaemonForAgent,
   getOpenCodeDaemonSnapshots,
@@ -30,8 +31,8 @@ import {
   getSidecarTask,
 } from './sidecar-read-model.js';
 
-// Per-agent serialization for persistent conversation changes. Concurrent
-// Codex respawns or OpenCode session switches must not race each other.
+// Per-agent serialization for persistent conversation/lifecycle changes.
+// Runtime stop/start, Codex respawns and session switches must not race.
 const setThreadLocks = new Map<string, Promise<unknown>>();
 function lockPerAgent<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
   const prev = setThreadLocks.get(agentId) ?? Promise.resolve();
@@ -39,9 +40,10 @@ function lockPerAgent<T>(agentId: string, fn: () => Promise<T>): Promise<T> {
   setThreadLocks.set(agentId, next);
   // Cleanup map entry once this call settles AND no later call has chained
   // onto it (we re-check identity before deleting).
-  next.finally(() => {
+  const cleanup = () => {
     if (setThreadLocks.get(agentId) === next) setThreadLocks.delete(agentId);
-  });
+  };
+  void next.then(cleanup, cleanup);
   return next;
 }
 
@@ -104,10 +106,74 @@ export async function broadcastUrlChange(newUrl: string): Promise<{ ok: number; 
   return { ok, fail };
 }
 
-export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url: URL) {
+export interface AgentRuntimeControls {
+  getAgent(agentId: string): Agent | undefined;
+  start(agentId: string): boolean;
+  stop(agentId: string): Promise<{ ok: boolean; error?: string }>;
+  hasReadyRuntime?(agentId: string): boolean;
+  ensure?(agentId: string): boolean;
+  remove?(agentId: string): boolean;
+}
+
+const agentRuntimeControls: AgentRuntimeControls = {
+  getAgent: db.getAgentById,
+  start: startCodexRuntime,
+  stop: stopCodexRuntime,
+};
+
+export async function handleAdmin(
+  req: IncomingMessage,
+  res: ServerResponse,
+  url: URL,
+  runtimeControls: AgentRuntimeControls = agentRuntimeControls,
+) {
   if (!isLoopback(req)) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: 'Admin endpoints are loopback-only' }));
+    return;
+  }
+
+  // POST /admin/agents/:id/runtime — explicit resident Codex lifecycle
+  // control, independent of role:* Pool membership. Stop must go through
+  // the live supervisor so busy/attached runtimes can refuse safely.
+  const agentRuntimeMatch = url.pathname.match(/^\/admin\/agents\/([^/]+)\/runtime$/);
+  if (agentRuntimeMatch && req.method === 'POST') {
+    let agentId: string;
+    let action: 'start' | 'stop';
+    try {
+      agentId = decodeURIComponent(agentRuntimeMatch[1]);
+      const body = JSON.parse(await readBody(req));
+      if (body?.action !== 'start' && body?.action !== 'stop') {
+        throw new Error('action must be start or stop');
+      }
+      action = body.action;
+    } catch (err: any) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+      return;
+    }
+
+    const agent = runtimeControls.getAgent(agentId);
+    if (!agent || agent.origin_peer || agent.parent_agent_id || agent.runtime_scope !== 'resident' || agent.tool !== 'codex') {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: `local resident Codex agent not found: ${agentId}` }));
+      return;
+    }
+    try {
+      const result = await lockPerAgent(agent.id, async () => action === 'start'
+        ? { ok: runtimeControls.start(agent.id), error: 'Codex runtime could not be started' }
+        : runtimeControls.stop(agent.id));
+      if (!result.ok) {
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: result.error || 'Codex runtime control was refused' }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, agent_id: agent.id, action, runtime_enabled: action === 'start' ? 1 : 0 }));
+    } catch (err: any) {
+      res.writeHead(409, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: String(err?.message || err) }));
+    }
     return;
   }
 
@@ -262,12 +328,9 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
     return;
   }
 
-  // POST /admin/notify-agent-created — the CLI `agent register` calls this
-  // after it writes a new agent row, so the codex-supervisor (in serve's
-  // process) can dynamically spawn a daemon for new tool=codex agents without
-  // requiring a serve restart. The in-process onAgentCreated hook only fires
-  // when register goes through the live serve via MCP; this endpoint bridges
-  // the CLI-direct-DB-write path.
+  // POST /admin/notify-agent-created — reconcile CLI-side row changes, or
+  // explicitly request attach demand. Codex registration passes
+  // ensure_runtime:false so metadata updates do not wake a cold runtime.
   if (url.pathname === '/admin/notify-agent-created' && req.method === 'POST') {
     try {
       const body = JSON.parse(await readBody(req));
@@ -277,17 +340,29 @@ export async function handleAdmin(req: IncomingMessage, res: ServerResponse, url
         res.end(JSON.stringify({ error: 'agent_id (string) required' }));
         return;
       }
+      if (body.ensure_runtime !== undefined && typeof body.ensure_runtime !== 'boolean') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'ensure_runtime must be boolean' }));
+        return;
+      }
       // Reconcile both supervisors, not just spawn the requested one. This
       // endpoint is also used for tool morphs (codex <-> opencode): kill the
       // now-ineligible old daemon before ensuring the new one exists.
-      const agent = db.getAgentById(agent_id);
-      if (agent?.tool !== 'codex') notifyAgentRemoved(agent_id);
+      const agent = runtimeControls.getAgent(agent_id);
+      if (agent?.tool !== 'codex') (runtimeControls.remove ?? notifyAgentRemoved)(agent_id);
       if (agent?.tool !== 'opencode') notifyOpenCodeAgentRemoved(agent_id);
-      const codex = agent?.tool === 'codex' ? notifyAgentCreated(agent_id) : false;
-      const opencode = agent?.tool === 'opencode' ? notifyOpenCodeAgentCreated(agent_id) : false;
+      const ensureRuntime = body.ensure_runtime !== false;
+      const hasReadyCodex = runtimeControls.hasReadyRuntime?.(agent_id) ?? Boolean(getDaemonForAgent({ agentId: agent_id })?.ready);
+      const codex = agent?.tool === 'codex' && (ensureRuntime || hasReadyCodex)
+        ? (runtimeControls.ensure ?? notifyAgentCreated)(agent_id) : false;
+      const opencode = agent?.tool === 'opencode' && (ensureRuntime || getOpenCodeDaemonForAgent(agent_id)?.ready)
+        ? notifyOpenCodeAgentCreated(agent_id) : false;
       const spawned = codex || opencode;
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, spawned, supervisor: codex ? 'codex' : opencode ? 'opencode' : null }));
+      res.end(JSON.stringify({
+        ok: true, spawned, supervisor: codex ? 'codex' : opencode ? 'opencode' : null,
+        agent_id, tool: agent?.tool, runtime_enabled: agent?.runtime_enabled,
+      }));
     } catch (err: any) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: String(err?.message || err) }));

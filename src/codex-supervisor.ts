@@ -1,14 +1,14 @@
 /**
  * Codex daemon supervisor.
  *
- * On hive serve boot, spawns one codex-channel daemon child per local agent
- * registered with `tool='codex'`. Daemons get push delivery via WebSocket to
- * a codex app-server they manage; the supervisor just keeps them alive.
+ * Codex runtimes are demand-driven: a pane/launcher or an automatic-mode
+ * event requests one. Boot restores only automatic agents with durable work.
+ * Registry membership alone does not allocate a channel or app-server.
  *
- * Design choices (settled with the user, 2026-05-20):
- *   - DB is the single source of truth: `WHERE tool='codex' AND origin_peer=''`
- *     decides what gets spawned. No separate config list, no opt-in flag —
- *     same UX as Claude plugin (install once, just works).
+ * Lifecycle:
+ *   - runtime_enabled is the persistent manual stop switch, separate from Pool.
+ *   - Unattached runtimes without tasks are reclaimed after 15 idle minutes,
+ *     only when the daemon confirms no active turn/goal. Unknown means retain.
  *   - Restart with exponential backoff (1s → 2s → 4s → ... → cap 60s).
  *   - On serve SIGTERM, supervisor kills all children with SIGTERM and waits.
  *   - Daemon stderr/stdout are tee'd into serve's own stderr with an
@@ -21,13 +21,12 @@
  *     ~/.codex/sessions/) instead of `thread/start`. Conversation survives
  *     daemon kill / serve restart / machine reboot.
  *
- * Out of scope (deferred):
- *   - Hot reload on DB changes (poll / watch). Add/remove agents → must
- *     restart serve to pick up. Acceptable for now since codex agents are
- *     long-lived once configured.
  */
 
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, execFile, type ChildProcess } from 'node:child_process';
+import { createRequire } from 'node:module';
+import { promisify } from 'node:util';
+import { canStopCodexRuntime, selectCodexBootAgents } from './codex-runtime-policy.js';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -37,7 +36,7 @@ import {
   CodexAppserverDiagnosticCoalescer,
   CodexDaemonLogForwarder,
 } from './codex-appserver-diagnostics.js';
-import { listLocalCodexAgents, getAgentById, onAgentCreated, onAgentRuntimeChanged, setAgentThreadId } from './db.js';
+import { listLocalCodexAgents, getAgentById, onAgentRuntimeChanged, setAgentThreadId, getDB } from './db.js';
 import type { Agent } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -83,6 +82,7 @@ interface DaemonInfo {
   // daemon as "never ready" even though supervisor was faithfully
   // respawning it, just slowly.
   intentionalShutdown?: boolean;
+  retiring?: boolean;
   // Handle for the "healthy for 30s → clear crash counter" timer scheduled
   // by markDaemonReady. Cleared on daemon exit so we don't leak a
   // reference to a dead DaemonInfo. See markDaemonReady() below.
@@ -101,6 +101,130 @@ export interface ProcessSnapshot {
 }
 
 const daemons = new Map<string, DaemonInfo>();
+let supervisorStarted = false;
+let idleTimer: NodeJS.Timeout | undefined;
+let sweepingIdle = false;
+const suspended = new Set<string>();
+const retiringAgents = new Set<string>();
+export function isCodexRuntimeRetiring(agentId: string): boolean {
+  return retiringAgents.has(agentId);
+}
+const idleSince = new Map<string, number>();
+const demandRevision = new Map<string, number>();
+const runtimeStops = new Map<string, Promise<{ ok: boolean; error?: string }>>();
+const IDLE_TIMEOUT_MS = 15 * 60_000;
+const execFileAsync = promisify(execFile);
+
+export function noteCodexRuntimeDemand(agentId: string): void {
+  demandRevision.set(agentId, (demandRevision.get(agentId) ?? 0) + 1);
+  idleSince.delete(agentId);
+}
+
+function hasActiveTask(agentId: string): boolean {
+  const tasks = getDB().prepare("SELECT assignee_agent_id, workflow_json FROM tasks WHERE status NOT IN ('completed','failed','canceled')").all() as Array<{ assignee_agent_id: string | null; workflow_json: string | null }>;
+  return tasks.some(task => {
+    if (task.assignee_agent_id === agentId) return true;
+    if (!task.workflow_json) return false;
+    try {
+      const workflow = JSON.parse(task.workflow_json);
+      const nodes = Array.isArray(workflow) ? workflow : workflow.nodes;
+      return Array.isArray(nodes) && nodes.some(node => node.assignees?.includes(agentId));
+    } catch { return true; } // malformed task data is not permission to stop
+  });
+}
+
+async function attachedConnectionCount(info: DaemonInfo): Promise<number | null> {
+  if (!info.appserverPid || !info.wsUrl) return null;
+  try {
+    const port = new URL(info.wsUrl).port;
+    const { stdout } = await execFileAsync('lsof', ['-nP', '-a', '-p', String(info.appserverPid), '-iTCP:' + port, '-sTCP:ESTABLISHED', '-Fn'], { timeout: 3000 });
+    return stdout.split('\n').filter(line => line.startsWith('n') && line.includes('->')).length;
+  } catch { return null; }
+}
+
+async function runtimeCanStop(info: DaemonInfo): Promise<boolean> {
+  return canStopCodexRuntime({
+    ready: Boolean(info.readyAt && info.controlUrl),
+    attachedConnections: await attachedConnectionCount(info),
+    activeTask: hasActiveTask(info.agentId),
+  });
+}
+
+export function startCodexRuntime(agentId: string): boolean {
+  const agent = getAgentById(agentId);
+  if (!supervisorStarted || shuttingDown || !agent || agent.tool !== 'codex' || agent.origin_peer || agent.parent_agent_id) return false;
+  getDB().prepare("UPDATE agents SET runtime_enabled = 1 WHERE id = ?").run(agentId);
+  notifyAgentCreated(agentId);
+  return daemons.has(agentId);
+}
+
+export function stopCodexRuntime(agentId: string): Promise<{ ok: boolean; error?: string }> {
+  return stopRuntimeSingleFlight(agentId, true);
+}
+
+function stopRuntimeSingleFlight(agentId: string, explicit: boolean): Promise<{ ok: boolean; error?: string }> {
+  const pending = runtimeStops.get(agentId);
+  if (pending) return Promise.resolve({ ok: false, error: 'Runtime stop already in progress' });
+  const run = stopRuntime(agentId, explicit).finally(() => runtimeStops.delete(agentId));
+  runtimeStops.set(agentId, run);
+  return run;
+}
+
+async function stopRuntime(agentId: string, explicit: boolean): Promise<{ ok: boolean; error?: string }> {
+  const agent = getAgentById(agentId);
+  if (!agent || agent.tool !== 'codex' || agent.origin_peer || agent.parent_agent_id) return { ok: false, error: 'Local resident Codex agent required' };
+  const info = daemons.get(agentId);
+  const revision = demandRevision.get(agentId);
+  if (info) {
+    if (!await runtimeCanStop(info)) return { ok: false, error: 'Runtime is attached, has an active task, is starting, or cannot safely be inspected' };
+    try {
+      const response = await fetch(info.controlUrl + '/prepare-idle-stop', { method: 'POST', signal: AbortSignal.timeout(7000) });
+      const result = await response.json() as { ok?: boolean; error?: string };
+      if (!response.ok || result.ok !== true) return { ok: false, error: result.error || 'Runtime is busy' };
+      const stillIdle = await runtimeCanStop(info);
+      if (!stillIdle || daemons.get(agentId) !== info || revision !== demandRevision.get(agentId)) {
+        return { ok: false, error: 'Runtime demand changed during stop; retry when idle' };
+      }
+    } catch { return { ok: false, error: 'Cannot confirm daemon idle state; nothing stopped' }; }
+  }
+  if (explicit) getDB().prepare("UPDATE agents SET runtime_enabled = 0, status = 'offline' WHERE id = ?").run(agentId);
+  suspended.add(agentId);
+  retiringAgents.add(agentId);
+  idleSince.delete(agentId);
+  if (!info) return { ok: true };
+  info.retiring = true;
+  info.readyAt = null;
+  info.wsUrl = null;
+  info.controlUrl = null;
+  signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
+  const deadline = Date.now() + 5000;
+  while (daemons.get(agentId) === info && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 50));
+  if (daemons.get(agentId) === info) return { ok: false, error: 'Stop requested but daemon has not exited; automatic restart is suppressed' };
+  return { ok: true };
+}
+
+async function reapIdleCodexRuntimes(): Promise<void> {
+  if (sweepingIdle || shuttingDown) return;
+  sweepingIdle = true;
+  try {
+    for (const info of daemons.values()) {
+      if (!await runtimeCanStop(info)) { idleSince.delete(info.agentId); continue; }
+      try {
+        const response = await fetch(info.controlUrl + '/idle-status', { signal: AbortSignal.timeout(7000) });
+        const status = await response.json() as { ok?: boolean };
+        if (!response.ok || status.ok !== true) { idleSince.delete(info.agentId); continue; }
+      } catch { idleSince.delete(info.agentId); continue; }
+      const since = idleSince.get(info.agentId);
+      if (!since) idleSince.set(info.agentId, Date.now());
+      else if (Date.now() - since >= IDLE_TIMEOUT_MS) {
+        const result = await stopRuntimeSingleFlight(info.agentId, false);
+        if (!result.ok) idleSince.delete(info.agentId);
+        else log('info', `[codex-supervisor] reclaimed idle runtime ${info.agentId}; history preserved`);
+      }
+    }
+  } catch (err) { log('warn', `[codex-supervisor] idle check failed: ${err}`); }
+  finally { sweepingIdle = false; }
+}
 // Non-empty targets explicitly selected through /admin/codex-set-thread.
 // Unlike the durable agents.thread_id (which may self-heal on an ordinary
 // restart), these in-memory intents must fail closed across every respawn
@@ -479,12 +603,9 @@ function requestIntentionalDaemonExit(info: DaemonInfo): void {
   signalDaemonProcessTree(info.pid, 'SIGTERM', () => info.child.kill('SIGTERM'));
 }
 
-function findNpx(): string {
-  const probe = process.platform === 'win32' ? 'where npx' : 'command -v npx';
-  try {
-    const out = execSync(probe, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
-    return out || 'npx';
-  } catch { return 'npx'; }
+export function codexChannelLaunch(scriptPath: string): { command: string; args: string[] } {
+  const require = createRequire(import.meta.url);
+  return { command: process.execPath, args: ['--import', require.resolve('tsx/esm'), scriptPath] };
 }
 
 function locateCodexChannelScript(): string {
@@ -503,7 +624,7 @@ function spawnDaemon(
   restartCount = 0,
   releaseStartupSlot?: () => void,
 ): void {
-  if (shuttingDown) {
+  if (shuttingDown || suspended.has(agentId)) {
     releaseStartupSlot?.();
     return;
   }
@@ -559,7 +680,8 @@ function spawnDaemon(
     supervisorPid: process.pid,
   });
 
-  const child = spawn(findNpx(), ['-y', 'tsx', scriptPath], {
+  const launch = codexChannelLaunch(scriptPath);
+  const child = spawn(launch.command, launch.args, {
     env: cleanEnv,
     stdio: ['ignore', 'pipe', 'pipe'],
     detached: shouldDetachDaemonProcess(),
@@ -614,7 +736,7 @@ function spawnDaemon(
     releaseDaemonStartupSlot(info);
     daemons.delete(agentId);
     log('info', `[codex-supervisor] daemon "${displayName}" exited (code=${code}, signal=${signal}, intentional=${wasIntentional})`);
-    if (shuttingDown) return;
+    if (shuttingDown || suspended.has(agentId)) return;
 
     // Refresh agent record — it may have been removed or modified
     const fresh = getAgentById(agentId);
@@ -654,7 +776,9 @@ export function startCodexSupervisor(port: number = 4123): void {
       `[codex-supervisor] reaped ${orphanedAppservers.length} orphaned Hive app-server(s) before restore: ${orphanedAppservers.join(', ')}`,
     );
   }
-  const agents = listLocalCodexAgents();
+  supervisorStarted = true;
+  const agents = selectCodexBootAgents(listLocalCodexAgents(), id =>
+    hasActiveTask(id) || Boolean(getDB().prepare('SELECT 1 FROM pending_pushes WHERE agent_id = ? LIMIT 1').get(id)));
   if (agents.length === 0) {
     log('info', '[codex-supervisor] no local tool=codex agents — nothing to spawn at boot');
   } else {
@@ -672,17 +796,14 @@ export function startCodexSupervisor(port: number = 4123): void {
   // while serve is running. Listen for agent-create events and spawn a daemon
   // on the fly so the launcher doesn't have to restart serve. Subscribe AFTER
   // initial boot scan so we don't double-spawn the already-spawned set above.
-  onAgentCreated((agent: Agent) => {
-    if (agent.tool !== 'codex' || agent.origin_peer !== '' || agent.runtime_enabled !== 1) return;
-    if (daemons.has(agent.id)) return; // already spawning
-    log('info', `[codex-supervisor] new local tool=codex agent registered: "${agent.display_name}" (${agent.id.slice(-12)}) → spawning daemon`);
-    spawnDaemon(agent.id, agent.display_name, 0);
-  });
+  // Registration alone does not spawn; attachment and events provide demand.
   onAgentRuntimeChanged((agent: Agent) => {
     if (agent.tool !== 'codex' || agent.origin_peer !== '') return;
     if (agent.runtime_enabled === 1) notifyAgentCreated(agent.id);
     else notifyAgentRemoved(agent.id);
   });
+  idleTimer = setInterval(() => { void reapIdleCodexRuntimes(); }, 60_000);
+  idleTimer.unref();
 }
 
 function releaseDaemonStartupSlot(info: DaemonInfo): void {
@@ -697,6 +818,8 @@ function releaseDaemonStartupSlot(info: DaemonInfo): void {
 
 export async function stopCodexSupervisor(): Promise<void> {
   shuttingDown = true;
+  supervisorStarted = false;
+  if (idleTimer) clearInterval(idleTimer);
   codexAppserverDiagnostics.flush();
   if (daemons.size === 0) return;
   log('info', `[codex-supervisor] stopping ${daemons.size} daemon(s)...`);
@@ -865,7 +988,7 @@ export function markDaemonReady(
   appserverPid?: number | null,
 ): boolean {
   const info = daemons.get(agentId);
-  if (!info || info.intentionalShutdown) return false;
+  if (!info || info.intentionalShutdown || info.retiring) return false;
   const strictThreadId = strictThreadIntents.get(agentId);
   if (!strictThreadReadyMatches(strictThreadId, threadId)) {
     log(
@@ -879,6 +1002,7 @@ export function markDaemonReady(
   info.wsUrl = wsUrl;
   info.threadId = threadId;
   info.readyAt = new Date();
+  retiringAgents.delete(agentId);
   if (controlUrl !== undefined) info.controlUrl = controlUrl;
   if (appserverPid !== undefined) info.appserverPid = appserverPid;
   // The bounded boot queue protects only process/app-server startup. Session
@@ -928,11 +1052,16 @@ export function markDaemonReady(
  *  daemon: codex-channel caches its thread/start cwd at process startup.
  *  Returns true if a spawn/restart was initiated. */
 export function notifyAgentCreated(agentId: string): boolean {
+  if (!supervisorStarted || shuttingDown) return false;
+  noteCodexRuntimeDemand(agentId);
+  suspended.delete(agentId);
+  idleSince.delete(agentId);
   const agent = getAgentById(agentId);
   if (!agent) return false;
   if (agent.tool !== 'codex' || agent.origin_peer !== '' || agent.runtime_enabled !== 1) return false;
   const existing = daemons.get(agentId);
   if (existing) {
+    if (existing.retiring) return false; // demand is remembered; exit will respawn
     if (!daemonProjectDirHasDrifted(existing.projectDir, agent.project_dir)) return false;
     log(
       'info',
@@ -1080,6 +1209,9 @@ export async function requestDaemonRespawn(
   timeoutMs = 30_000,
   options?: { strictThreadId?: string | null },
 ): Promise<DaemonSnapshot | null> {
+  suspended.delete(agentId);
+  idleSince.delete(agentId);
+  demandRevision.set(agentId, (demandRevision.get(agentId) ?? 0) + 1);
   if (options && 'strictThreadId' in options) {
     const strictThreadId = options.strictThreadId?.trim() || '';
     if (strictThreadId) strictThreadIntents.set(agentId, strictThreadId);
