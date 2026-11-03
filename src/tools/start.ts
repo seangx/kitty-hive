@@ -89,7 +89,13 @@ export function handleStart(input: StartInput): StartOutput {
   }
   // 3. name (fuzzy, reuse latest match — local only)
   if (!agent && input.name) {
-    const matches = getAgentsByName(input.name).filter(a => a.origin_peer === '' && !a.parent_agent_id);
+    // A caller presenting a key is a distinct orchestrated session. Never adopt
+    // a same-named agent that already belongs to a different key: doing so would
+    // overwrite that key and make two live sessions share one identity.
+    const matches = getAgentsByName(input.name).filter(a =>
+      a.origin_peer === ''
+      && !a.parent_agent_id
+      && (!input.key || !a.external_key || a.external_key === input.key));
     if (matches.length > 0) {
       agent = matches.sort((a, b) => b.last_seen.localeCompare(a.last_seen))[0];
       matchedVia = 'name';
