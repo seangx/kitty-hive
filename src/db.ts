@@ -517,6 +517,12 @@ export function setAgentPoolEnabled(agentId: string, enabled: boolean): void {
   getDB().prepare('UPDATE agents SET pool_enabled = ? WHERE id = ?').run(enabled ? 1 : 0, agentId);
 }
 
+/** Re-enable a stopped runtime. An explicit stop marks the agent offline, and
+ * role routing only considers active agents, so both fields must be restored. */
+export function markAgentRuntimeStarted(agentId: string): void {
+  getDB().prepare("UPDATE agents SET runtime_enabled = 1, status = 'active' WHERE id = ?").run(agentId);
+}
+
 /** Enable/disable a supervised runtime and notify live supervisors. Used by
  * ephemeral workflow contexts; resident Pool toggles must not call this. */
 export function setAgentRuntimeEnabled(agentId: string, enabled: boolean): void {

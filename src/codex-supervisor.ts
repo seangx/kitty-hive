@@ -36,7 +36,7 @@ import {
   CodexAppserverDiagnosticCoalescer,
   CodexDaemonLogForwarder,
 } from './codex-appserver-diagnostics.js';
-import { listLocalCodexAgents, getAgentById, onAgentRuntimeChanged, setAgentThreadId, getDB } from './db.js';
+import { listLocalCodexAgents, getAgentById, markAgentRuntimeStarted, onAgentRuntimeChanged, setAgentThreadId, getDB } from './db.js';
 import type { Agent } from './models.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -153,7 +153,7 @@ async function runtimeCanStop(info: DaemonInfo): Promise<boolean> {
 export function startCodexRuntime(agentId: string): boolean {
   const agent = getAgentById(agentId);
   if (!supervisorStarted || shuttingDown || !agent || agent.tool !== 'codex' || agent.origin_peer || agent.parent_agent_id) return false;
-  getDB().prepare("UPDATE agents SET runtime_enabled = 1 WHERE id = ?").run(agentId);
+  markAgentRuntimeStarted(agentId);
   notifyAgentCreated(agentId);
   return daemons.has(agentId);
 }
