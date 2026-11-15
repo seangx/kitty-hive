@@ -3,6 +3,8 @@
 import { existsSync, unlinkSync } from 'node:fs';
 import {
   activeSSE,
+  beginPushHold,
+  endPushHold,
   agentSessions,
   declaresEventConsumer,
   drainPushesForAgent,
@@ -200,6 +202,36 @@ enqueuePendingPush(recipient.id, JSON.stringify({
 await drainPushesForAgent(recipient.id);
 ok(sends === 1, 'already-read pending DM is deleted without SSE replay');
 ok(listPendingPushes(recipient.id).length === 0, 'suppressed stale row is settled');
+
+console.log('\n=== Fresh-context hold: assignment DM goes first, held pushes drain after ===');
+const freshRecipient = createAgent('fresh-hold-recipient');
+const freshSid = 'fresh-hold-session';
+const freshOrder = [];
+sessions[freshSid] = {
+  server: {
+    async sendLoggingMessage(message) { freshOrder.push(JSON.parse(message.data).message_id); },
+    server: { sendResourceUpdated() {} },
+  },
+};
+agentSessions.set(freshRecipient.id, new Set([freshSid]));
+sessionAgents.set(freshSid, freshRecipient.id);
+activeSSE.add(freshSid);
+markEventConsumer(freshSid);
+beginPushHold(freshRecipient.id);
+const otherDm = appendDM(sender.id, freshRecipient.id, 'arrives during the clear');
+await notifyAgents([freshRecipient.id], undefined, JSON.stringify({ type: 'dm', event_id: `dm:${otherDm.id}`, message_id: otherDm.id }));
+await drainPushesForAgent(freshRecipient.id);
+ok(freshOrder.length === 0, 'held push is neither sent live nor drained during the hold');
+ok(listPendingPushes(freshRecipient.id).length === 1, 'held push is persisted');
+const assignmentDm = appendDM(sender.id, freshRecipient.id, 'new assignment');
+await notifyAgents([freshRecipient.id], undefined, JSON.stringify({ type: 'dm', event_id: `dm:${assignmentDm.id}`, message_id: assignmentDm.id }), { bypassHold: true });
+endPushHold(freshRecipient.id);
+for (let i = 0; i < 50 && freshOrder.length < 2; i++) await new Promise(r => setTimeout(r, 10));
+ok(
+  JSON.stringify(freshOrder) === JSON.stringify([assignmentDm.id, otherDm.id]),
+  `assignment DM is delivered before the held push (got ${JSON.stringify(freshOrder)})`,
+);
+ok(listPendingPushes(freshRecipient.id).length === 0, 'held push is settled after the hold ends');
 
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail === 0 ? 0 : 1);

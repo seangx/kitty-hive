@@ -116,8 +116,9 @@ test('lost control responses reconcile a switch already committed by ready annou
 
 test('admin writes a requested target only after live control is unavailable', () => {
   const source = readFileSync(new URL('../src/admin-http.ts', import.meta.url), 'utf8');
-  const switchIndex = source.indexOf('await switchDaemonThread(agent_id, targetThreadId)');
+  const switchIndex = source.indexOf('await switchDaemonThread(agent_id, targetThreadId, undefined, { requireIdle })');
   const unavailableIndex = source.indexOf("if (switched.kind !== 'unavailable')", switchIndex);
+  const idleGuardIndex = source.indexOf('if (requireIdle && getDaemonForAgent({ agentId: agent_id }))', unavailableIndex);
   const commitIndex = source.indexOf('db.setAgentThreadId(agent_id, targetThreadId)', unavailableIndex);
   const respawnIndex = source.indexOf('await requestDaemonRespawn(agent_id, 30_000, {', commitIndex);
   const strictIntentIndex = source.indexOf('strictThreadId: targetThreadId || null', respawnIndex);
@@ -125,6 +126,7 @@ test('admin writes a requested target only after live control is unavailable', (
   assert.ok(switchIndex >= 0);
   assert.ok(unavailableIndex > switchIndex);
   assert.ok(commitIndex > unavailableIndex, 'live-control requests must not pre-write the DB target');
+  assert.ok(idleGuardIndex > unavailableIndex && idleGuardIndex < commitIndex, 'require_idle must refuse a running daemon before any DB write or respawn');
   assert.ok(respawnIndex > commitIndex, 'unavailable fallback must commit before daemon env injection');
   assert.ok(strictIntentIndex > respawnIndex, 'explicit targets must stay strict across the respawn fallback');
 });
@@ -426,4 +428,17 @@ test('shutdown sweep signals only TUI clients attached to tracked Hive websocket
     [700, 'SIGTERM'],
     [701, 'SIGTERM'],
   ]);
+});
+
+test('daemon require_idle check runs inside the lifecycle gate before any thread change', () => {
+  const source = readFileSync(new URL('../codex-channel.ts', import.meta.url), 'utf8');
+  const fnIndex = source.indexOf('async function performThreadSwitch(target: string, opts: { requireIdle?: boolean } = {})');
+  const gateIndex = source.indexOf('lifecycleGate.tryStartSwitch()', fnIndex);
+  const idleIndex = source.indexOf('await confirmThreadIdle(', gateIndex);
+  const startIndex = source.indexOf("rpcCall('thread/start'", gateIndex);
+  const resumeIndex = source.indexOf('await resumePersistedThread(target)', gateIndex);
+  assert.ok(fnIndex >= 0);
+  assert.ok(idleIndex > gateIndex, 'idle confirmation must hold the switch gate');
+  assert.ok(idleIndex < startIndex && idleIndex < resumeIndex, 'idle confirmation must precede thread/start and thread/resume');
+  assert.match(source, /performThreadSwitch\(target, \{ requireIdle \}\)/);
 });

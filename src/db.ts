@@ -778,6 +778,18 @@ export function listTeams(activeOnly: boolean = true): Team[] {
   return getDB().prepare(sql).all() as Team[];
 }
 
+/** True when hostAgentId hosts an open team that memberAgentId belongs to.
+ *  Fresh-context authorization relies on Hive's own team records only. */
+export function hostsOpenTeamOfMember(hostAgentId: string, memberAgentId: string): boolean {
+  const row = getDB().prepare(`
+    SELECT 1 FROM teams t
+    JOIN team_members m ON m.team_id = t.id
+    WHERE t.host_agent_id = ? AND m.agent_id = ? AND t.closed_at IS NULL
+    LIMIT 1
+  `).get(hostAgentId, memberAgentId);
+  return !!row;
+}
+
 export function listTeamsHostedBy(agentId: string): Team[] {
   return getDB().prepare('SELECT * FROM teams WHERE host_agent_id = ? ORDER BY created_at DESC').all(agentId) as Team[];
 }

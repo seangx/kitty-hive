@@ -1,6 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { copyFileSync, mkdirSync } from 'node:fs';
+import { copyFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { handleDMAsync } from '../tools/dm.js';
 import { asParam, authError, resolveAgent } from '../auth.js';
@@ -9,6 +9,7 @@ import { getUnreadForAgent, setReadCursor } from '../db.js';
 import { getFilePath, getFileMeta } from '../files.js';
 import { buildDMPreview, CHANNEL_PREVIEW_LEN, buildPushMessage } from '../preview.js';
 import * as db from '../db.js';
+import { deliverWithFreshContext } from '../fresh-context.js';
 
 export function registerDMTools(mcp: McpServer) {
   mcp.tool(
@@ -23,10 +24,12 @@ export function registerDMTools(mcp: McpServer) {
       to: z.string().describe('Target: agent id, team-nickname, display_name, or "id@node"'),
       content: z.string().describe('Message text. Inline an absolute path here when sender+receiver share a filesystem and the receiver can read it (same-machine same-project is the common case); otherwise use `attach`.'),
       attach: z.array(z.string()).optional().describe('Absolute paths on YOUR machine; bytes are copied into hive and referenced by file_id on the receiver side. Use for cross-machine sends, binary blobs, or anything the receiver cannot read at its own path.'),
+      fresh_context: z.boolean().optional().describe('Team hosts only: clear the target worker\'s conversation first, then deliver this DM as the first message of the new conversation. Only for a NEW assignment, never for rework. Requires a Kitty-managed local claude/codex target that is idle with an empty input box; otherwise nothing is cleared or sent and fresh_context.reason explains why (forbidden / busy / draft / not_running / unsupported_tool / not_managed / timeout / ...). Check delivered in the result.'),
     },
     async (params, extra) => {
       const agent = resolveAgent(extra, params.as);
       if (!agent) return authError();
+      if (params.fresh_context) return freshContextDM(agent, params);
       const result = await handleDMAsync(agent.id, params);
       if (!result.federated) {
         await notifyAgents([result.to_agent_id], agent.id, buildPushMessage({
@@ -150,4 +153,43 @@ export function registerDMTools(mcp: McpServer) {
       return { content: [{ type: 'text', text: JSON.stringify(unread.length > 0 ? unread : []) }] };
     },
   );
+}
+
+type DMParams = { to: string; content: string; attach?: string[] };
+
+function pushMessageForDM(sender: { id: string; display_name: string }, result: { message_id: number; attachments?: unknown[] }): string {
+  return buildPushMessage({
+    type: 'dm',
+    from: sender.display_name,
+    from_agent_id: sender.id,
+    event_id: 'dm:' + result.message_id,
+    message_id: result.message_id,
+    attachments_count: (result.attachments || []).length,
+  });
+}
+
+/** hive_dm(fresh_context: true): clear the target's conversation through
+ *  Kitty, then store and push the DM. Nothing is stored when the clear fails. */
+async function freshContextDM(sender: NonNullable<ReturnType<typeof resolveAgent>>, params: DMParams) {
+  const reply = (payload: unknown) => ({ content: [{ type: 'text' as const, text: JSON.stringify(payload) }] });
+  if (params.to.lastIndexOf('@') > 0) {
+    return reply({ delivered: false, fresh_context: { ok: false, cleared: false, reason: 'unsupported_target', detail: 'federated targets cannot be cleared' } });
+  }
+  const resolved = db.resolveAddressee(sender.id, params.to);
+  if ('error' in resolved) throw new Error(resolved.error);
+  const target = resolved.agent!;
+  if (target.id === sender.id) throw new Error('Cannot DM yourself');
+  // Validate attachments before clearing: failing after the clear would leave
+  // the worker with an empty conversation and no assignment.
+  for (const path of params.attach || []) {
+    if (!existsSync(path) || !statSync(path).isFile()) throw new Error('Attachment not found: ' + path);
+  }
+
+  const { fresh, delivered } = await deliverWithFreshContext(sender, target, async () => {
+    const result = await handleDMAsync(sender.id, { to: target.id, content: params.content, attach: params.attach });
+    await notifyAgents([result.to_agent_id], sender.id, pushMessageForDM(sender, result), { bypassHold: true });
+    return result;
+  });
+  if (!delivered) return reply({ delivered: false, to_agent_id: target.id, fresh_context: fresh });
+  return reply({ ...delivered, delivered: true, fresh_context: fresh });
 }

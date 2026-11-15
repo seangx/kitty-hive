@@ -95,7 +95,42 @@ export function unbindSession(sessionId: string) {
   eventConsumers.delete(sessionId);
 }
 
-export async function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string) {
+// ===== Push holds (GX-89 fresh context) =====
+// While Hive clears an agent's conversation, other pushes must not become the
+// new conversation's first input. Held pushes go to the persistent queue and
+// drain only after the hold ends; the fresh-context DM itself bypasses it.
+const pushHolds = new Map<string, number>();
+
+export function beginPushHold(agentId: string): void {
+  pushHolds.set(agentId, (pushHolds.get(agentId) ?? 0) + 1);
+}
+
+export function endPushHold(agentId: string): void {
+  const remaining = (pushHolds.get(agentId) ?? 0) - 1;
+  if (remaining > 0) {
+    pushHolds.set(agentId, remaining);
+    return;
+  }
+  pushHolds.delete(agentId);
+  // A drain that started before the hold may have stopped early; run a new
+  // pass after it settles instead of sharing its (truncated) promise.
+  const inFlight = activeDrains.get(agentId) ?? Promise.resolve();
+  inFlight
+    .catch(() => undefined)
+    .then(() => drainPushesForAgent(agentId))
+    .catch(err => log('warn', `[drain] failed for ${agentId}: ${err}`));
+}
+
+export function isPushHeld(agentId: string): boolean {
+  return (pushHolds.get(agentId) ?? 0) > 0;
+}
+
+export interface NotifyOptions {
+  /** Deliver even while the target's pushes are held (fresh-context DM). */
+  bypassHold?: boolean;
+}
+
+export async function notifyAgents(agentIds: string[], excludeAgentId?: string, message?: string, opts: NotifyOptions = {}) {
   const payload = message ?? 'New event';
   const visibleNotifications: Promise<void>[] = [];
   for (const agentId of agentIds) {
@@ -118,6 +153,11 @@ export async function notifyAgents(agentIds: string[], excludeAgentId?: string, 
           log('debug', `[notify] agent=${agentId} kitty wakeup ${result.kind}: ${result.reason}`);
         }
       }));
+    }
+    if (isPushHeld(agentId) && !opts.bypassHold) {
+      db.enqueuePendingPush(agentId, payload);
+      log('info', `[notify] agent=${agentId} → push held (fresh context in progress), enqueued`);
+      continue;
     }
     const live = livePushSessionsForAgent(agentId);
     if (live.length === 0) {
@@ -171,6 +211,8 @@ async function drainPendingPushesOnce(agentId: string): Promise<void> {
   let deliveredCount = 0;
   let skippedCount = 0;
   for (const row of rows) {
+    // A fresh-context hold may begin while an older drain is iterating.
+    if (isPushHeld(agentId)) break;
     const identity = parsePushPayload(row.payload);
     if (identity) {
       try {
@@ -219,6 +261,8 @@ async function drainPendingPushesOnce(agentId: string): Promise<void> {
  * callers from reading and replaying the same pending rows before deletion.
  */
 export function drainPushesForAgent(agentId: string): Promise<void> {
+  // endPushHold drains once the hold is released.
+  if (isPushHeld(agentId)) return Promise.resolve();
   const existing = activeDrains.get(agentId);
   if (existing) return existing;
   const run = drainPendingPushesOnce(agentId).finally(() => {
