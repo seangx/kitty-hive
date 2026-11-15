@@ -1117,6 +1117,7 @@ export async function switchDaemonThread(
   agentId: string,
   threadId: string,
   timeoutMs = 150_000,
+  opts: { requireIdle?: boolean } = {},
 ): Promise<DaemonThreadSwitchResult> {
   const info = daemons.get(agentId);
   if (!info || !info.readyAt || !info.controlUrl) {
@@ -1137,7 +1138,7 @@ export async function switchDaemonThread(
     const res = await fetch(`${info.controlUrl}/switch-thread`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ thread_id: threadId }),
+      body: JSON.stringify(opts.requireIdle ? { thread_id: threadId, require_idle: true } : { thread_id: threadId }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     const body = await res.json().catch(() => null) as DaemonControlSwitchBody | null;

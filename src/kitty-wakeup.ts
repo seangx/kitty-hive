@@ -104,36 +104,39 @@ export function notifyKittyCodexTurnCompleted(
   );
 }
 
-function postKittyWakeup(
-  externalKey: string,
-  payload: Record<string, string>,
+function kittySocketPath(opts: KittyWakeupOptions): string {
+  return opts.socketPath || process.env.KITTY_WAKEUP_SOCKET || join(homedir(), '.kitty-kitty', 'wakeup.sock');
+}
+
+type KittySocketResponse =
+  | { kind: 'response'; status: number; body: Record<string, unknown> }
+  | { kind: 'error'; reason: string; timedOut: boolean };
+
+/** One bounded JSON request over Kitty's local wakeup socket. */
+function kittySocketRequest(
+  method: 'GET' | 'POST',
+  path: string,
+  sessionKey: string,
+  payload: Record<string, unknown> | null,
   opts: KittyWakeupOptions,
-): Promise<KittyWakeupResult> {
-  const sessionKey = externalKey.trim();
-  if (!sessionKey) return Promise.resolve({ kind: 'unavailable', reason: 'missing external key' });
-
-  const socketPath = opts.socketPath || process.env.KITTY_WAKEUP_SOCKET || join(homedir(), '.kitty-kitty', 'wakeup.sock');
-  const timeoutMs = opts.timeoutMs ?? 750;
-  const body = JSON.stringify(payload);
-
+  defaultTimeoutMs: number,
+): Promise<KittySocketResponse> {
+  const timeoutMs = opts.timeoutMs ?? defaultTimeoutMs;
+  const body = payload ? JSON.stringify(payload) : '';
   return new Promise((resolve) => {
     let settled = false;
-    const finish = (result: KittyWakeupResult) => {
+    let timedOut = false;
+    const finish = (result: KittySocketResponse) => {
       if (settled) return;
       settled = true;
       resolve(result);
     };
-
-    const req = request({
-      socketPath,
-      path: '/wakeup',
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'content-length': Buffer.byteLength(body),
-        'x-kitty-session': sessionKey,
-      },
-    }, (res) => {
+    const headers: Record<string, string | number> = { 'x-kitty-session': sessionKey };
+    if (payload) {
+      headers['content-type'] = 'application/json';
+      headers['content-length'] = Buffer.byteLength(body);
+    }
+    const req = request({ socketPath: kittySocketPath(opts), path, method, headers }, (res) => {
       const chunks: Buffer[] = [];
       let size = 0;
       res.on('data', (chunk: Buffer) => {
@@ -143,21 +146,124 @@ function postKittyWakeup(
       });
       res.on('end', () => {
         const raw = Buffer.concat(chunks).toString('utf8');
-        let response: { ok?: boolean; sessionId?: string; reason?: string } = {};
-        try { response = raw ? JSON.parse(raw) : {}; } catch { /* non-JSON response */ }
-        if (res.statusCode === 200 && response.ok === true) {
-          finish({ kind: 'sent', sessionId: response.sessionId || sessionKey });
-          return;
-        }
+        let parsed: unknown = {};
+        try { parsed = raw ? JSON.parse(raw) : {}; } catch { /* non-JSON response */ }
         finish({
-          kind: 'rejected',
-          reason: response.reason || `HTTP ${res.statusCode ?? 'unknown'}`,
+          kind: 'response',
+          status: res.statusCode ?? 0,
+          body: parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed as Record<string, unknown> : {},
         });
       });
+      res.on('error', (err) => finish({ kind: 'error', reason: err.message, timedOut }));
     });
-
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`timeout after ${timeoutMs}ms`)));
-    req.on('error', (err) => finish({ kind: 'unavailable', reason: err.message }));
-    req.end(body);
+    req.setTimeout(timeoutMs, () => {
+      timedOut = true;
+      req.destroy(new Error(`timeout after ${timeoutMs}ms`));
+    });
+    req.on('error', (err) => finish({ kind: 'error', reason: err.message, timedOut }));
+    req.end(body || undefined);
   });
+}
+
+async function postKittyWakeup(
+  externalKey: string,
+  payload: Record<string, string>,
+  opts: KittyWakeupOptions,
+): Promise<KittyWakeupResult> {
+  const sessionKey = externalKey.trim();
+  if (!sessionKey) return { kind: 'unavailable', reason: 'missing external key' };
+  const res = await kittySocketRequest('POST', '/wakeup', sessionKey, payload, opts, 750);
+  if (res.kind === 'error') return { kind: 'unavailable', reason: res.reason };
+  if (res.status === 200 && res.body.ok === true) {
+    return { kind: 'sent', sessionId: typeof res.body.sessionId === 'string' && res.body.sessionId ? res.body.sessionId : sessionKey };
+  }
+  return {
+    kind: 'rejected',
+    reason: typeof res.body.reason === 'string' && res.body.reason ? res.body.reason : `HTTP ${res.status || 'unknown'}`,
+  };
+}
+
+// ===== Fresh context (GX-89) =====
+// Hive asks Kitty to clear a managed session's conversation before a host
+// delivers new work. Kitty owns the idle/draft checks and the actual clear;
+// a repeated POST with the same request_id returns the recorded outcome.
+
+export interface KittyFreshContextRequest {
+  agentId: string;
+  tool: string;
+  requestId: string;
+}
+
+export type KittyFreshContextResult =
+  | { kind: 'cleared'; newExternalId?: string }
+  | { kind: 'rejected'; reason: string }
+  | { kind: 'unavailable'; reason: string }
+  | { kind: 'timeout'; reason: string };
+
+export type KittyFreshContextLookup =
+  | { kind: 'found'; cleared: boolean; reason?: string; newExternalId?: string }
+  | { kind: 'not_found' }
+  | { kind: 'unavailable'; reason: string };
+
+function optionalString(value: unknown): string | undefined {
+  return typeof value === 'string' && value ? value : undefined;
+}
+
+export async function requestKittyFreshContext(
+  externalKey: string,
+  input: KittyFreshContextRequest,
+  opts: KittyWakeupOptions = {},
+): Promise<KittyFreshContextResult> {
+  const sessionKey = externalKey.trim();
+  if (!sessionKey) return { kind: 'unavailable', reason: 'missing external key' };
+  const res = await kittySocketRequest('POST', '/fresh-context', sessionKey, {
+    agent_id: input.agentId,
+    tool: input.tool,
+    request_id: input.requestId,
+  }, opts, 20_000);
+  if (res.kind === 'error') {
+    return res.timedOut ? { kind: 'timeout', reason: res.reason } : { kind: 'unavailable', reason: res.reason };
+  }
+  if (res.status >= 200 && res.status < 300 && res.body.ok === true) {
+    const newExternalId = optionalString(res.body.new_external_id);
+    return newExternalId ? { kind: 'cleared', newExternalId } : { kind: 'cleared' };
+  }
+  // A Kitty without this endpoint answers 404 without a reason.
+  if (res.status === 404 && !optionalString(res.body.reason)) {
+    return { kind: 'unavailable', reason: 'kitty does not support fresh-context' };
+  }
+  return { kind: 'rejected', reason: optionalString(res.body.reason) || `HTTP ${res.status || 'unknown'}` };
+}
+
+export async function lookupKittyFreshContextResult(
+  externalKey: string,
+  requestId: string,
+  opts: KittyWakeupOptions = {},
+): Promise<KittyFreshContextLookup> {
+  const sessionKey = externalKey.trim();
+  if (!sessionKey) return { kind: 'unavailable', reason: 'missing external key' };
+  const res = await kittySocketRequest(
+    'GET',
+    `/fresh-context/result?request_id=${encodeURIComponent(requestId)}`,
+    sessionKey,
+    null,
+    opts,
+    2_000,
+  );
+  if (res.kind === 'error') return { kind: 'unavailable', reason: res.reason };
+  if (res.status < 200 || res.status >= 300) {
+    return res.status === 404 && res.body.found !== true
+      ? { kind: 'not_found' }
+      : { kind: 'unavailable', reason: `HTTP ${res.status || 'unknown'}` };
+  }
+  if (res.body.found !== true) return { kind: 'not_found' };
+  if (typeof res.body.cleared !== 'boolean') return { kind: 'unavailable', reason: 'invalid lookup response' };
+  const reason = optionalString(res.body.reason);
+  const newExternalId = optionalString(res.body.new_external_id);
+  return {
+    kind: 'found',
+    cleared: res.body.cleared,
+    ...(reason ? { reason } : {}),
+    ...(newExternalId ? { newExternalId } : {}),
+  };
 }

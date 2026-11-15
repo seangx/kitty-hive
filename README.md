@@ -132,7 +132,7 @@ Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case
 
 | Channel | HTTP | Description |
 |---------|------|-------------|
-| `hive-dm` | `hive_dm` | Send a direct message. Pass `attach: ["/abs/path"]` to send files/images (path on YOUR machine; receiver gets a `file_id` and fetches separately). |
+| `hive-dm` | `hive_dm` | Send a direct message. Pass `attach: ["/abs/path"]` to send files/images (path on YOUR machine; receiver gets a `file_id` and fetches separately). Team hosts may pass `fresh_context: true` to have Kitty clear a managed claude/codex worker's conversation first; the DM is sent only after the clear is confirmed (see `fresh_context.reason` / `delivered` in the result). |
 | `hive-inbox` | `hive_inbox` | Check unread DMs / team / task events. Each DM entry carries `message_id` + `attachments` inline. |
 | `hive-dm-read` | `hive_dm_read` | Fetch a single DM in full by `message_id` (use when a preview ends with `…(truncated; hive-dm-read message_id=N)`). |
 | `hive-file-fetch` | `hive_file_fetch` | Fetch an attachment by `file_id`; optional `save_to` copies to a local path. |

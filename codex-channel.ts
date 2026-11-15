@@ -956,7 +956,7 @@ async function performThreadGoalPause(): Promise<ThreadGoalPauseResult> {
   }
 }
 
-async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> {
+async function performThreadSwitch(target: string, opts: { requireIdle?: boolean } = {}): Promise<ThreadSwitchResult> {
   if (pushMode !== 'appserver' || !appserverWs || appserverWs.readyState !== 1) {
     return { ok: false, error: 'daemon not in appserver mode (or WS not open)' };
   }
@@ -973,6 +973,22 @@ async function performThreadSwitch(target: string): Promise<ThreadSwitchResult> 
   const previousRolloutPath = threadRolloutPath;
   const previousModelTransport = modelTransport;
   try {
+    // Fresh-context callers (GX-89) must never orphan a running turn. The
+    // lifecycle gate only covers Hive event turns, so also ask the app-server
+    // whether a TUI-initiated turn or an active goal owns the thread. Checked
+    // while holding the gate so no Hive event can start in between.
+    if (opts.requireIdle) {
+      if (eventQueue.length > 0) {
+        return { ok: false, busy: true, error: 'daemon has queued Hive events' };
+      }
+      if (threadId) {
+        try {
+          await confirmThreadIdle({ call: (method, params, timeoutMs) => rpcCall(method, params, timeoutMs) }, threadId);
+        } catch (err: any) {
+          return { ok: false, busy: true, error: `thread not idle: ${String(err?.message || err)}` };
+        }
+      }
+    }
     if (target) {
       if (target !== threadId) {
         await resumePersistedThread(target);
@@ -1103,8 +1119,11 @@ async function startControlServer(): Promise<void> {
       req.on('data', (c) => chunks.push(c));
       req.on('end', () => {
         let target = '';
+        let requireIdle = false;
         try {
           const body = JSON.parse(Buffer.concat(chunks).toString() || '{}');
+          if ('require_idle' in body && typeof body.require_idle !== 'boolean') throw new Error('require_idle must be boolean');
+          requireIdle = body.require_idle === true;
           if (!('thread_id' in body)) throw new Error('thread_id required (use "" or null to reset)');
           if (body.thread_id !== null && typeof body.thread_id !== 'string') throw new Error('thread_id must be string or null');
           target = (body.thread_id ?? '').trim();
@@ -1113,7 +1132,7 @@ async function startControlServer(): Promise<void> {
           res.end(JSON.stringify({ ok: false, error: String(err?.message || err) }));
           return;
         }
-        const run = switchChain.catch(() => undefined).then(() => performThreadSwitch(target));
+        const run = switchChain.catch(() => undefined).then(() => performThreadSwitch(target, { requireIdle }));
         switchChain = run;
         run.then((result) => {
           res.writeHead(result.ok ? 200 : result.busy ? 409 : 500, { 'Content-Type': 'application/json' });

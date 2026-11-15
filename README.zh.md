@@ -132,7 +132,7 @@ npx kitty-hive init cursor
 
 | Channel | HTTP | 说明 |
 |---------|------|------|
-| `hive-dm` | `hive_dm` | 发私信。传 `attach: ["/abs/path"]` 发文件/图片（路径是**你**这台机器的；对方拿到 `file_id` 另取） |
+| `hive-dm` | `hive_dm` | 发私信。传 `attach: ["/abs/path"]` 发文件/图片（路径是**你**这台机器的；对方拿到 `file_id` 另取）。团队 host 可传 `fresh_context: true`：先由 Kitty 清空目标 claude/codex worker 的对话，确认清空后才投递这条 DM（看返回值里的 `delivered` 和 `fresh_context.reason`） |
 | `hive-inbox` | `hive_inbox` | 查看未读 DM / team / task 事件。每条 DM 带 `message_id` + `attachments` |
 | `hive-dm-read` | `hive_dm_read` | 按 `message_id` 拉单条 DM 全文（preview 结尾 `…(truncated; hive-dm-read message_id=N)` 时用） |
 | `hive-file-fetch` | `hive_file_fetch` | 按 `file_id` 取附件；`save_to` 可复制到指定位置 |

@@ -700,6 +700,15 @@ export async function handleAdmin(
         return;
       }
       const targetThreadId = (rawThreadId ?? '').trim();  // '' means reset
+      // require_idle (GX-89 fresh context): refuse with 409 unless the live
+      // daemon confirms no turn/goal is running. A daemon process without a
+      // ready control path cannot prove idleness, so it is not respawned.
+      if ('require_idle' in body && typeof body.require_idle !== 'boolean') {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'require_idle must be boolean' }));
+        return;
+      }
+      const requireIdle = body.require_idle === true;
 
       const agent = db.getAgentById(agent_id);
       if (!agent) {
@@ -740,7 +749,7 @@ export async function handleAdmin(
         // response leaves DB and daemon reconcilable instead of requiring a
         // blind rollback. Only the unavailable path commits the target before
         // its deliberate respawn reads it at env injection.
-        const switched = await switchDaemonThread(agent_id, targetThreadId);
+        const switched = await switchDaemonThread(agent_id, targetThreadId, undefined, { requireIdle });
         if (switched.kind === 'switched') {
           return {
             snap: switched.snapshot,
@@ -758,6 +767,15 @@ export async function handleAdmin(
             status: switched.kind === 'busy' ? 409 : switched.kind === 'uncertain' ? 504 : 500,
             ready: switched.kind === 'busy'
               || (switched.kind === 'rejected' && !switched.failClosed),
+          };
+        }
+        if (requireIdle && getDaemonForAgent({ agentId: agent_id })) {
+          return {
+            snap: null,
+            mode: 'in-process' as const,
+            error: `daemon is running without a ready control path (${switched.reason}); idle state unknown`,
+            status: 409,
+            ready: false,
           };
         }
         db.setAgentThreadId(agent_id, targetThreadId);
