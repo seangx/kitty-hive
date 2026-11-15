@@ -154,6 +154,22 @@ test('timeout is resolved through the recorded Kitty result', async () => {
   assert.equal(uncertain.delivered, undefined);
 });
 
+test('Kitty-reported unknown outcomes are not delivered and need no lookup', async () => {
+  const { deps, calls } = fakeDeps({ request: async () => ({ kind: 'uncertain', reason: 'timeout' }) });
+  const out = await deliverWithFreshContext(host, agent('w'), async () => 'sent', deps);
+  assert.deepEqual([out.fresh.ok, out.fresh.cleared, out.fresh.reason, out.delivered], [false, 'unknown', 'timeout', undefined]);
+  assert.equal(calls.some(c => c.startsWith('lookup:')), false);
+
+  const pending = fakeDeps({
+    request: async () => ({ kind: 'timeout', reason: 'timeout after 1000ms' }),
+    lookup: async () => ({ kind: 'found', cleared: 'unknown', pending: true }),
+  });
+  const stillPending = await deliverWithFreshContext(host, agent('w'), async () => 'sent', pending.deps);
+  assert.equal(stillPending.fresh.cleared, 'unknown');
+  assert.match(String(stillPending.fresh.detail), /still pending/);
+  assert.equal(stillPending.delivered, undefined);
+});
+
 test('a second fresh request for the same target is refused while one is in flight', async () => {
   let release!: () => void;
   const gate = new Promise<void>(r => { release = r; });
@@ -231,6 +247,22 @@ test('fresh-context request maps rejection, missing endpoint and timeout', async
       { kind: 'rejected', reason: 'busy' },
     );
   });
+  await withKittySocket(() => ({ status: 200, body: { ok: false, cleared: 'unknown', reason: 'timeout', tool: 'claude', request_id: 'r' } }), async (socketPath) => {
+    assert.deepEqual(
+      await requestKittyFreshContext('k', { agentId: 'a', tool: 'claude', requestId: 'r' }, { socketPath }),
+      { kind: 'uncertain', reason: 'timeout' },
+    );
+  });
+  await withKittySocket(() => ({ status: 200, body: { ok: false, cleared: false, reason: 'draft', tool: 'claude', request_id: 'r' } }), async (socketPath) => {
+    assert.deepEqual(
+      await requestKittyFreshContext('k', { agentId: 'a', tool: 'claude', requestId: 'r' }, { socketPath }),
+      { kind: 'rejected', reason: 'draft' },
+    );
+  });
+  await withKittySocket(() => ({ status: 503, body: { ok: false } }), async (socketPath) => {
+    const res = await requestKittyFreshContext('k', { agentId: 'a', tool: 'claude', requestId: 'r' }, { socketPath });
+    assert.deepEqual(res, { kind: 'unavailable', reason: 'kitty not ready' });
+  });
   await withKittySocket(() => ({ status: 404 }), async (socketPath) => {
     const res = await requestKittyFreshContext('k', { agentId: 'a', tool: 'codex', requestId: 'r' }, { socketPath });
     assert.equal(res.kind, 'unavailable');
@@ -253,6 +285,9 @@ test('fresh-context result lookup parses found / not found records', async () =>
     );
   });
   assert.equal(url, '/fresh-context/result?request_id=r%201');
+  await withKittySocket(() => ({ status: 200, body: { found: true, pending: true, cleared: 'unknown' } }), async (socketPath) => {
+    assert.deepEqual(await lookupKittyFreshContextResult('k', 'r', { socketPath }), { kind: 'found', cleared: 'unknown', pending: true });
+  });
   await withKittySocket(() => ({ status: 200, body: { found: false } }), async (socketPath) => {
     assert.deepEqual(await lookupKittyFreshContextResult('k', 'r', { socketPath }), { kind: 'not_found' });
   });

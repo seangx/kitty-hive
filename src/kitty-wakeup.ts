@@ -197,11 +197,13 @@ export interface KittyFreshContextRequest {
 export type KittyFreshContextResult =
   | { kind: 'cleared'; newExternalId?: string }
   | { kind: 'rejected'; reason: string }
+  /** Kitty answered but could not confirm whether the clear happened. */
+  | { kind: 'uncertain'; reason: string }
   | { kind: 'unavailable'; reason: string }
   | { kind: 'timeout'; reason: string };
 
 export type KittyFreshContextLookup =
-  | { kind: 'found'; cleared: boolean; reason?: string; newExternalId?: string }
+  | { kind: 'found'; cleared: boolean | 'unknown'; pending?: boolean; reason?: string; newExternalId?: string }
   | { kind: 'not_found' }
   | { kind: 'unavailable'; reason: string };
 
@@ -232,7 +234,13 @@ export async function requestKittyFreshContext(
   if (res.status === 404 && !optionalString(res.body.reason)) {
     return { kind: 'unavailable', reason: 'kitty does not support fresh-context' };
   }
-  return { kind: 'rejected', reason: optionalString(res.body.reason) || `HTTP ${res.status || 'unknown'}` };
+  // 503: Kitty is up but not ready; it did not act on the request.
+  if (res.status === 503) {
+    return { kind: 'unavailable', reason: `kitty not ready${optionalString(res.body.reason) ? `: ${res.body.reason}` : ''}` };
+  }
+  const reason = optionalString(res.body.reason) || `HTTP ${res.status || 'unknown'}`;
+  if (res.body.cleared === 'unknown') return { kind: 'uncertain', reason };
+  return { kind: 'rejected', reason };
 }
 
 export async function lookupKittyFreshContextResult(
@@ -257,12 +265,14 @@ export async function lookupKittyFreshContextResult(
       : { kind: 'unavailable', reason: `HTTP ${res.status || 'unknown'}` };
   }
   if (res.body.found !== true) return { kind: 'not_found' };
-  if (typeof res.body.cleared !== 'boolean') return { kind: 'unavailable', reason: 'invalid lookup response' };
+  const cleared = res.body.cleared;
+  if (typeof cleared !== 'boolean' && cleared !== 'unknown') return { kind: 'unavailable', reason: 'invalid lookup response' };
   const reason = optionalString(res.body.reason);
   const newExternalId = optionalString(res.body.new_external_id);
   return {
     kind: 'found',
-    cleared: res.body.cleared,
+    cleared,
+    ...(res.body.pending === true ? { pending: true } : {}),
     ...(reason ? { reason } : {}),
     ...(newExternalId ? { newExternalId } : {}),
   };

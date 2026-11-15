@@ -91,7 +91,7 @@ export function preflightFreshContext(actor: Agent, target: Agent, deps: FreshCo
 
 /** Connection failures where Kitty cannot have received the request. */
 function requestNeverArrived(reason: string): boolean {
-  return /ENOENT|ECONNREFUSED|missing external key|does not support/i.test(reason);
+  return /ENOENT|ECONNREFUSED|missing external key|does not support|kitty not ready/i.test(reason);
 }
 
 async function resolveUncertain(
@@ -101,7 +101,7 @@ async function resolveUncertain(
   deps: FreshContextDeps,
 ): Promise<FreshContextOutcome> {
   const lookup = await deps.lookup(target.external_key, base.request_id);
-  if (lookup.kind === 'found' && lookup.cleared) {
+  if (lookup.kind === 'found' && lookup.cleared === true) {
     return {
       ...base,
       ok: true,
@@ -110,8 +110,17 @@ async function resolveUncertain(
       ...(lookup.newExternalId ? { new_external_id: lookup.newExternalId } : {}),
     };
   }
-  if (lookup.kind === 'found') {
+  if (lookup.kind === 'found' && lookup.cleared === false) {
     return { ...base, ok: false, cleared: false, reason: lookup.reason || 'clear_failed' };
+  }
+  if (lookup.kind === 'found') {
+    return {
+      ...base,
+      ok: false,
+      cleared: 'unknown',
+      reason: lookup.reason || 'timeout',
+      detail: `${failure}; result lookup: ${lookup.pending ? 'still pending' : 'outcome unknown'}`,
+    };
   }
   return {
     ...base,
@@ -146,6 +155,10 @@ export async function deliverWithFreshContext<T>(
       fresh = { ...base, ok: true, cleared: true, ...(res.newExternalId ? { new_external_id: res.newExternalId } : {}) };
     } else if (res.kind === 'rejected') {
       fresh = { ...base, ok: false, cleared: false, reason: res.reason };
+    } else if (res.kind === 'uncertain') {
+      // Kitty itself could not confirm the clear (e.g. claude SessionStart
+      // never fired). Do not deliver into a conversation of unknown state.
+      fresh = { ...base, ok: false, cleared: 'unknown', reason: res.reason };
     } else if (res.kind === 'unavailable' && requestNeverArrived(res.reason)) {
       fresh = { ...base, ok: false, cleared: false, reason: 'kitty_unavailable', detail: res.reason };
     } else {
