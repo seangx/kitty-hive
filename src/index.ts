@@ -9,8 +9,8 @@ import {
   askText, askSelect, askMultiselect, askConfirm,
   pickLocalAgent, pickLocalAgents, pickPeer, isLocalAgent, isInteractive,
 } from './interactive.js';
-import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync } from 'node:fs';
-import { join, dirname, basename, delimiter } from 'node:path';
+import { writeFileSync, existsSync, readFileSync, unlinkSync, mkdirSync, cpSync } from 'node:fs';
+import { join, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { homedir, hostname } from 'node:os';
 import { execSync } from 'node:child_process';
@@ -129,6 +129,18 @@ async function cmdOpenCodeChannel() {
     process.on(sig, () => { try { child.kill(sig); } catch { /* ignore */ } });
   }
   await new Promise(() => { /* child exit terminates this wrapper */ });
+}
+
+// Antigravity CLI (agy) stdio MCP 通道 + 本地推送桥
+async function cmdAgyChannel() {
+  const { runAgyChannel } = await import('./agy-channel.js');
+  await runAgyChannel();
+}
+
+// Antigravity CLI (agy) 实时推送中继守护进程（调用官方 agentapi send-message）
+async function cmdAgyRelay() {
+  const { runAgyRelay } = await import('./agy-relay.js');
+  await runAgyRelay(args.slice(1));
 }
 
 // codex-pane <subcommand>: launcher-facing utilities for path B (visible codex
@@ -461,28 +473,69 @@ function configureOpenCode(port: number): { ok: boolean; message: string } {
   return { ok: true, message: `${path}  (mcp.hive remote server enabled)` };
 }
 
+function findKittyHive(): string | null {
+  const probe = process.platform === 'win32' ? 'where kitty-hive' : 'command -v kitty-hive';
+  try {
+    const out = execSync(probe, { encoding: 'utf8' }).trim().split(/\r?\n/)[0];
+    return out || null;
+  } catch { return null; }
+}
+
+function configureAntigravity(port: number): { ok: boolean; message: string; note?: string } {
+  const srcPluginDir = join(__dirname, '..', 'antigravity-plugin');
+  if (!existsSync(srcPluginDir)) {
+    return { ok: false, message: `antigravity-plugin directory not found at ${srcPluginDir}` };
+  }
+  const destDir = join(homedir(), '.gemini', 'config', 'plugins', 'kitty-hive');
+  try {
+    mkdirSync(dirname(destDir), { recursive: true });
+    cpSync(srcPluginDir, destDir, { recursive: true, force: true });
+
+    const hiveBin = findKittyHive();
+    const url = `http://localhost:${port}/mcp`;
+    const serverConfig: Record<string, any> = hiveBin
+      ? { command: hiveBin, args: ['agy-channel'] }
+      : { command: process.execPath, args: [__filename, 'agy-channel'] };
+    if (port !== 4123) {
+      serverConfig.env = { HIVE_URL: url };
+    }
+    writeJson(join(destDir, 'mcp_config.json'), {
+      mcpServers: {
+        'hive-channel': serverConfig,
+      },
+    });
+
+    let note: string | undefined;
+    const legacyMcpPath = join(homedir(), '.gemini', 'config', 'mcp_config.json');
+    if (existsSync(legacyMcpPath)) {
+      const legacy = readJson(legacyMcpPath);
+      if (legacy?.mcpServers?.hive) {
+        note = 'Note: legacy "hive" MCP entry found in ~/.gemini/config/mcp_config.json — run `agy mcp remove hive` to avoid duplicate tools.';
+      }
+    }
+    return {
+      ok: true,
+      message: `${destDir}  (Antigravity plugin installed: MCP channel + hooks + rules)`,
+      note,
+    };
+  } catch (err: any) {
+    return {
+      ok: false,
+      message: `failed to install Antigravity plugin to ${destDir}: ${err?.message ?? err}`,
+    };
+  }
+}
+
 function antigravitySnippet(port: number): string {
-  // Antigravity has no public on-disk config path — users edit via
-  // "..." → MCP Store → Manage MCP Servers → View raw config.
-  // It also doesn't speak streamable HTTP directly, so we route through a stdio→HTTP adapter.
   const url = `http://localhost:${port}/mcp`;
-  // Pre-seed PATH so the GUI app can find npx even when launched without a shell.
-  const pathDirs = process.platform === 'win32'
-    ? [
-        process.env.SystemRoot ? join(process.env.SystemRoot, 'System32') : 'C:\\Windows\\System32',
-        process.env.APPDATA ? join(process.env.APPDATA, 'npm') : '',
-      ].filter(Boolean)
-    : ['/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin'];
+  const hiveBin = findKittyHive();
+  const serverConfig: Record<string, any> = hiveBin
+    ? { command: hiveBin, args: ['agy-channel'] }
+    : { command: process.execPath, args: [__filename, 'agy-channel'] };
+  if (port !== 4123) serverConfig.env = { HIVE_URL: url };
   return JSON.stringify({
     mcpServers: {
-      hive: {
-        command: findNpx(),
-        args: ['-y', '@pyroprompts/mcp-stdio-to-streamable-http-adapter'],
-        env: {
-          PATH: pathDirs.join(delimiter),
-          URI: url,
-        },
-      },
+      'hive-channel': serverConfig,
     },
   }, null, 2);
 }
@@ -497,7 +550,7 @@ function showInitUsage() {
   console.log('  vscode        .vscode/mcp.json   (VS Code Copilot)');
   console.log('  codex         shells out to `codex mcp add` (writes ~/.codex/config.toml)');
   console.log('  opencode      ~/.config/opencode/opencode.json (remote MCP server)');
-  console.log('  antigravity   prints snippet to paste via MCP Store UI');
+  console.log('  antigravity   ~/.gemini/config/plugins/kitty-hive (Antigravity plugin + push bridge)');
   console.log('  all           run all of the above');
 }
 
@@ -525,7 +578,7 @@ async function cmdInit() {
         { value: 'vscode', label: 'VS Code Copilot', hint: '.vscode/mcp.json' },
         { value: 'codex', label: 'Codex CLI', hint: 'codex mcp add → ~/.codex/config.toml' },
         { value: 'opencode', label: 'OpenCode', hint: '~/.config/opencode/opencode.json' },
-        { value: 'antigravity', label: 'Antigravity', hint: 'snippet — paste via MCP Store UI' },
+        { value: 'antigravity', label: 'Antigravity', hint: '~/.gemini/config/plugins/kitty-hive (plugin + push)' },
         { value: 'all', label: 'All of the above' },
       ],
     });
@@ -545,12 +598,15 @@ async function cmdInit() {
   console.log(`🐝 Configuring hive → http://localhost:${port}/mcp\n`);
   for (const t of targets) {
     if (t === 'antigravity') {
-      console.log(`  antigravity  (no on-disk path — paste this snippet)`);
-      console.log(`               Open: "..." → MCP Store → Manage MCP Servers → View raw config`);
-      console.log(`               Merge "hive" into mcpServers:\n`);
-      const snippet = antigravitySnippet(port).split('\n').map(l => '    ' + l).join('\n');
-      console.log(snippet);
-      console.log('');
+      const res = configureAntigravity(port);
+      console.log(`  ${t.padEnd(12)} ${res.message}`);
+      if (res.note) console.log(`               ${res.note}`);
+      if (!res.ok) {
+        const snippet = antigravitySnippet(port).split('\n').map(l => '    ' + l).join('\n');
+        console.log('               Fallback mcp_config.json snippet:\n');
+        console.log(snippet);
+        console.log('');
+      }
     } else if (t === 'codex') {
       const res = configureCodex(port);
       console.log(`  ${t.padEnd(12)} ${res.message}`);
@@ -2762,6 +2818,8 @@ Top-level commands:
   init [tool] [--port 4123]                  Write MCP config (claude|cursor|vscode|codex|opencode|antigravity|all)
   codex-channel [--name X] [--profile P]     Run a long-lived codex agent that receives hive push events
   opencode-channel [--name X]                Run a persistent OpenCode agent that receives hive pushes
+  agy-channel                                Run the Antigravity stdio MCP channel + local push bridge
+  agy-relay [--socket PATH]                  Run the Antigravity agentapi push relay daemon
   codex-pane ws --id ID                      Get Codex app-server attach coordinates
   opencode-pane server --id ID               Get OpenCode server/session attach coordinates
   status [--port 4123]                       Server & agent status
@@ -2951,6 +3009,12 @@ switch (command) {
     break;
   case 'opencode-pane':
     run(cmdOpenCodePane);
+    break;
+  case 'agy-channel':
+    run(cmdAgyChannel);
+    break;
+  case 'agy-relay':
+    run(cmdAgyRelay);
     break;
   case 'status':
     run(cmdStatus);

@@ -41,7 +41,8 @@ export function declaresEventConsumer(
     // was added.
     || clientName === 'hive-channel'
     || clientName === 'codex-channel'
-    || clientName === 'opencode-channel';
+    || clientName === 'opencode-channel'
+    || clientName === 'agy-channel';
 }
 
 export function livePushSessionsForAgent(agentId: string): string[] {

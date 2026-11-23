@@ -103,7 +103,9 @@ Each machine runs its **own** `kitty-hive serve` — there is no central hub. Lo
 
 **OpenCode** — Messages are pushed into a persistent supervised OpenCode session; a visible TUI attaches to the same backend/session.
 
-**Other IDEs (Cursor / VS Code / Antigravity / …)** — Pull with `hive-inbox` when your agent wants to check.
+**Antigravity (`agy`)** — Install the bundled plugin via `kitty-hive init antigravity`. `agy-channel` bridges MCP tools and SSE pushes; `kitty-hive agy-relay` wakes idle sessions in real time via `agentapi send-message`, with lifecycle hooks (`PreInvocation` / `Stop`) as fallback and `/clear` / `/resume` tracking.
+
+**Other IDEs (Cursor / VS Code / …)** — Pull with `hive-inbox` when your agent wants to check.
 
 **Cross-machine** — Peers connect symmetrically; no "primary" hive. See [Federation](#federation) for setup.
 
@@ -179,17 +181,13 @@ Every HTTP tool `hive_foo_bar` is re-exposed by the channel plugin as kebab-case
 <details>
 <summary>Manual MCP configuration for each IDE</summary>
 
-**Antigravity** (`mcp_config.json`):
+**Antigravity** (recommended: run `kitty-hive init antigravity` to install `~/.gemini/config/plugins/kitty-hive`; or manual `mcp_config.json`):
 ```json
 {
   "mcpServers": {
-    "hive": {
-      "command": "/opt/homebrew/bin/npx",
-      "args": ["-y", "@pyroprompts/mcp-stdio-to-streamable-http-adapter"],
-      "env": {
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        "URI": "http://localhost:4123/mcp"
-      }
+    "hive-channel": {
+      "command": "kitty-hive",
+      "args": ["agy-channel"]
     }
   }
 }
