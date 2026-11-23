@@ -12,7 +12,6 @@ import {
   bridgeSocketPath,
   discoverBridgeSocket,
   formatAgyPushNotification,
-  inspectAgyPaneForColdBootstrap,
   parseBridgeSocketPid,
 } from './agy-bridge.js';
 import { resolveAgentApiInvocation, runAgyRelay } from './agy-relay.js';
@@ -55,39 +54,6 @@ function runHookScript(scriptPath: string, socketPath: string, stdinObj: Record<
     child.stdin?.end(JSON.stringify(stdinObj));
   });
 }
-
-test('inspectAgyPaneForColdBootstrap detects idle empty prompt vs draft vs busy', () => {
-  const rule = '─'.repeat(40);
-  const idleWithPlaceholder = [
-    'Some previous response',
-    rule,
-    '> Accept-edits mode: file edits auto-approved (shift+tab to cycle)',
-    rule,
-    'main │ Gemini 4 Argon',
-  ].join('\n');
-  assert.deepEqual(inspectAgyPaneForColdBootstrap(idleWithPlaceholder), {
-    canBootstrap: true,
-    reason: 'idle_empty',
-  });
-
-  const idleBare = ['ok', rule, '>', rule, 'status'].join('\n');
-  assert.deepEqual(inspectAgyPaneForColdBootstrap(idleBare), {
-    canBootstrap: true,
-    reason: 'idle_empty',
-  });
-
-  const withDraft = ['ok', rule, '> working on a draft prompt', rule, 'status'].join('\n');
-  assert.deepEqual(inspectAgyPaneForColdBootstrap(withDraft), {
-    canBootstrap: false,
-    reason: 'draft',
-  });
-
-  const busy = ['> user msg', '⢿  Generating...', rule, '>', rule, 'status'].join('\n');
-  assert.deepEqual(inspectAgyPaneForColdBootstrap(busy), {
-    canBootstrap: false,
-    reason: 'busy',
-  });
-});
 
 test('resolveAgentApiInvocation prepends agentapi subcommand when pointing to main antigravity binary', () => {
   assert.deepEqual(
