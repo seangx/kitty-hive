@@ -15,6 +15,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { AgyBridgeServer, bridgeSocketPath } from './agy-bridge.js';
+import { notifyKittyWakeup } from './kitty-wakeup.js';
 
 interface MCPTool {
   name: string;
@@ -301,7 +302,11 @@ export async function runAgyChannel(): Promise<void> {
               const raw = String(data.params.data);
               let parsed: any;
               try { parsed = JSON.parse(raw); } catch { parsed = { type: 'message', preview: raw }; }
-              bridge.pushEvent(parsed, raw);
+              const item = bridge.pushEvent(parsed, raw);
+              // 若在 Kitty 会话中运行且尚未挂上 agy-relay，同步点亮 Kitty 会话提醒气泡
+              if (item && HIVE_AGENT_KEY && !bridge.state.getStatus().relayConnected) {
+                void notifyKittyWakeup(HIVE_AGENT_KEY, raw).catch(() => {});
+              }
             } catch {
               // 忽略单行解析异常，保持 SSE 不断
             }
