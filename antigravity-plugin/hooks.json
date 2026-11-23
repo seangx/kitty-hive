@@ -14,6 +14,18 @@
         "timeout": 5
       }
     ],
+    "PreToolUse": [
+      {
+        "matcher": "call_mcp_tool|run_command|read_file",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/agy-hook.mjs",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
     "Stop": [
       {
         "type": "command",

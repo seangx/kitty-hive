@@ -485,11 +485,13 @@ export class AgyBridgeServer {
 
     if (msg.event === 'PreInvocation' || msg.event === 'Stop') {
       const pending = this.state.drainForHook(msg.event, Boolean(msg.continuationActive));
+      const remindRelayStart = msg.event === 'PreInvocation' && !status.relayConnected;
       this.writeJsonLine(socket, {
         ok: true,
         pending,
         block: formatHookPushBlock(pending),
         relayConnected: status.relayConnected,
+        remindRelayStart,
         agentId: id.agentId,
         agentName: id.agentName,
       });

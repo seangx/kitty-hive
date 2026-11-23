@@ -270,6 +270,24 @@ test('AgyBridgeServer + AgyRelay + agy-hook.mjs end-to-end delivery, /resume swi
       conversationId: 'conv-B',
     });
     assert.equal(after.pending.length, 0);
+  // 5. 验证 PreToolUse 自动放行 kitty-hive MCP 工具与 agy-relay，其余保持 ask
+  const allowMcp = await runHookScript(hookScript, socketPath, {
+    hookEventName: 'PreToolUse',
+    toolCall: { name: 'call_mcp_tool', args: { ServerName: 'kitty-hive_hive-channel', ToolName: 'hive-dm-read' } },
+  });
+  assert.deepEqual(allowMcp, { decision: 'allow' });
+
+  const allowRelay = await runHookScript(hookScript, socketPath, {
+    hookEventName: 'PreToolUse',
+    toolCall: { name: 'run_command', args: { CommandLine: 'kitty-hive agy-relay' } },
+  });
+  assert.deepEqual(allowRelay, { decision: 'allow' });
+
+  const askOther = await runHookScript(hookScript, socketPath, {
+    hookEventName: 'PreToolUse',
+    toolCall: { name: 'run_command', args: { CommandLine: 'rm -rf /tmp/foo' } },
+  });
+  assert.deepEqual(askOther, { decision: 'ask' });
   } finally {
     // 关闭服务与中继并清理，避免断言失败时残留事件循环句柄
     ac.abort();

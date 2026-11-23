@@ -68,9 +68,55 @@ function queryBridge(socketPath, payload, timeoutMs = 1500) {
   });
 }
 
+function evaluatePreToolUse(input) {
+  const tc = input.toolCall || {};
+  const name = tc.name || '';
+  const args = tc.args || {};
+
+  // 1. 自动放行 kitty-hive 的 MCP 工具调用，防止后台唤醒后卡在权限确认弹窗
+  if (name === 'call_mcp_tool') {
+    const serverName = String(args.ServerName || '');
+    if (serverName === 'kitty-hive_hive-channel' || serverName === 'hive-channel') {
+      return { decision: 'allow' };
+    }
+  }
+
+  // 2. 自动放行启动后台推送守护进程 `kitty-hive agy-relay`
+  if (name === 'run_command') {
+    const cmd = String(args.CommandLine || '').trim();
+    if (cmd === 'kitty-hive agy-relay') {
+      return { decision: 'allow' };
+    }
+  }
+
+  // 3. 自动放行读取 kitty-hive 插件自身的 MCP 工具 schema 与规则文件（位于工作区外的 ~/.gemini 下）
+  if (name === 'read_file') {
+    const p = String(args.Path || '').replace(/\\/g, '/');
+    if (
+      p.includes('/mcp/kitty-hive_hive-channel/')
+      || p.includes('/.gemini/config/plugins/kitty-hive/')
+    ) {
+      return { decision: 'allow' };
+    }
+  }
+
+  return { decision: 'ask' };
+}
+
+const RELAY_AUTOSTART_NOTICE =
+  '[kitty-hive] Real-time push relay is not running for this agy process yet. ' +
+  'In this turn, call run_command({ CommandLine: "kitty-hive agy-relay", WaitMsBeforeAsync: 5000 }) ' +
+  '(auto-approved, detaches in <50ms with no background task bar) so incoming hive messages can wake this session while idle.';
+
 async function main() {
   const input = readStdinJson();
   const event = input.hookEventName || '';
+
+  if (event === 'PreToolUse') {
+    process.stdout.write(JSON.stringify(evaluatePreToolUse(input)) + '\n');
+    return;
+  }
+
   const conversationId = input.conversationId || process.env.ANTIGRAVITY_CONVERSATION_ID || '';
   const socketPath = process.env.HIVE_AGY_BRIDGE_SOCKET || join(tmpdir(), `kitty-hive-agy-${process.ppid}.sock`);
 
@@ -82,17 +128,24 @@ async function main() {
     cwd: input.cwd || '',
   });
 
-  if (!res || !res.ok || !res.block) {
+  if (!res || !res.ok) {
     process.stdout.write('{}\n');
     return;
   }
 
   if (event === 'PreInvocation') {
+    const parts = [];
+    if (res.remindRelayStart) parts.push(RELAY_AUTOSTART_NOTICE);
+    if (res.block) parts.push(res.block);
+    if (parts.length === 0) {
+      process.stdout.write('{}\n');
+      return;
+    }
     process.stdout.write(JSON.stringify({
       injectSteps: [
         {
           systemMessage: {
-            systemMessage: res.block,
+            systemMessage: parts.join('\n\n'),
           },
         },
       ],
@@ -100,7 +153,7 @@ async function main() {
     return;
   }
 
-  if (event === 'Stop') {
+  if (event === 'Stop' && res.block) {
     process.stdout.write(JSON.stringify({
       decision: 'continue',
       reason: res.block,
