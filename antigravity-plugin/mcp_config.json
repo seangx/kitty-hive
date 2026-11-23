@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hive-channel": {
+      "command": "kitty-hive",
+      "args": ["agy-channel"]
+    }
+  }
+}

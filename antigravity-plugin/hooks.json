@@ -1,0 +1,25 @@
+{
+  "kitty-hive": {
+    "SessionStart": [
+      {
+        "type": "command",
+        "command": "node ./scripts/agy-hook.mjs",
+        "timeout": 5
+      }
+    ],
+    "PreInvocation": [
+      {
+        "type": "command",
+        "command": "node ./scripts/agy-hook.mjs",
+        "timeout": 5
+      }
+    ],
+    "Stop": [
+      {
+        "type": "command",
+        "command": "node ./scripts/agy-hook.mjs",
+        "timeout": 5
+      }
+    ]
+  }
+}

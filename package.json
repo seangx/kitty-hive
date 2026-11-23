@@ -9,6 +9,7 @@
   },
   "files": [
     "dist/",
+    "antigravity-plugin/",
     "channel.ts",
     "codex-channel.ts",
     "opencode-channel.ts",

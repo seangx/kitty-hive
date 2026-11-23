@@ -18,7 +18,7 @@ export function registerAgentTools(mcp: McpServer) {
       key: z.string().optional().describe('External orchestrator key. Idempotent: same key always returns the same agent_id. UNIQUE on populated values.'),
       name: z.string().optional().describe('Display name (random if omitted). When the agent already exists, display_name is silently refreshed to this value.'),
       roles: z.string().optional().describe('Comma-separated roles: ux,frontend,backend'),
-      tool: z.string().optional().describe('Agent tool: claude, codex, opencode, shell'),
+      tool: z.string().optional().describe('Agent tool: claude, codex, opencode, antigravity, shell'),
       expertise: z.string().optional().describe('Free-text expertise description'),
     },
     async (params, extra) => {

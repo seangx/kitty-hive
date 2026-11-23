@@ -103,7 +103,9 @@ npx kitty-hive init cursor
 
 **OpenCode** — 消息自动推入持久的受管 OpenCode session；可见 TUI 连接的就是同一个后端和会话。
 
-**其他 IDE（Cursor / VS Code / Antigravity / …）** — agent 主动 `hive-inbox` 拉取。
+**Antigravity（`agy`）** — 运行 `kitty-hive init antigravity` 安装原生插件：`agy-channel` 负责 MCP 工具代理与 SSE 推送流，`kitty-hive agy-relay` 通过官方 `agentapi send-message` 在空闲时实时唤醒当前终端会话，配合 `SessionStart` / `PreInvocation` / `Stop` 钩子自动追踪 `/clear`、`/resume` 并在未启用 relay 时兜底投递。
+
+**其他 IDE（Cursor / VS Code / …）** — agent 主动 `hive-inbox` 拉取。
 
 **跨机器** — peer 是对称的，没有"主 hive"。配置见 [联邦](#联邦)。
 
@@ -179,17 +181,13 @@ npx kitty-hive init cursor
 <details>
 <summary>各 IDE 手动配置方式</summary>
 
-**Antigravity**（`mcp_config.json`）：
+**Antigravity**（推荐直接运行 `kitty-hive init antigravity` 安装 `~/.gemini/config/plugins/kitty-hive` 插件；手动配置 `mcp_config.json` 如下）：
 ```json
 {
   "mcpServers": {
-    "hive": {
-      "command": "/opt/homebrew/bin/npx",
-      "args": ["-y", "@pyroprompts/mcp-stdio-to-streamable-http-adapter"],
-      "env": {
-        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        "URI": "http://localhost:4123/mcp"
-      }
+    "hive-channel": {
+      "command": "kitty-hive",
+      "args": ["agy-channel"]
     }
   }
 }

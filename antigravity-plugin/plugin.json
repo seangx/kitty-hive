@@ -1,0 +1,11 @@
+{
+  "name": "kitty-hive",
+  "version": "0.7.14",
+  "description": "Multi-agent collaboration for Antigravity — DM, tasks, teams, workflow, federation, and real-time push.",
+  "author": {
+    "name": "seangx",
+    "url": "https://github.com/seangx"
+  },
+  "homepage": "https://github.com/seangx/kitty-hive",
+  "repository": "https://github.com/seangx/kitty-hive"
+}
