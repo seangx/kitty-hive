@@ -14,7 +14,7 @@
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
-import { AgyBridgeServer, bridgeSocketPath } from './agy-bridge.js';
+import { AgyBridgeServer, bridgeSocketPath, tryColdBootstrapTmuxPane } from './agy-bridge.js';
 import { notifyKittyWakeup } from './kitty-wakeup.js';
 
 interface MCPTool {
@@ -78,12 +78,38 @@ export async function runAgyChannel(): Promise<void> {
   let shuttingDown = false;
   let cachedHiveTools: MCPTool[] = [];
   let cachedFingerprint = '';
+  let coldBootstrapTimer: ReturnType<typeof setTimeout> | null = null;
+  let lastColdBootstrapSentAt = 0;
 
   const bridge = new AgyBridgeServer({
     socketPath: SOCKET_PATH,
     getIdentity: () => ({ agentId, agentName }),
     onLog: (msg) => console.error(`[agy-channel] ${msg}`),
   });
+
+  function scheduleColdBootstrapIfNeeded(): void {
+    if (shuttingDown || !process.env.TMUX_PANE) return;
+    const st = bridge.state.getStatus();
+    if (st.relayConnected || st.pendingCount === 0) return;
+    if (coldBootstrapTimer) return;
+
+    const sinceLast = Date.now() - lastColdBootstrapSentAt;
+    const delayMs = sinceLast < 15_000 ? 15_000 - sinceLast : 400;
+    coldBootstrapTimer = setTimeout(async () => {
+      coldBootstrapTimer = null;
+      const cur = bridge.state.getStatus();
+      if (shuttingDown || cur.relayConnected || cur.pendingCount === 0) return;
+      const res = await tryColdBootstrapTmuxPane();
+      if (res.sent) {
+        lastColdBootstrapSentAt = Date.now();
+        console.error(`[agy-channel] cold-bootstrapped tmux pane ${process.env.TMUX_PANE} to start turn 1 & agy-relay`);
+      } else if (res.reason === 'busy' || res.reason === 'draft' || res.reason === 'no_prompt_box') {
+        // 界面尚在启动加载或用户正在输入，稍后重试直到 relay 连上或消息被取走
+        scheduleColdBootstrapIfNeeded();
+      }
+    }, delayMs);
+    coldBootstrapTimer.unref();
+  }
 
   await bridge.start();
   console.error(`[agy-channel] bridge socket listening on ${SOCKET_PATH}`);
@@ -303,9 +329,13 @@ export async function runAgyChannel(): Promise<void> {
               let parsed: any;
               try { parsed = JSON.parse(raw); } catch { parsed = { type: 'message', preview: raw }; }
               const item = bridge.pushEvent(parsed, raw);
-              // 若在 Kitty 会话中运行且尚未挂上 agy-relay，同步点亮 Kitty 会话提醒气泡
-              if (item && HIVE_AGENT_KEY && !bridge.state.getStatus().relayConnected) {
-                void notifyKittyWakeup(HIVE_AGENT_KEY, raw).catch(() => {});
+              // 若尚未挂上 agy-relay（例如刚通过 --conversation 冷重启且用户未切过去说话），
+              // 自动通过 tmux 空闲检测触发首轮（由 PreInvocation 注入消息并自动拉起 agy-relay）
+              if (item && !bridge.state.getStatus().relayConnected) {
+                scheduleColdBootstrapIfNeeded();
+                if (HIVE_AGENT_KEY) {
+                  void notifyKittyWakeup(HIVE_AGENT_KEY, raw).catch(() => {});
+                }
               }
             } catch {
               // 忽略单行解析异常，保持 SSE 不断

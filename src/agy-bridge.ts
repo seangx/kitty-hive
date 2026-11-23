@@ -582,3 +582,103 @@ export function isPidAlive(pid: number): boolean {
     return err?.code === 'EPERM';
   }
 }
+
+export type ColdBootstrapCheck =
+  | { canBootstrap: true; reason: 'idle_empty' }
+  | { canBootstrap: false; reason: 'no_prompt_box' | 'draft' | 'busy' };
+
+/**
+ * 分析 tmux capture-pane 抓屏文本，判断刚重启但尚未跑过首轮（relayConnected=false）的 agy 会话
+ * 是否正处于“空闲且输入框为空”的安全状态，可供一次性冷启动唤醒。
+ */
+export function inspectAgyPaneForColdBootstrap(screenText: string): ColdBootstrapCheck {
+  const lines = screenText
+    .split(/\r?\n/)
+    .map((l) => l.trimEnd());
+
+  // 寻找底部输入框的上下两条水平分割线（─────）
+  const ruleIndices: number[] = [];
+  for (let i = lines.length - 1; i >= 0 && ruleIndices.length < 2; i--) {
+    if (/^─{20,}$/.test(lines[i].trim())) {
+      ruleIndices.unshift(i);
+    }
+  }
+  if (ruleIndices.length < 2) {
+    return { canBootstrap: false, reason: 'no_prompt_box' };
+  }
+
+  const [topRule, bottomRule] = ruleIndices;
+  const boxLines = lines.slice(topRule + 1, bottomRule).filter((l) => l.trim().length > 0);
+  if (boxLines.length !== 1) {
+    return { canBootstrap: false, reason: boxLines.length === 0 ? 'no_prompt_box' : 'draft' };
+  }
+
+  const promptLine = boxLines[0].trim();
+  const isEmptyPrompt =
+    /^>$/.test(promptLine)
+    || /^>\s+.*\(shift\+tab to cycle\)\s*$/i.test(promptLine);
+  if (!isEmptyPrompt) {
+    return { canBootstrap: false, reason: 'draft' };
+  }
+
+  // 检查输入框上方是否正在生成或执行工具
+  const aboveStart = Math.max(0, topRule - 6);
+  const aboveLines = lines.slice(aboveStart, topRule);
+  for (const line of aboveLines) {
+    if (/Generating\.\.\.|Thinking\.\.\.|esc to cancel|[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⢿⣻⣽⣾]/i.test(line)) {
+      return { canBootstrap: false, reason: 'busy' };
+    }
+  }
+
+  return { canBootstrap: true, reason: 'idle_empty' };
+}
+
+/**
+ * 在 tmux 管理的冷启动 agy 会话（尚未跑过任何一轮，因此 agy-relay 还未启动）收到首条推送时，
+ * 先做两次读屏确认“空闲且无草稿”，再向当前 TMUX_PANE 发送一次 `[kitty-hive]` 回车触发首轮，
+ * 使 PreInvocation 钩子得以运行：自动拉起 agy-relay 并注入待处理推送。
+ */
+export async function tryColdBootstrapTmuxPane(
+  tmuxPane = process.env.TMUX_PANE || '',
+): Promise<{ sent: boolean; reason: string }> {
+  const pane = tmuxPane.trim();
+  if (!pane) return { sent: false, reason: 'no_tmux_pane' };
+
+  const capture = (): string | null => {
+    try {
+      return execFileSync('tmux', ['capture-pane', '-p', '-t', pane], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      });
+    } catch {
+      return null;
+    }
+  };
+
+  const firstScreen = capture();
+  if (!firstScreen) return { sent: false, reason: 'capture_failed' };
+  const firstCheck = inspectAgyPaneForColdBootstrap(firstScreen);
+  if (!firstCheck.canBootstrap) return { sent: false, reason: firstCheck.reason };
+
+  // 二次读屏确认，避开用户刚好开始打字的瞬间（与 GX-89 策略一致）
+  await new Promise((r) => setTimeout(r, 150));
+  const secondScreen = capture();
+  if (!secondScreen) return { sent: false, reason: 'capture_failed' };
+  const secondCheck = inspectAgyPaneForColdBootstrap(secondScreen);
+  if (!secondCheck.canBootstrap) return { sent: false, reason: secondCheck.reason };
+
+  try {
+    execFileSync('tmux', ['send-keys', '-t', pane, '-l', '[kitty-hive]'], {
+      timeout: 2000,
+      stdio: 'ignore',
+    });
+    execFileSync('tmux', ['send-keys', '-t', pane, 'Enter'], {
+      timeout: 2000,
+      stdio: 'ignore',
+    });
+    return { sent: true, reason: 'bootstrapped' };
+  } catch {
+    return { sent: false, reason: 'send_keys_failed' };
+  }
+}
