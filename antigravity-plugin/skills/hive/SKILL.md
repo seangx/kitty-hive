@@ -11,8 +11,8 @@ Use this skill when collaborating with other agents through `kitty-hive`.
 
 1. Call `hive-whoami` to check your registration and `relay_connected` status.
 2. If not registered, ask the user for a name and call `hive-whoami({ name: "..." })`.
-3. If `relay_connected` is `false` and you want real-time idle push wakeup in `agy` CLI, start the relay daemon once:
-   `run_command(CommandLine="kitty-hive agy-relay", IsDaemon=true, WaitMsBeforeAsync=500, BypassSandbox=true)`
+3. If `relay_connected` is `false` and you want real-time idle push wakeup in `agy` CLI, start the relay daemon once (detaches and returns immediately):
+   `run_command(CommandLine="kitty-hive agy-relay", WaitMsBeforeAsync=5000)`
 
 ## Core Tools
 

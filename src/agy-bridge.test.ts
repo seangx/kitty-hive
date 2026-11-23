@@ -14,7 +14,7 @@ import {
   formatAgyPushNotification,
   parseBridgeSocketPid,
 } from './agy-bridge.js';
-import { runAgyRelay } from './agy-relay.js';
+import { resolveAgentApiInvocation, runAgyRelay } from './agy-relay.js';
 
 function sendHookLine(socketPath: string, payload: Record<string, unknown>): Promise<any> {
   return new Promise((resolve, reject) => {
@@ -54,6 +54,21 @@ function runHookScript(scriptPath: string, socketPath: string, stdinObj: Record<
     child.stdin?.end(JSON.stringify(stdinObj));
   });
 }
+
+test('resolveAgentApiInvocation prepends agentapi subcommand when pointing to main antigravity binary', () => {
+  assert.deepEqual(
+    resolveAgentApiInvocation('/opt/homebrew/Caskroom/antigravity-cli/1.5.14/antigravity'),
+    { bin: '/opt/homebrew/Caskroom/antigravity-cli/1.5.14/antigravity', prefixArgs: ['agentapi'] },
+  );
+  assert.deepEqual(
+    resolveAgentApiInvocation('/Users/marvingod/.gemini/antigravity-cli/bin/agentapi'),
+    { bin: '/Users/marvingod/.gemini/antigravity-cli/bin/agentapi', prefixArgs: [] },
+  );
+  assert.deepEqual(
+    resolveAgentApiInvocation(''),
+    { bin: 'agentapi', prefixArgs: [] },
+  );
+});
 
 test('bridgeSocketPath and parseBridgeSocketPid round-trip owner pid', () => {
   const p = bridgeSocketPath(42424, '/tmp');

@@ -10,8 +10,9 @@
  * 4. 向 agy-channel 回传 `push-ack`；当宿主 agy 进程退出时自动退出，不留孤儿进程。
  */
 
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { createConnection, type Socket } from 'node:net';
+import { basename } from 'node:path';
 import { discoverBridgeSocket, isPidAlive, type BridgePushFrame } from './agy-bridge.js';
 
 export type AgentApiSender = (input: {
@@ -31,14 +32,31 @@ export interface AgyRelayOptions {
   signal?: AbortSignal;
 }
 
+/**
+ * 解析 agentapi 调用方式：
+ * Antigravity 注入的 ANTIGRAVITY_AGENTAPI_EXE 指向主二进制 `antigravity`（需要带 `agentapi` 子命令），
+ * 而 PATH 中的 `agentapi` 包装脚本或测试 stub 则直接接受 `send-message`。
+ */
+export function resolveAgentApiInvocation(
+  envExe = process.env.ANTIGRAVITY_AGENTAPI_EXE,
+): { bin: string; prefixArgs: string[] } {
+  const bin = envExe || 'agentapi';
+  const base = basename(bin).toLowerCase();
+  const needsSubcommand = !base.includes('agentapi');
+  return {
+    bin,
+    prefixArgs: needsSubcommand ? ['agentapi'] : [],
+  };
+}
+
 /** 默认发送器：调用 Antigravity 注入到环境中的官方 `agentapi send-message`。 */
 export function createDefaultAgentApiSender(): AgentApiSender {
-  const bin = process.env.ANTIGRAVITY_AGENTAPI_EXE || 'agentapi';
   return ({ conversationId, title, content }) =>
     new Promise<void>((resolve, reject) => {
+      const { bin, prefixArgs } = resolveAgentApiInvocation();
       execFile(
         bin,
-        ['send-message', '--title', title, conversationId, content],
+        [...prefixArgs, 'send-message', '--title', title, conversationId, content],
         { timeout: 15_000 },
         (err, _stdout, stderr) => {
           if (err) {
@@ -52,17 +70,24 @@ export function createDefaultAgentApiSender(): AgentApiSender {
     });
 }
 
-function parseRelayCliArgs(argv: string[]): { socketPath?: string; conversationId?: string } {
+function parseRelayCliArgs(argv: string[]): {
+  socketPath?: string;
+  conversationId?: string;
+  foreground: boolean;
+} {
   let socketPath: string | undefined;
   let conversationId: string | undefined;
+  let foreground = false;
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--socket' && argv[i + 1]) {
       socketPath = argv[++i];
     } else if (argv[i] === '--conversation' && argv[i + 1]) {
       conversationId = argv[++i];
+    } else if (argv[i] === '--foreground' || argv[i] === '-f') {
+      foreground = true;
     }
   }
-  return { socketPath, conversationId };
+  return { socketPath, conversationId, foreground };
 }
 
 export async function runAgyRelay(argv: string[] = [], opts: AgyRelayOptions = {}): Promise<void> {
@@ -118,6 +143,24 @@ export async function runAgyRelay(argv: string[] = [], opts: AgyRelayOptions = {
 
   ownerPid = discovered.ownerPid;
   const socketPath = discovered.socketPath;
+
+  // CLI 默认自后台化（detached）：在父进程完成祖先 PID socket 发现后，
+  // 将 --socket 显式传给脱离后台的子进程并立即退出，避免在 agy 界面一直挂着黄色 running 任务条。
+  const runInForeground =
+    parsed.foreground || Boolean(opts.sender) || Boolean(opts.signal) || Boolean(opts.socketPath);
+  if (!runInForeground) {
+    const childArgs = [process.argv[1], 'agy-relay', '--foreground', '--socket', socketPath];
+    if (initialConvId) childArgs.push('--conversation', initialConvId);
+    const child = spawn(process.execPath, childArgs, {
+      detached: true,
+      stdio: 'ignore',
+      env: process.env,
+    });
+    child.unref();
+    onLog(`started background relay pid=${child.pid} socket=${socketPath} ownerPid=${ownerPid ?? 'explicit'}`);
+    return;
+  }
+
   onLog(`discovered bridge socket=${socketPath} ownerPid=${ownerPid ?? 'explicit'}`);
 
   let backoffMs = 500;

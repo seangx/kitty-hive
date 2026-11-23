@@ -185,8 +185,8 @@ try {
   assert.equal(whoami.tool, 'antigravity');
   assert.equal(whoami.relay_connected, false);
 
-  // 3. 启动 agy-relay 守护进程（使用 stub agentapi）
-  const relay = spawn(process.execPath, [DIST_INDEX, 'agy-relay', '--socket', socketPath], {
+  // 3. 启动 agy-relay 守护进程（使用 --foreground 便于测试进程直接管理生命周期，配合 stub agentapi）
+  const relay = spawn(process.execPath, [DIST_INDEX, 'agy-relay', '--foreground', '--socket', socketPath], {
     env: {
       ...process.env,
       ANTIGRAVITY_AGENTAPI_EXE: stubAgentApi,

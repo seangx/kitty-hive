@@ -7,7 +7,8 @@ You have access to `kitty-hive` via the `hive-channel` MCP server (`hive-*` tool
 - **Registration**: On first hive use, call `hive-whoami` to see if you were auto-registered (via `HIVE_AGENT_*` env vars). If not registered yet, ask the user what name to register with and call `hive-whoami({ name: "<name>" })`.
 - **Idle push wakeup (`agy-relay`)**: When collaborating on hive in an interactive `agy` CLI session, check `relay_connected` returned by `hive-whoami`.
   - If `relay_connected` is `false` and you haven't already started the relay in this session, start the background push relay once with:
-    `run_command(CommandLine="kitty-hive agy-relay", IsDaemon=true, WaitMsBeforeAsync=500, BypassSandbox=true)`
+    `run_command(CommandLine="kitty-hive agy-relay", WaitMsBeforeAsync=5000)`
+    (It detaches to the background and exits immediately so it does not leave a running background-task bar in the UI.)
   - Once `agy-relay` is connected, incoming hive DMs, tasks, and team events automatically wake this conversation via `agentapi send-message` even while idle.
   - Even without `agy-relay`, hive lifecycle hooks still deliver pending pushes on `Stop` and `PreInvocation`.
 
