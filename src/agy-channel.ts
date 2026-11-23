@@ -229,6 +229,25 @@ export async function runAgyChannel(): Promise<void> {
     }
     agentId = result.agent_id;
     agentName = result.display_name;
+    // 若用户已在 Kitty 中重命名了该会话（KITTY_SESSION_ID === HIVE_AGENT_KEY 且 KITTY_SESSION_NAME 变化），
+    // hive_start 的 key 路径出于防 .mcp.json 污染会忽略 name 更新，此处主动调用 hive_rename 同步。
+    const kittySessionId = process.env.KITTY_SESSION_ID || '';
+    const kittySessionName = process.env.KITTY_SESSION_NAME || '';
+    if (
+      opts.name
+      && agentName !== opts.name
+      && opts.key
+      && kittySessionId === opts.key
+      && kittySessionName === opts.name
+    ) {
+      try {
+        await hiveCallTool('hive_rename', { as: agentId, name: opts.name });
+        agentName = opts.name;
+        result.display_name = opts.name;
+      } catch (err) {
+        console.error('[agy-channel] failed to sync Kitty session rename:', err);
+      }
+    }
     if (!sseStarted) {
       sseStarted = true;
       void listenSSE();
